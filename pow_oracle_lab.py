@@ -12,9 +12,17 @@ Expected work is ~2**difficulty hashes. Each worker does roughly 1-2 M hash/s.
 Raw/BTC modes use a 32-bit nonce space (difficulty 32 has ~63% chance of a
 solution existing); text modes use a 64-bit space.
 
+BTC block submission: after solving with "BTC HEADER (dSHA256)" (or with any 80-byte
+header pasted by hand), press "Submit BTC Block..." to splice the header onto your
+transaction data and send it to a Bitcoin Core node with the `submitblock` RPC.
+A node only accepts a block whose hash meets the nBits target inside the header
+(mainnet is far out of reach for this tool; regtest, nBits 0x207fffff, works with
+difficulty 1).
+
 CLI self-test:  python pow_oracle_lab.py --selftest
 """
 
+import base64
 import hashlib
 import json
 import multiprocessing as mp
@@ -24,6 +32,9 @@ import random
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 try:
     import tkinter as tk
@@ -107,6 +118,117 @@ OUTPUT_ALGOS = {
     "BTC HEADER (hex)": out_btc_header,
     "JSON REPORT": out_json,
 }
+
+
+# ==============================================================================
+# BITCOIN BLOCK SUBMISSION (manual, via Bitcoin Core JSON-RPC)
+# ==============================================================================
+def clean_hex(text):
+    """Hex text (optional 0x prefix, any whitespace) -> bytes. Raises ValueError."""
+    t = "".join(text.split())
+    if t.lower().startswith("0x"):
+        t = t[2:]
+    return bytes.fromhex(t)
+
+
+def bits_to_target(bits):
+    """Decode the compact nBits encoding into the 256-bit target (0 if invalid/negative)."""
+    exp, mant = bits >> 24, bits & 0x007FFFFF
+    if bits & 0x00800000:
+        return 0
+    return mant >> (8 * (3 - exp)) if exp <= 3 else mant << (8 * (exp - 3))
+
+
+def header_info(header):
+    """Decode an 80-byte block header and check its hash against its own nBits target."""
+    if len(header) != 80:
+        raise ValueError(f"Block header must be exactly 80 bytes (got {len(header)}).")
+    bits = int.from_bytes(header[72:76], "little")
+    target = bits_to_target(bits)
+    block_hash = _dsha256(header)[::-1].hex()
+    return dict(
+        version=int.from_bytes(header[0:4], "little"),
+        prev_hash=header[4:36][::-1].hex(),
+        merkle_root=header[36:68][::-1].hex(),
+        time=int.from_bytes(header[68:72], "little"),
+        bits=bits,
+        nonce=int.from_bytes(header[76:80], "little"),
+        hash=block_hash,
+        meets_target=target > 0 and int(block_hash, 16) <= target,
+    )
+
+
+def assemble_block(header, body_hex):
+    """header (80 bytes) + transaction data -> full serialized block bytes.
+
+    `body_hex` is the tx-count varint followed by all serialized transactions. As a
+    convenience, a complete block (whose first 76 header bytes match `header`) is also
+    accepted: its header is dropped and replaced by the solved one.
+    """
+    if len(header) != 80:
+        raise ValueError(f"Block header must be exactly 80 bytes (got {len(header)}).")
+    try:
+        raw = clean_hex(body_hex)
+    except ValueError:
+        raise ValueError("Transaction data is not valid hex.")
+    if len(raw) > 80 and raw[:76] == header[:76]:
+        raw = raw[80:]
+    if not raw:
+        raise ValueError("Transaction data is empty. Paste the tx-count varint + transactions "
+                         "(or a full block hex) in the transactions box.")
+    if raw[0] == 0:
+        raise ValueError("Transaction count is 0; a block needs at least the coinbase transaction.")
+    return header + raw
+
+
+def btc_rpc(url, user, password, method, params, timeout=30):
+    """Minimal Bitcoin Core JSON-RPC call (HTTP basic auth). Returns the 'result' field."""
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+        raise RuntimeError("Node URL must start with http:// or https://")
+    payload = json.dumps({"jsonrpc": "1.0", "id": "pow_oracle_lab",
+                          "method": method, "params": params}).encode()
+    req = urllib.request.Request(url, payload, {"Content-Type": "application/json"})
+    if user or password:
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise RuntimeError("RPC authentication failed (HTTP 401) - check user/password.")
+        body = e.read()                      # Bitcoin Core reports RPC errors with HTTP 4xx/5xx + JSON
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Cannot reach node at {url}: {e.reason}")
+    try:
+        resp = json.loads(body)
+    except ValueError:
+        raise RuntimeError("Node returned a non-JSON response.")
+    if resp.get("error"):
+        err = resp["error"]
+        raise RuntimeError(f"RPC error {err.get('code')}: {err.get('message')}")
+    return resp.get("result")
+
+
+_REJECT_NOTES = {
+    "duplicate": "the node already has this block",
+    "inconclusive": "block stored but not on the best chain (side branch / orphan for now)",
+    "high-hash": "block hash does not meet the target in nBits",
+    "bad-prevblk": "previous block is unknown to the node (stale or wrong chain)",
+    "bad-txnmrklroot": "merkle root in the header does not match the transactions",
+    "bad-cb-height": "coinbase does not encode the correct block height",
+    "bad-diffbits": "nBits does not match the difficulty the node expects",
+    "time-too-old": "header timestamp is too old",
+    "time-too-new": "header timestamp is too far in the future",
+}
+
+
+def describe_submit_result(mode, res):
+    """Human-readable outcome of submitblock (mode='submit') or proposal validation."""
+    if res is None:
+        return ("VALID: the node accepts this block (proposal mode does not check proof-of-work)."
+                if mode == "validate" else "ACCEPTED: the node accepted the block and will relay it.")
+    note = f" - {_REJECT_NOTES[res]}" if res in _REJECT_NOTES else ""
+    return f"REJECTED: {res}{note}"
 
 
 # ==============================================================================
@@ -432,6 +554,8 @@ class App:
         self.cam_thread = None
         self._last_draw = 0.0
         self._rendered = False
+        self._btc_busy = False
+        self._submit_win = None
         self._build_ui()
         window.protocol("WM_DELETE_WINDOW", self._close)
         window.after(50, self._poll)
@@ -478,6 +602,7 @@ class App:
         ttk.Button(ctl, text="Stop", command=self.stop_solve).pack(side="left", padx=5)
         ttk.Button(ctl, text="Step Batch", command=self.step_once).pack(side="left", padx=5)
         ttk.Button(ctl, text="Reset", command=self.reset).pack(side="left", padx=5)
+        ttk.Button(ctl, text="Submit BTC Block...", command=self.open_submit_dialog).pack(side="left", padx=5)
         ttk.Button(ctl, text="Start Camera", command=self.start_cam).pack(side="left", padx=15)
         ttk.Button(ctl, text="Stop Camera", command=lambda: self.ctl.update(cam_stop=True)).pack(side="left")
         self.v_ir = tk.BooleanVar()
@@ -586,6 +711,150 @@ class App:
         self.cam_thread = CamThread(0, self.ctl, self.q)
         self.cam_thread.start()
 
+    # ---- BTC block submission
+    def _btc_log(self, msg):
+        w = getattr(self, "btc_log", None)
+        if w is None or not self._submit_win or not self._submit_win.winfo_exists():
+            return
+        w.insert("end", msg + "\n")
+        w.see("end")
+
+    def open_submit_dialog(self):
+        if self._submit_win is not None and self._submit_win.winfo_exists():
+            self._submit_win.lift()
+            return
+        win = self._submit_win = tk.Toplevel(self.window)
+        win.title("Submit BTC Block to the Blockchain")
+        f = ttk.Frame(win, padding=10)
+        f.pack(fill="both", expand=True)
+
+        node = ttk.LabelFrame(f, text="Bitcoin Core node (JSON-RPC)")
+        node.pack(fill="x", pady=4)
+        self.v_rpc_url = tk.StringVar(value="http://127.0.0.1:8332")
+        self.v_rpc_user = tk.StringVar()
+        self.v_rpc_pass = tk.StringVar()
+        ttk.Label(node, text="URL:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Entry(node, textvariable=self.v_rpc_url, width=48).grid(row=0, column=1, columnspan=3, sticky="we", padx=5)
+        ttk.Label(node, text="User:").grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        ttk.Entry(node, textvariable=self.v_rpc_user, width=18).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(node, text="Password:").grid(row=1, column=2, sticky="e", padx=5)
+        ttk.Entry(node, textvariable=self.v_rpc_pass, show="*", width=18).grid(row=1, column=3, sticky="w", padx=5)
+
+        hf = ttk.LabelFrame(f, text="Block header (80 bytes hex) - blank = use the solved header")
+        hf.pack(fill="x", pady=4)
+        self.v_btc_header = tk.StringVar()
+        ttk.Entry(hf, textvariable=self.v_btc_header).pack(fill="x", padx=5, pady=5)
+
+        bf = ttk.LabelFrame(f, text="Transactions (hex): tx-count varint + txs, or a full block hex")
+        bf.pack(fill="both", expand=True, pady=4)
+        self.btc_body = tk.Text(bf, height=6, width=90, font=("Consolas", 9))
+        self.btc_body.pack(fill="both", expand=True, padx=5, pady=5)
+
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=4)
+        ttk.Button(row, text="Check Header", command=self._btc_check).pack(side="left", padx=3)
+        ttk.Button(row, text="Build Block Hex", command=self._btc_build).pack(side="left", padx=3)
+        ttk.Button(row, text="Copy Block Hex", command=self._btc_copy).pack(side="left", padx=3)
+        ttk.Button(row, text="Validate (no submit)", command=lambda: self._btc_send("validate")).pack(side="left", padx=12)
+        ttk.Button(row, text="SUBMIT BLOCK", command=lambda: self._btc_send("submit")).pack(side="left", padx=3)
+
+        lf = ttk.LabelFrame(f, text="Log")
+        lf.pack(fill="both", expand=True, pady=4)
+        self.btc_log = tk.Text(lf, height=10, width=90, font=("Consolas", 9))
+        self.btc_log.pack(fill="both", expand=True, padx=5, pady=5)
+        self._btc_log("Solve a BTC HEADER first (or paste a header), paste the transactions, "
+                      "then Validate / Submit.")
+
+    def _btc_header(self):
+        """The 80-byte header to submit: manual override if given, else the solved one."""
+        override = self.v_btc_header.get().strip()
+        if override:
+            try:
+                header = clean_hex(override)
+            except ValueError:
+                raise ValueError("Header override is not valid hex.")
+            if len(header) != 80:
+                raise ValueError(f"Header must be exactly 80 bytes (got {len(header)}).")
+            return header
+        o = self.engine.oracle
+        if not o.is_done or not o.input_algo.startswith("BTC"):
+            raise ValueError("No solved BTC header yet. Solve with 'BTC HEADER (dSHA256)' "
+                             "or paste an 80-byte header above.")
+        return o.solution["input"]
+
+    def _btc_collect(self):
+        """Return (header, block_hex), or None after showing what is wrong."""
+        try:
+            header = self._btc_header()
+            block = assemble_block(header, self.btc_body.get("1.0", "end"))
+        except ValueError as e:
+            messagebox.showerror("Cannot build block", str(e), parent=self._submit_win)
+            return None
+        return header, block.hex()
+
+    def _btc_check(self):
+        try:
+            info = header_info(self._btc_header())
+        except ValueError as e:
+            messagebox.showerror("Header", str(e), parent=self._submit_win)
+            return
+        self._btc_log(
+            f"version={info['version']:#x} time={info['time']} nBits={info['bits']:#010x} nonce={info['nonce']}\n"
+            f"prev  ={info['prev_hash']}\nmerkle={info['merkle_root']}\nhash  ={info['hash']}\n"
+            f"meets own nBits target: {'YES' if info['meets_target'] else 'NO (a node will reject it: high-hash)'}")
+
+    def _btc_build(self):
+        got = self._btc_collect()
+        if got:
+            self._btc_log(f"Block hex ({len(got[1]) // 2} bytes):\n{got[1]}")
+
+    def _btc_copy(self):
+        got = self._btc_collect()
+        if got:
+            self._submit_win.clipboard_clear()
+            self._submit_win.clipboard_append(got[1])
+            self._btc_log(f"Copied block hex ({len(got[1]) // 2} bytes) to clipboard.")
+
+    def _btc_send(self, mode):
+        """mode 'validate' = getblocktemplate proposal (nothing is broadcast); 'submit' = submitblock."""
+        if self._btc_busy:
+            return
+        got = self._btc_collect()
+        if not got:
+            return
+        header, block_hex = got
+        info = header_info(header)
+        url = self.v_rpc_url.get().strip()
+        win = self._submit_win
+        if mode == "submit":
+            if not info["meets_target"] and not messagebox.askyesno(
+                    "Header below target",
+                    "This header's hash does NOT meet its own nBits target, so the node will "
+                    "reject it. Send anyway?", parent=win):
+                return
+            if not messagebox.askyesno(
+                    "Submit block",
+                    f"Submit block\n{info['hash']}\nto {url}?\n\nIf valid, the node relays it to the "
+                    f"network and this cannot be undone.", parent=win):
+                return
+        user, pw = self.v_rpc_user.get(), self.v_rpc_pass.get()
+        self._btc_busy = True
+        self._btc_log(f"[{mode}] sending {len(block_hex) // 2}-byte block {info['hash']} to {url} ...")
+
+        def work():
+            try:
+                if mode == "submit":
+                    res = btc_rpc(url, user, pw, "submitblock", [block_hex])
+                else:
+                    res = btc_rpc(url, user, pw, "getblocktemplate",
+                                  [{"mode": "proposal", "data": block_hex, "rules": ["segwit"]}])
+                msg = describe_submit_result(mode, res)
+            except Exception as e:
+                msg = f"FAILED: {e}"
+            self.q.put(("btc", msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ---- display
     def _render_output(self):
         if not self.engine.oracle.is_done:
@@ -632,6 +901,9 @@ class App:
                 if kind == "cam":
                     self.photo = ppm_photo(payload)
                     self.cam_canvas.itemconfig(self.cam_img_id, image=self.photo)
+                elif kind == "btc":
+                    self._btc_busy = False
+                    self._btc_log(payload)
                 elif kind == "error":
                     messagebox.showerror("Camera Error", payload)
         except queue.Empty:
@@ -652,7 +924,69 @@ class App:
 
 
 # ==============================================================================
+def selftest_btc_submit():
+    import http.server
+    genesis = bytes.fromhex(
+        "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b2"
+        "7ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c")
+    info = header_info(genesis)
+    assert info["hash"] == "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    assert info["meets_target"] and info["nonce"] == 2083236893
+    assert bits_to_target(0x1d00ffff) == 0xFFFF << 208
+    tampered = genesis[:76] + (1).to_bytes(4, "little")
+    assert not header_info(tampered)["meets_target"]
+
+    body = bytes.fromhex("01" + "ab" * 20)                       # fake tx data, 1 tx
+    assert assemble_block(genesis, body.hex()) == genesis + body
+    assert assemble_block(genesis, "0x" + (genesis + body).hex()) == genesis + body   # full-block form
+    other = b"\x02" + genesis[1:]                                  # different prefix: pasted data is a body
+    assert assemble_block(other, (genesis + body).hex()) == other + genesis + body
+    assert assemble_block(tampered, (genesis + body).hex()) == tampered + body   # same prefix: header swapped
+    for bad in ("", "zz", "00"):
+        try:
+            assemble_block(genesis, bad)
+            raise AssertionError("expected ValueError")
+        except ValueError:
+            pass
+
+    seen = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.update(req=req, auth=self.headers.get("Authorization"))
+            res = "high-hash" if req["method"] == "getblocktemplate" else None
+            out = json.dumps({"result": res, "error": None, "id": req["id"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}"
+    blk = (genesis + body).hex()
+    res = btc_rpc(url, "user", "pw", "submitblock", [blk])
+    assert res is None and seen["req"] == {"jsonrpc": "1.0", "id": "pow_oracle_lab",
+                                           "method": "submitblock", "params": [blk]}
+    assert seen["auth"] == "Basic " + base64.b64encode(b"user:pw").decode()
+    assert describe_submit_result("submit", res).startswith("ACCEPTED")
+    res = btc_rpc(url, "user", "pw", "getblocktemplate", [{"mode": "proposal", "data": blk, "rules": ["segwit"]}])
+    assert "REJECTED: high-hash" in describe_submit_result("validate", res)
+    srv.shutdown()
+    try:
+        btc_rpc("file:///etc/passwd", "", "", "submitblock", [blk])
+        raise AssertionError("non-http URL must be refused")
+    except RuntimeError:
+        pass
+    print("BTC submit: header decode, block assembly, submitblock/proposal RPC (mock node) ... ok")
+
+
 def selftest():
+    selftest_btc_submit()
     for algo, data, diff in [
         ("TEXT + DEC NONCE", b"hello", 16),
         ("TEXT:NONCE (hashcash)", b"1:16:resource", 16),
