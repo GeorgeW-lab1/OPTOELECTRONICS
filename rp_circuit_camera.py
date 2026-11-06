@@ -44,7 +44,10 @@ class BitPoolingOracle:
         self.pooled_bits = 0
         self.pooled_count = 0
         self.is_done = False
-
+    def reveal(self):
+        if not self.is_done:
+            return 0
+        return self.__target
     def query_bit(self, trial_val):
         """
         Oracle evaluation: determines if the secret target is >= the pooled trial value.
