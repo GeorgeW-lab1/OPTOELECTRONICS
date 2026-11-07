@@ -1,20 +1,24 @@
 """
 Bit-Pooling Oracle Lock Box Lab
-Python + Arduino challenge-response system.
+Python + Arduino 256-bit challenge-response system.
 
 Protocol:
-    Arduino -> PC:  CHALLENGE:<0-1023>\n
-    PC -> Arduino:  GUESS:<0-1023>\n
-    Arduino -> PC:  DISARMED\n or REJECTED\n
+    Arduino -> PC:  CHALLENGE:<64 hexadecimal characters>\\n
+    PC -> Arduino:  GUESS:<64 hexadecimal characters>\\n
+    Arduino -> PC:  DISARMED\\n or REJECTED\\n
 
-The Arduino emits a new random challenge every five seconds. The Python
-bit-pooling oracle reconstructs that challenge and returns it. The Arduino
-disarms only when the returned value matches the still-current challenge.
+The Arduino generates a new 256-bit random challenge every five seconds.
+The Python bit-pooling oracle reconstructs that challenge and returns it.
+The Arduino disarms only when the returned value exactly matches the
+still-current challenge.
+
+Install dependencies:
+    pip install pyserial opencv-python numpy
 """
 
 import asyncio
 import queue
-import random
+import secrets
 import sys
 import threading
 import time
@@ -38,17 +42,22 @@ except ImportError:
     cv2 = None
 
 
+PASSCODE_BITS = 256
+PASSCODE_BYTES = PASSCODE_BITS // 8
+PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
+
+
 # ==============================================================================
-# SAFE TIME DELAY
+# SAFE RESPONSE DELAY
 # ==============================================================================
 
 class SafeDelay:
     """
-    Thread-safe, validated delay before the oracle begins responding to a
-    new Arduino challenge.
+    Thread-safe, validated delay before the oracle responds to an Arduino
+    challenge.
 
-    Valid range: 0 to 10 seconds. This must remain shorter than the Arduino's
-    five-second challenge window.
+    The Arduino issues a new challenge every five seconds, so the maximum
+    response delay is kept below five seconds.
     """
 
     MIN_DELAY_S = 0.0
@@ -82,17 +91,17 @@ class SafeDelay:
 
 
 # ==============================================================================
-# BIT-POOLING ORACLE
+# 256-BIT BIT-POOLING ORACLE
 # ==============================================================================
 
 class BitPoolingOracle:
     """
-    Stores a hidden target and answers successive higher-or-equal queries.
+    Stores a hidden 256-bit target and answers higher-or-equal queries.
 
     The search engine reconstructs the target one bit at a time, MSB first.
     """
 
-    def __init__(self, bit_depth: int = 10, target=None):
+    def __init__(self, bit_depth: int = PASSCODE_BITS, target=None):
         if not isinstance(bit_depth, int) or bit_depth < 1:
             raise ValueError("bit_depth must be a positive integer.")
 
@@ -100,9 +109,9 @@ class BitPoolingOracle:
         self.max_val = (1 << bit_depth) - 1
 
         if target is None:
-            target = random.randint(0, self.max_val)
+            target = secrets.randbits(bit_depth)
 
-        self._target = int(np.clip(int(target), 0, self.max_val))
+        self._target = int(target) & self.max_val
 
         self.kernel_size = 4
         self.stride = 2
@@ -165,11 +174,11 @@ class BitPoolingOracle:
 
 
 # ==============================================================================
-# BIT-POOLING SEARCH ENGINE
+# 256-BIT BIT-POOLING SEARCH ENGINE
 # ==============================================================================
 
 class BitPoolingSearchEngine:
-    def __init__(self, bit_depth: int = 10):
+    def __init__(self, bit_depth: int = PASSCODE_BITS):
         if not isinstance(bit_depth, int) or bit_depth < 1:
             raise ValueError("bit_depth must be a positive integer.")
 
@@ -227,7 +236,7 @@ class BitPoolingSearchEngine:
             self.converged = True
 
             if self.current_guess == self.oracle._target:
-                self.last_status = f"LOCKED & REVEALED AT {self.current_guess}"
+                self.last_status = "LOCKED & REVEALED"
             else:
                 self.last_status = "RECONSTRUCTION MISMATCH"
 
@@ -248,15 +257,20 @@ class BitPoolingSearchEngine:
 
 class ArduinoLockBox:
     """
-    Serial link to an Arduino lock box.
+    Serial link to an Arduino 256-bit lock box.
 
     Expected protocol:
-        Arduino -> PC: CHALLENGE:<0-1023>\\n
-        PC -> Arduino: GUESS:<0-1023>\\n
+        Arduino -> PC: CHALLENGE:<64 hex characters>\\n
+        PC -> Arduino: GUESS:<64 hex characters>\\n
         Arduino -> PC: DISARMED\\n or REJECTED\\n
     """
 
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0):
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 115200,
+        timeout: float = 1.0,
+    ):
         if serial is None:
             raise RuntimeError(
                 "pyserial is not installed. Run: pip install pyserial"
@@ -270,7 +284,10 @@ class ArduinoLockBox:
         if serial_tools is None:
             return []
 
-        return [device.device for device in serial_tools.list_ports.comports()]
+        return [
+            device.device
+            for device in serial_tools.list_ports.comports()
+        ]
 
     def close(self):
         with self._lock:
@@ -279,7 +296,7 @@ class ArduinoLockBox:
 
     def read_challenge(self):
         """
-        Reads one CHALLENGE line.
+        Reads one 256-bit CHALLENGE line.
 
         Returns:
             int: challenge value, or None if no complete line arrived.
@@ -293,15 +310,23 @@ class ArduinoLockBox:
 
                 line = raw.decode("ascii", errors="ignore").strip()
 
-                if line.startswith("CHALLENGE:"):
-                    try:
-                        return int(line.split(":", 1)[1])
-                    except ValueError:
-                        continue
+                if not line.startswith("CHALLENGE:"):
+                    continue
+
+                hex_text = line.split(":", 1)[1].strip()
+
+                if (
+                    len(hex_text) != PASSCODE_HEX_CHARS
+                    or not all(c in "0123456789abcdefABCDEF" for c in hex_text)
+                ):
+                    continue
+
+                return int(hex_text, 16)
 
     def send_guess(self, guess: int) -> str:
-        """Sends the oracle guess and reads the Arduino response."""
-        message = f"GUESS:{int(guess)}\n"
+        """Sends the 256-bit oracle guess and reads the Arduino response."""
+        hex_guess = f"{int(guess) & ((1 << PASSCODE_BITS) - 1):064X}"
+        message = f"GUESS:{hex_guess}\n"
 
         with self._lock:
             self.ser.reset_input_buffer()
@@ -322,8 +347,8 @@ def handle_arduino_challenge(
     delay_s: float = 0.0,
 ):
     """
-    Receives one Arduino challenge, lets the oracle reconstruct it, and sends
-    the result back for validation.
+    Receives one 256-bit Arduino challenge, reconstructs it with the oracle,
+    and sends the result back for validation.
     """
     engine.reset(challenge)
 
@@ -358,19 +383,12 @@ class ArduinoThread(threading.Thread):
 
         try:
             lock_box = ArduinoLockBox(self.port)
-            self.out.put(("arduino", "Connected to lock box."))
+            self.out.put(("arduino", "Connected to 256-bit lock box."))
 
             while not self.ctl["stop"]:
                 challenge = lock_box.read_challenge()
 
                 if challenge is None:
-                    continue
-
-                if not 0 <= challenge <= self.engine.max_val:
-                    self.out.put((
-                        "arduino",
-                        f"Ignored out-of-range challenge: {challenge}",
-                    ))
                     continue
 
                 result = handle_arduino_challenge(
@@ -402,7 +420,9 @@ class ArduinoThread(threading.Thread):
 class Source:
     def __init__(self, index: int):
         if cv2 is None:
-            raise RuntimeError("OpenCV is not installed. Run: pip install opencv-python")
+            raise RuntimeError(
+                "OpenCV is not installed. Run: pip install opencv-python"
+            )
 
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(index, backend)
@@ -431,7 +451,10 @@ class Source:
 
 def ppm_photo(rgb: np.ndarray) -> tk.PhotoImage:
     h, w, _ = rgb.shape
-    data = b"P6 %d %d 255\n" % (w, h) + np.ascontiguousarray(rgb, np.uint8).tobytes()
+    data = (
+        b"P6 %d %d 255\n" % (w, h)
+        + np.ascontiguousarray(rgb, np.uint8).tobytes()
+    )
     return tk.PhotoImage(data=data, format="PPM")
 
 
@@ -462,7 +485,7 @@ class SimThread(threading.Thread):
 
         out.put(("info", f"USB camera {self.cam_index} opened."))
 
-        t_prev = time.perf_counter()
+        previous_time = time.perf_counter()
         frame_index = 0
         previous_even = False
 
@@ -471,19 +494,26 @@ class SimThread(threading.Thread):
                 gray = await asyncio.to_thread(src.read)
 
                 if gray is None:
-                    out.put(("info", "Camera stopped delivering frames."))
+                    out.put((
+                        "info",
+                        "Camera stopped delivering frames.",
+                    ))
                     break
 
                 now = time.perf_counter()
-                dt = min(max(now - t_prev, 1e-3), 0.25)
-                t_prev = now
+                dt = min(max(now - previous_time, 1e-3), 0.25)
+                previous_time = now
 
                 small = cv2.resize(
                     gray, (128, 96), interpolation=cv2.INTER_AREA
                 )
-                motion_detected = frame_index > 5 and np.std(small) > 5.0
+                motion_detected = (
+                    frame_index > 5 and np.std(small) > 5.0
+                )
                 motion_value = (
-                    int(np.std(small) * 10) if motion_detected else 0
+                    int(np.std(small) * 10)
+                    if motion_detected
+                    else 0
                 )
 
                 even_now = motion_value > 0 and motion_value % 2 == 0
@@ -510,20 +540,27 @@ class SimThread(threading.Thread):
                 preview = cv2.resize(
                     rgb,
                     (320, 240),
-                    interpolation=cv2.INTER_AREA
+                    interpolation=cv2.INTER_AREA,
                 ).copy()
 
                 if ctl.get("ir_heatmap", False):
                     preview[:, :, 0] = np.clip(
-                        preview[:, :, 0].astype(int) + 80, 0, 255
+                        preview[:, :, 0].astype(int) + 80,
+                        0,
+                        255,
                     )
                     preview[:, :, 2] = np.clip(
-                        preview[:, :, 2].astype(int) - 50, 0, 255
+                        preview[:, :, 2].astype(int) - 50,
+                        0,
+                        255,
                     )
 
                 exposed_target = (
                     engine.oracle._target
-                    if (engine.converged or ctl.get("force_reveal", False))
+                    if (
+                        engine.converged
+                        or ctl.get("force_reveal", False)
+                    )
                     else 0
                 )
 
@@ -558,7 +595,9 @@ class SimThread(threading.Thread):
 class App:
     def __init__(self, window):
         self.window = window
-        self.window.title("Bit-Pooling Oracle Lock Box Lab")
+        self.window.title(
+            "Bit-Pooling Oracle Lock Box Lab — 256-Bit Passcode"
+        )
 
         self.q = queue.Queue()
         self.safe_delay = SafeDelay(SafeDelay.DEFAULT_DELAY_S)
@@ -571,7 +610,9 @@ class App:
             "safe_delay": self.safe_delay,
         }
 
-        self.engine = BitPoolingSearchEngine(bit_depth=10)
+        self.engine = BitPoolingSearchEngine(
+            bit_depth=PASSCODE_BITS
+        )
         self.camera_thread = None
         self.arduino_thread = None
 
@@ -584,23 +625,33 @@ class App:
         main_frame.pack(fill="both", expand=True)
 
         # Laboratory controls
-        control_frame = ttk.LabelFrame(main_frame, text="Laboratory Controls")
+        control_frame = ttk.LabelFrame(
+            main_frame, text="Laboratory Controls"
+        )
         control_frame.pack(fill="x", padx=5, pady=5)
 
         ttk.Button(
-            control_frame, text="Start Camera", command=self.start_camera
+            control_frame,
+            text="Start Camera",
+            command=self.start_camera,
         ).pack(side="left", padx=5, pady=5)
 
         ttk.Button(
-            control_frame, text="Stop Camera", command=self.stop_camera
+            control_frame,
+            text="Stop Camera",
+            command=self.stop_camera,
         ).pack(side="left", padx=5, pady=5)
 
         ttk.Button(
-            control_frame, text="Step Bit Pool", command=self.step_search
+            control_frame,
+            text="Step Bit Pool",
+            command=self.step_search,
         ).pack(side="left", padx=5, pady=5)
 
         ttk.Button(
-            control_frame, text="Reset Pool", command=self.reset_search
+            control_frame,
+            text="Reset Pool",
+            command=self.reset_search,
         ).pack(side="left", padx=5, pady=5)
 
         self.v_ir = tk.BooleanVar(value=False)
@@ -608,86 +659,121 @@ class App:
             control_frame,
             text="IR Thermal Heatmap",
             variable=self.v_ir,
-            command=lambda: self.ctl.update(ir_heatmap=self.v_ir.get()),
+            command=lambda: self.ctl.update(
+                ir_heatmap=self.v_ir.get()
+            ),
         ).pack(side="left", padx=10)
 
-        # Arduino lock-box controls
+        # Arduino controls
         arduino_frame = ttk.LabelFrame(
-            main_frame, text="Arduino Lock Box — Challenge Response"
+            main_frame,
+            text="Arduino Lock Box — 256-Bit Challenge Response",
         )
         arduino_frame.pack(fill="x", padx=5, pady=5)
 
-        ttk.Label(arduino_frame, text="Serial port:").pack(
-            side="left", padx=5, pady=5
-        )
+        ttk.Label(
+            arduino_frame,
+            text="Serial port:",
+        ).pack(side="left", padx=5, pady=5)
 
         self.v_arduino_port = tk.StringVar(value="COM3")
         self.e_arduino_port = ttk.Entry(
-            arduino_frame, width=12, textvariable=self.v_arduino_port
+            arduino_frame,
+            width=14,
+            textvariable=self.v_arduino_port,
         )
         self.e_arduino_port.pack(side="left", padx=2, pady=5)
 
         ttk.Button(
-            arduino_frame, text="List Ports", command=self.list_arduino_ports
+            arduino_frame,
+            text="List Ports",
+            command=self.list_arduino_ports,
         ).pack(side="left", padx=2, pady=5)
 
         ttk.Button(
-            arduino_frame, text="Connect Lock Box", command=self.connect_arduino
+            arduino_frame,
+            text="Connect Lock Box",
+            command=self.connect_arduino,
         ).pack(side="left", padx=10, pady=5)
 
         ttk.Button(
-            arduino_frame, text="Disconnect", command=self.disconnect_arduino
+            arduino_frame,
+            text="Disconnect",
+            command=self.disconnect_arduino,
         ).pack(side="left", padx=2, pady=5)
 
-        # Safe delay
+        # Response delay
         delay_frame = ttk.LabelFrame(
-            main_frame, text="Oracle Response Delay (0-4 seconds)"
+            main_frame,
+            text="Oracle Response Delay (0-4 seconds)",
         )
         delay_frame.pack(fill="x", padx=5, pady=5)
 
-        ttk.Label(delay_frame, text="Delay before response (s):").pack(
-            side="left", padx=5, pady=5
-        )
+        ttk.Label(
+            delay_frame,
+            text="Delay before response (s):",
+        ).pack(side="left", padx=5, pady=5)
 
-        self.v_delay = tk.StringVar(value=f"{SafeDelay.DEFAULT_DELAY_S:.3f}")
+        self.v_delay = tk.StringVar(
+            value=f"{SafeDelay.DEFAULT_DELAY_S:.3f}"
+        )
         self.e_delay = ttk.Entry(
-            delay_frame, width=10, textvariable=self.v_delay
+            delay_frame,
+            width=10,
+            textvariable=self.v_delay,
         )
         self.e_delay.pack(side="left", padx=2, pady=5)
 
         ttk.Button(
-            delay_frame, text="Apply Delay", command=self.apply_delay
+            delay_frame,
+            text="Apply Delay",
+            command=self.apply_delay,
         ).pack(side="left", padx=2, pady=5)
 
         ttk.Label(
             delay_frame,
-            text="Keep below 5 s so the response arrives before the next challenge.",
+            text=(
+                "Keep below 5 s so the response arrives before "
+                "the next challenge."
+            ),
             foreground="#88a0c0",
         ).pack(side="left", padx=10)
 
-        # Hidden target controls
+        # Local target controls
         target_frame = ttk.LabelFrame(
-            main_frame, text="Local Oracle Target (manual testing)"
+            main_frame,
+            text="Local 256-Bit Oracle Target (hexadecimal)",
         )
         target_frame.pack(fill="x", padx=5, pady=5)
 
         self.target_label = ttk.Label(
-            target_frame, text=f"Target (0-{self.engine.max_val}):"
+            target_frame,
+            text="Target (64 hex characters):",
         )
         self.target_label.pack(side="left", padx=5, pady=5)
 
-        self.v_custom_target = tk.StringVar(value="[SECURE]")
-        self.e_custom_target = ttk.Entry(
-            target_frame, width=10, textvariable=self.v_custom_target
+        self.v_custom_target = tk.StringVar(
+            value="[SECURE]"
         )
-        self.e_custom_target.pack(side="left", padx=5, pady=5)
+        self.e_custom_target = ttk.Entry(
+            target_frame,
+            width=72,
+            textvariable=self.v_custom_target,
+        )
+        self.e_custom_target.pack(
+            side="left", padx=5, pady=5
+        )
 
         ttk.Button(
-            target_frame, text="Set Custom", command=self.set_custom_target
+            target_frame,
+            text="Set Custom",
+            command=self.set_custom_target,
         ).pack(side="left", padx=2, pady=5)
 
         ttk.Button(
-            target_frame, text="Randomize Target", command=self.randomize_target
+            target_frame,
+            text="Randomize Target",
+            command=self.randomize_target,
         ).pack(side="left", padx=5, pady=5)
 
         self.v_reveal = tk.BooleanVar(value=False)
@@ -695,42 +781,61 @@ class App:
             target_frame,
             text="Force Reveal Local Target",
             variable=self.v_reveal,
-            command=lambda: self.ctl.update(force_reveal=self.v_reveal.get()),
+            command=lambda: self.ctl.update(
+                force_reveal=self.v_reveal.get()
+            ),
         ).pack(side="left", padx=15, pady=5)
 
-        # Camera and registers
+        # Camera and register display
         display_frame = ttk.Frame(main_frame)
-        display_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        display_frame.pack(
+            fill="both", expand=True, padx=5, pady=5
+        )
 
         camera_frame = ttk.LabelFrame(
-            display_frame, text="Optoelectronic Circuit Camera Viewport"
+            display_frame,
+            text="Optoelectronic Circuit Camera Viewport",
         )
         camera_frame.pack(side="left", padx=5, pady=5)
 
         self.cam_canvas = tk.Canvas(
-            camera_frame, width=320, height=240, bg="black"
+            camera_frame,
+            width=320,
+            height=240,
+            bg="black",
         )
         self.cam_canvas.pack(padx=5, pady=5)
-        self.cam_image_id = self.cam_canvas.create_image(0, 0, anchor="nw")
+        self.cam_image_id = self.cam_canvas.create_image(
+            0, 0, anchor="nw"
+        )
 
         right_panel = ttk.Frame(display_frame)
         right_panel.pack(
-            side="right", fill="both", expand=True, padx=5, pady=5
+            side="right",
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5,
         )
 
         register_frame = ttk.LabelFrame(
-            right_panel, text="Bit-Pooling Hardware Registers"
+            right_panel,
+            text="256-Bit Passcode Registers",
         )
-        register_frame.pack(fill="x", padx=5, pady=5)
+        register_frame.pack(
+            fill="both", expand=True, padx=5, pady=5
+        )
 
         self.register_canvas = tk.Canvas(
             register_frame,
-            width=520,
-            height=170,
+            width=760,
+            height=190,
             bg="#121414",
             highlightthickness=0,
         )
-        self.register_canvas.pack(padx=5, pady=5)
+        self.register_canvas.pack(
+            padx=5, pady=5
+        )
 
         self.status_label = ttk.Label(
             register_frame,
@@ -738,31 +843,62 @@ class App:
             font=("Consolas", 11),
             foreground="#00e5ff",
         )
-        self.status_label.pack(anchor="w", padx=10, pady=5)
+        self.status_label.pack(
+            anchor="w", padx=10, pady=5
+        )
 
         # Pooling settings
         settings_frame = ttk.LabelFrame(
-            right_panel, text="Pooling & Algorithm Settings"
+            right_panel,
+            text="Pooling & Algorithm Settings",
         )
-        settings_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        settings_frame.pack(
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5,
+        )
 
-        ttk.Label(settings_frame, text="Pooling Operator:").grid(
-            row=0, column=0, sticky="w", padx=5, pady=5
+        ttk.Label(
+            settings_frame,
+            text="Pooling Operator:",
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=5,
         )
 
         self.operator_combo = ttk.Combobox(
             settings_frame,
-            values=["POPCOUNT", "AND", "OR", "XOR", "MAJORITY"],
+            values=[
+                "POPCOUNT",
+                "AND",
+                "OR",
+                "XOR",
+                "MAJORITY",
+            ],
             state="readonly",
         )
         self.operator_combo.set("POPCOUNT")
-        self.operator_combo.grid(row=0, column=1, padx=5, pady=5)
+        self.operator_combo.grid(
+            row=0, column=1, padx=5, pady=5
+        )
         self.operator_combo.bind(
-            "<<ComboboxSelected>>", self._update_pool_operator
+            "<<ComboboxSelected>>",
+            self._update_pool_operator,
         )
 
-        ttk.Label(settings_frame, text="Kernel Size:").grid(
-            row=1, column=0, sticky="w", padx=5, pady=5
+        ttk.Label(
+            settings_frame,
+            text="Kernel Size:",
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=5,
         )
 
         self.kernel_spin = ttk.Spinbox(
@@ -774,12 +910,18 @@ class App:
             command=self._update_kernel,
         )
         self.kernel_spin.set(4)
-        self.kernel_spin.grid(row=1, column=1, padx=5, pady=5)
+        self.kernel_spin.grid(
+            row=1, column=1, padx=5, pady=5
+        )
 
     def start_camera(self):
-        if self.camera_thread is not None and self.camera_thread.is_alive():
+        if (
+            self.camera_thread is not None
+            and self.camera_thread.is_alive()
+        ):
             messagebox.showwarning(
-                "Already Running", "The camera lab is already running."
+                "Already Running",
+                "The camera lab is already running.",
             )
             return
 
@@ -817,12 +959,15 @@ class App:
 
         if not ports:
             messagebox.showwarning(
-                "No Serial Ports", "No serial ports were found."
+                "No Serial Ports",
+                "No serial ports were found.",
             )
             return
 
         self.v_arduino_port.set(ports[0])
-        messagebox.showinfo("Serial Ports", "\n".join(ports))
+        messagebox.showinfo(
+            "Serial Ports", "\n".join(ports)
+        )
 
     def connect_arduino(self):
         if (
@@ -830,7 +975,8 @@ class App:
             and self.arduino_thread.is_alive()
         ):
             messagebox.showwarning(
-                "Already Connected", "The lock box is already connected."
+                "Already Connected",
+                "The lock box is already connected.",
             )
             return
 
@@ -838,13 +984,18 @@ class App:
 
         if not port:
             messagebox.showerror(
-                "Missing Port", "Enter a serial port such as COM3."
+                "Missing Port",
+                "Enter a serial port such as COM3.",
             )
             return
 
         self.ctl["stop"] = False
         self.arduino_thread = ArduinoThread(
-            port, self.ctl, self.q, self.engine, self.safe_delay
+            port,
+            self.ctl,
+            self.q,
+            self.engine,
+            self.safe_delay,
         )
         self.arduino_thread.start()
 
@@ -853,11 +1004,17 @@ class App:
             self.ctl["stop"] = True
 
     def set_custom_target(self):
+        text = self.v_custom_target.get().strip()
+
+        if text.startswith("0x") or text.startswith("0X"):
+            text = text[2:]
+
         try:
-            value = int(self.v_custom_target.get())
+            value = int(text, 16)
         except ValueError:
             messagebox.showerror(
-                "Invalid Input", "Please enter a valid integer."
+                "Invalid Input",
+                "Enter a 64-character hexadecimal value.",
             )
             return
 
@@ -865,12 +1022,12 @@ class App:
             self.engine.reset(value)
             messagebox.showinfo(
                 "Target Set",
-                "New local target configured for bit pooling.",
+                "New 256-bit target configured for bit pooling.",
             )
         else:
             messagebox.showerror(
                 "Invalid Range",
-                f"Target must be between 0 and {self.engine.max_val}.",
+                "Target must be a 256-bit hexadecimal value.",
             )
 
     def randomize_target(self):
@@ -890,75 +1047,74 @@ class App:
         except ValueError:
             pass
 
-    def _draw_bit_rows(self, target_value, guess_value, pooled_value, revealed):
+    def _draw_hex_rows(
+        self,
+        target_value,
+        guess_value,
+        pooled_value,
+        revealed,
+    ):
         self.register_canvas.delete("all")
 
-        bit_depth = self.engine.bit_depth
         is_exposed = revealed or self.engine.converged
         active_target = target_value if is_exposed else 0
 
         rows = [
-            ("TARGET", active_target, "#00e676", not is_exposed),
+            (
+                "TARGET",
+                active_target,
+                "#00e676",
+                not is_exposed,
+            ),
             ("GUESS ", guess_value, "#ffb300", False),
-            ("POOLED", pooled_value, "#b388ff", False),
+            (
+                "POOLED",
+                pooled_value,
+                "#b388ff",
+                False,
+            ),
         ]
 
-        y_offset = 10
+        y_offset = 20
 
         for label, value, colour, hidden in rows:
             self.register_canvas.create_text(
                 10,
-                y_offset + 10,
+                y_offset,
                 text=label,
                 fill="#88a0c0",
                 anchor="w",
                 font=("Consolas", 10, "bold"),
             )
 
-            x = 90
-
-            for bit_index in range(bit_depth - 1, -1, -1):
-                bit_state = (value >> bit_index) & 1
-
-                self.register_canvas.create_rectangle(
-                    x,
-                    y_offset,
-                    x + 18,
-                    y_offset + 18,
-                    fill=(
-                        colour
-                        if bit_state and not hidden
-                        else "#1e2430"
-                    ),
-                    outline="#38445c",
-                )
-
-                text = "?" if hidden else str(bit_state)
-                text_colour = (
-                    "#000000" if bit_state and not hidden else "#708090"
-                )
-
-                self.register_canvas.create_text(
-                    x + 9,
-                    y_offset + 9,
-                    text=text,
-                    fill=text_colour,
-                    font=("Consolas", 8, "bold"),
-                )
-
-                x += 22
-
-            number_text = "[HIDDEN]" if hidden else f"[{value}]"
-            self.register_canvas.create_text(
-                x + 5,
-                y_offset + 9,
-                text=number_text,
-                fill="#d2e0f0",
-                anchor="w",
-                font=("Consolas", 9),
+            hex_text = (
+                "[HIDDEN]"
+                if hidden
+                else f"{value:064X}"
             )
 
-            y_offset += 48
+            self.register_canvas.create_text(
+                90,
+                y_offset,
+                text=hex_text,
+                fill=colour,
+                anchor="w",
+                font=("Consolas", 10),
+            )
+
+            y_offset += 35
+
+        self.register_canvas.create_text(
+            10,
+            y_offset + 10,
+            text=(
+                f"256-bit passcode | "
+                f"{self.engine.step_count}/256 reconstruction steps"
+            ),
+            fill="#d2e0f0",
+            anchor="w",
+            font=("Consolas", 10),
+        )
 
     def _poll(self):
         try:
@@ -969,10 +1125,11 @@ class App:
                     data = event[1]
                     self.photo = ppm_photo(data["preview"])
                     self.cam_canvas.itemconfig(
-                        self.cam_image_id, image=self.photo
+                        self.cam_image_id,
+                        image=self.photo,
                     )
 
-                    self._draw_bit_rows(
+                    self._draw_hex_rows(
                         data["target"],
                         data["guess"],
                         data["pooled"],
@@ -983,37 +1140,47 @@ class App:
                     self.status_label.config(
                         text=(
                             f"Status: {data['status']} | "
-                            f"Bit Step: {data['steps']}/"
-                            f"{self.engine.bit_depth} | "
+                            f"Bit Step: {data['steps']}/256 | "
                             f"Delay: {delay:.3f}s"
                         )
                     )
 
                 elif event[0] == "arduino":
-                    self.status_label.config(text=f"Lock Box: {event[1]}")
+                    self.status_label.config(
+                        text=f"Lock Box: {event[1]}"
+                    )
 
                 elif event[0] == "arduino_result":
                     result = event[1]
 
+                    challenge_hex = (
+                        f"{result['challenge']:064X}"
+                    )
+                    guess_hex = f"{result['guess']:064X}"
+
                     if result["disarmed"]:
                         status = (
-                            f"DISARMED | Challenge {result['challenge']} | "
-                            f"Oracle guess {result['guess']}"
+                            f"DISARMED | Challenge {challenge_hex} | "
+                            f"Oracle guess {guess_hex}"
                         )
                     else:
                         status = (
-                            f"REJECTED | Challenge {result['challenge']} | "
-                            f"Oracle guess {result['guess']} | "
+                            f"REJECTED | Challenge {challenge_hex} | "
+                            f"Oracle guess {guess_hex} | "
                             f"{result['response']}"
                         )
 
                     self.status_label.config(text=status)
 
                 elif event[0] == "arduino_error":
-                    messagebox.showerror("Arduino Error", event[1])
+                    messagebox.showerror(
+                        "Arduino Error", event[1]
+                    )
 
                 elif event[0] == "error":
-                    messagebox.showerror("Camera Error", event[1])
+                    messagebox.showerror(
+                        "Camera Error", event[1]
+                    )
 
         except queue.Empty:
             pass
@@ -1028,5 +1195,5 @@ class App:
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
-    root.geometry("1000x760")
+    root.geometry("1240x780")
     root.mainloop()
