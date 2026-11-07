@@ -8,6 +8,7 @@
   Commands:
     DIFF 12      sets the difficulty AND starts mining immediately
     DIFF         prints the current difficulty
+    HEADER       prints HEADER:<the DATA string being hashed>
     TERMINATOR   (or STOP) aborts mining
     DATA hello
     SHA256 hello
@@ -21,7 +22,16 @@
 
   Output while mining:
     Nothing, until a solution is found, then one line:
-      POW:<nonce>:<64 hex hash>
+      POW:<nonce>:<64 hex hash>:<padded message>:<padded nonce>:<padded hash>:<header>
+    where <header> is the DATA string that was hashed (the hashed
+    message is <header> followed by the decimal nonce), and each padded
+    field is SHA-256 padding of its own bytes, in hex: the bytes, 0x80,
+    zero bytes, then the 64-bit big-endian bit length, always a whole
+    number of 64-byte blocks:
+      <padded message>  header + decimal nonce
+      <padded nonce>    the decimal nonce text alone
+      <padded hash>     the 32 raw hash bytes
+    <header> is last because it may itself contain colons.
 
   Note:
     This is a simple educational SHA256 proof-of-work
@@ -209,7 +219,7 @@ void sha256(const uint8_t *data, size_t len, uint8_t *output) {
 // HEX OUTPUT
 // =====================================================
 
-void printHash(uint8_t *hash) {
+void printHashHex(uint8_t *hash) {
 
   const char hex[] = "0123456789abcdef";
 
@@ -217,7 +227,11 @@ void printHash(uint8_t *hash) {
     Serial.print(hex[hash[i] >> 4]);
     Serial.print(hex[hash[i] & 15]);
   }
+}
 
+void printHash(uint8_t *hash) {
+
+  printHashHex(hash);
   Serial.println();
 }
 
@@ -252,18 +266,49 @@ bool checkDifficulty(uint8_t *hash) {
 
 uint8_t hashOutput[32];
 
+// Builds <inputData><decimal nonce> and returns its length.
+size_t buildMessage(uint32_t n, char *message, size_t size) {
+
+  snprintf(message, size, "%s%lu",
+    inputData, (unsigned long)n);
+
+  return strlen(message);
+}
+
 void hashNonce(uint32_t n) {
 
   char message[200];
 
-  snprintf(message, sizeof(message), "%s%lu",
-    inputData, (unsigned long)n);
+  size_t len = buildMessage(n, message, sizeof(message));
 
   sha256(
     (const uint8_t*)message,
-    strlen(message),
+    len,
     hashOutput
   );
+}
+
+// Prints the SHA-256 padded form of a message as hex, streamed byte by
+// byte (no extra buffer): message, 0x80, zeros, 64-bit big-endian bit length.
+void printPaddedHex(const uint8_t *msg, size_t len) {
+
+  const char hex[] = "0123456789abcdef";
+
+  size_t total = ((len + 9 + 63) / 64) * 64;
+  uint64_t bitLength = (uint64_t)len * 8;
+
+  for (size_t i = 0; i < total; i++) {
+
+    uint8_t b;
+
+    if (i < len)             b = msg[i];
+    else if (i == len)       b = 0x80;
+    else if (i >= total - 8) b = (uint8_t)(bitLength >> ((total - 1 - i) * 8));
+    else                     b = 0;
+
+    Serial.print(hex[b >> 4]);
+    Serial.print(hex[b & 15]);
+  }
 }
 
 // =====================================================
@@ -312,10 +357,24 @@ void miningStep() {
     mining = false;
     found = true;
 
+    char message[200];
+    size_t len = buildMessage(nonce, message, sizeof(message));
+
+    char nonceText[12];
+    snprintf(nonceText, sizeof(nonceText), "%lu", (unsigned long)nonce);
+
     Serial.print(F("POW:"));
     Serial.print(nonce);
     Serial.print(':');
-    printHash(hashOutput);
+    printHashHex(hashOutput);
+    Serial.print(':');
+    printPaddedHex((const uint8_t*)message, len);
+    Serial.print(':');
+    printPaddedHex((const uint8_t*)nonceText, strlen(nonceText));
+    Serial.print(':');
+    printPaddedHex(hashOutput, 32);
+    Serial.print(':');
+    Serial.println(inputData);
 
     return;
   }
@@ -380,6 +439,12 @@ void executeCommand(char *command) {
 
       return;
     }
+  }
+
+  if (strcmp(command, "HEADER") == 0) {
+    Serial.print(F("HEADER:"));
+    Serial.println(inputData);
+    return;
   }
 
   if (strncmp(command, "DATA ", 5) == 0) {
@@ -458,6 +523,7 @@ void executeCommand(char *command) {
     Serial.println(F("STOP"));
     Serial.println(F("DIFF"));
     Serial.println(F("DIFF 12   (sets difficulty and starts mining)"));
+    Serial.println(F("HEADER"));
     Serial.println(F("DATA hello"));
     Serial.println(F("SHA256 hello"));
     Serial.println(F("STATUS"));
