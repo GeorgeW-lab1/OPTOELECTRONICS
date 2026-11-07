@@ -1011,12 +1011,6 @@ class BitPoolingOracleApp:
 
     def step_once(self):
 
-        if self.engine.oracle is None:
-
-            self.status_var.set("Status: No oracle target")
-
-            return
-
         result = self.engine.step()
 
         if result is None:
