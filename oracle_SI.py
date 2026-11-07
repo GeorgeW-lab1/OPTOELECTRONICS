@@ -8,6 +8,9 @@ Architecture (every word gets its own isolated oracle search):
     Intended-words box (optional, the words "meant to be typed")   |
          = hidden target index, held ONLY inside the BitOracle <---+
                                                                    |
+    Optoelectronic circuit camera viewport: motion triggers (two consecutive
+    "even" frames) fire the oracle, one trigger = one bit
+                                                                   |
     BitOracle reveals the target index MSB-first, one higher/lower bit per step
                                                                    |
     BitPredictor forecasts the remaining bits from the NLTK probabilities
@@ -18,15 +21,26 @@ Architecture (every word gets its own isolated oracle search):
 
 Requirements:
     Python 3.10+
-    pip install nltk
+    pip install nltk numpy opencv-python
     (tokenisation, language model and detokenisation need no NLTK downloads;
      the optional "Load NLTK Brown corpus" button downloads 'brown' on demand)
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-from itertools import accumulate
 import hashlib
+import queue
+import sys
+import threading
+import time
+import tkinter as tk
+from itertools import accumulate
+from tkinter import ttk, messagebox
+
+import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 try:
     from nltk.lm import KneserNeyInterpolated
@@ -514,6 +528,118 @@ class PredictionSession:
 
 
 # ============================================================
+# OPTOELECTRONIC CIRCUIT CAMERA
+# ============================================================
+
+class MotionTrigger:
+    """
+    Camera trigger from the circuit-camera lab: after a short warm-up, a
+    frame with enough activity yields x = int(std * 10). Two sequential
+    EVEN x values fire one trigger.
+    """
+
+    def __init__(self, warmup=5, threshold=5.0):
+        self.warmup = warmup
+        self.threshold = threshold
+        self.index = 0
+        self.prev_even = False
+
+    def update(self, std):
+        motion = self.index > self.warmup and std > self.threshold
+        x = int(std * 10) if motion else 0
+        even_now = x > 0 and x % 2 == 0
+        fired = even_now and self.prev_even
+        self.prev_even = even_now
+        self.index += 1
+        return fired, x, motion
+
+
+class Source:
+    def __init__(self, index):
+        if cv2 is None:
+            raise RuntimeError("OpenCV is not installed. Run: pip install opencv-python")
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(index, backend)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not (cap.isOpened() and cap.read()[0]):
+            cap.release()
+            raise RuntimeError(f"Cannot open camera {index}.")
+        self.cap = cap
+        self.rgb = None
+
+    def read(self):
+        ok, bgr = self.cap.read()
+        if not ok:
+            return None
+        self.rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    def close(self):
+        self.cap.release()
+
+
+def ppm_photo(rgb):
+    h, w, _ = rgb.shape
+    data = b"P6 %d %d 255\n" % (w, h) + np.ascontiguousarray(rgb, np.uint8).tobytes()
+    return tk.PhotoImage(data=data, format="PPM")
+
+
+class CameraThread(threading.Thread):
+    """
+    Reads the camera and posts frames + trigger flags to a queue. It never
+    touches the oracle or the GUI; the main thread decides what a trigger does.
+    """
+
+    PREVIEW = (256, 192)
+
+    def __init__(self, cam_index, ctl, out):
+        super().__init__(daemon=True)
+        self.cam_index = cam_index
+        self.ctl = ctl
+        self.out = out
+
+    def run(self):
+        try:
+            src = Source(self.cam_index)
+        except RuntimeError as error:
+            self.out.put(("error", str(error)))
+            self.out.put(("done", None))
+            return
+
+        self.out.put(("info", f"USB camera {self.cam_index} opened"))
+        trigger = MotionTrigger()
+        pw, ph = self.PREVIEW
+
+        try:
+            while not self.ctl["stop"]:
+                gray = src.read()
+                if gray is None:
+                    self.out.put(("info", "camera stopped delivering frames"))
+                    break
+
+                small = cv2.resize(gray, (128, 96), interpolation=cv2.INTER_AREA)
+                std = float(np.std(small))
+                fired, x, motion = trigger.update(std)
+
+                rgb = src.rgb if src.rgb is not None else np.stack([gray] * 3, axis=-1)
+                h_img, w_img = rgb.shape[:2]
+                preview = rgb[np.arange(ph) * h_img // ph][:, np.arange(pw) * w_img // pw].copy()
+
+                if self.ctl.get("ir_heatmap", False):
+                    preview[:, :, 0] = np.clip(preview[:, :, 0].astype(int) + 80, 0, 255)
+                    preview[:, :, 2] = np.clip(preview[:, :, 2].astype(int) - 50, 0, 255)
+
+                self.out.put(("frame", dict(
+                    preview=preview, std=std, x=x, motion=motion, trigger=fired
+                )))
+                time.sleep(0.03)
+        finally:
+            src.close()
+            self.out.put(("done", None))
+
+
+# ============================================================
 # MAIN APPLICATION
 # ============================================================
 
@@ -522,8 +648,8 @@ class OracleApplication:
     def __init__(self, root):
         self.root = root
         self.root.title("Bit Oracle — NLTK Word Prediction (isolated per-word oracle)")
-        self.root.geometry("1280x860")
-        self.root.minsize(1000, 700)
+        self.root.geometry("1280x940")
+        self.root.minsize(1000, 760)
 
         self.model = NltkWordModel()
         self.oracle = BitOracle(DEPTH)
@@ -535,10 +661,18 @@ class OracleApplication:
         self.debounce_id = None
         self._model_text = None
 
+        # camera lab
+        self.q = queue.Queue()
+        self.ctl = dict(stop=False, ir_heatmap=False)
+        self.cam_thread = None
+        self.last_trigger = 0.0
+        self.photo = None
+
         self.build_interface()
         self.load_default_dataset()
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(30, self.poll)
 
     # --------------------------------------------------------
     # INTERFACE
@@ -556,7 +690,52 @@ class OracleApplication:
         right = ttk.Frame(main)
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
 
-        # ---- LEFT: dataset / typing / intended ----
+        # ---- LEFT: camera viewport / dataset / typing / intended ----
+
+        cam_frame = ttk.LabelFrame(
+            left, text="0. Optoelectronic Circuit Camera Viewport — triggers drive the oracle"
+        )
+        cam_frame.pack(fill="x", pady=4)
+
+        cam_row = ttk.Frame(cam_frame)
+        cam_row.pack(fill="x", padx=5, pady=5)
+
+        w, h = CameraThread.PREVIEW
+        self.cam_canvas = tk.Canvas(cam_row, width=w, height=h, bg="black",
+                                    highlightthickness=0)
+        self.cam_canvas.pack(side="left")
+        self.cam_img_id = self.cam_canvas.create_image(0, 0, anchor="nw")
+
+        cam_ctl = ttk.Frame(cam_row)
+        cam_ctl.pack(side="left", fill="both", expand=True, padx=10)
+
+        lab_row = ttk.Frame(cam_ctl)
+        lab_row.pack(anchor="w", pady=2)
+        ttk.Button(lab_row, text="Start Lab", command=self.start_lab).pack(side="left", padx=2)
+        ttk.Button(lab_row, text="Stop Lab", command=self.stop_lab).pack(side="left", padx=2)
+
+        idx_row = ttk.Frame(cam_ctl)
+        idx_row.pack(anchor="w", pady=2)
+        ttk.Label(idx_row, text="Camera #").pack(side="left")
+        self.cam_index = tk.IntVar(value=0)
+        ttk.Spinbox(idx_row, from_=0, to=9, textvariable=self.cam_index,
+                    width=4).pack(side="left", padx=4)
+
+        self.v_cam_drive = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            cam_ctl, text="Camera triggers drive the bits\n(off = timer drives them)",
+            variable=self.v_cam_drive
+        ).pack(anchor="w", pady=2)
+
+        self.v_ir = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            cam_ctl, text="IR thermal heatmap", variable=self.v_ir,
+            command=lambda: self.ctl.update(ir_heatmap=self.v_ir.get())
+        ).pack(anchor="w", pady=2)
+
+        self.cam_var = tk.StringVar(value="Lab stopped.")
+        ttk.Label(cam_ctl, textvariable=self.cam_var, font=("Consolas", 9),
+                  justify="left").pack(anchor="w", pady=4)
 
         data_frame = ttk.LabelFrame(
             left, text="1. Dataset — trains the NLTK Kneser-Ney model"
@@ -564,7 +743,7 @@ class OracleApplication:
         data_frame.pack(fill="both", expand=True, pady=4)
 
         self.dataset_text = tk.Text(
-            data_frame, height=8, wrap="word", font=("Consolas", 10)
+            data_frame, height=5, wrap="word", font=("Consolas", 10)
         )
         self.dataset_text.pack(fill="both", expand=True, padx=5, pady=5)
 
@@ -641,8 +820,8 @@ class OracleApplication:
         ttk.Spinbox(top, from_=1, to=100, textvariable=self.word_count,
                     width=5).pack(side="left")
 
-        ttk.Label(top, text="Bit delay ms:").pack(side="left", padx=(10, 3))
-        self.speed = tk.IntVar(value=120)
+        ttk.Label(top, text="Bit delay / trigger cooldown ms:").pack(side="left", padx=(10, 3))
+        self.speed = tk.IntVar(value=250)
         ttk.Spinbox(top, from_=0, to=2000, increment=20,
                     textvariable=self.speed, width=6).pack(side="left")
 
@@ -783,6 +962,84 @@ class OracleApplication:
         self.rebuild_dataset()
 
     # --------------------------------------------------------
+    # CAMERA LAB
+    # --------------------------------------------------------
+
+    def start_lab(self):
+        if self.cam_thread is not None and self.cam_thread.is_alive():
+            return
+        try:
+            index = int(self.cam_index.get())
+        except (ValueError, tk.TclError):
+            index = 0
+        self.ctl["stop"] = False
+        self.cam_thread = CameraThread(index, self.ctl, self.q)
+        self.cam_thread.start()
+        self.cam_var.set("Opening camera...")
+
+    def stop_lab(self):
+        self.ctl["stop"] = True
+
+    def poll(self):
+        latest, fired = None, False
+
+        try:
+            for _ in range(200):
+                event = self.q.get_nowait()
+                kind = event[0]
+
+                if kind == "frame":
+                    latest = event[1]
+                    fired = fired or event[1]["trigger"]
+                elif kind == "error":
+                    messagebox.showerror(
+                        "Camera Error",
+                        event[1] + "\n\nUntick 'Camera triggers drive the bits' "
+                        "to run the oracle on the timer instead."
+                    )
+                    self.cam_var.set("Camera error.")
+                elif kind == "info":
+                    self.cam_var.set(event[1])
+                elif kind == "done":
+                    self.cam_thread = None
+                    self.cam_var.set("Lab stopped.")
+        except queue.Empty:
+            pass
+
+        if latest is not None:
+            self.photo = ppm_photo(latest["preview"])
+            self.cam_canvas.itemconfig(self.cam_img_id, image=self.photo)
+            self.cam_var.set(
+                f"std={latest['std']:5.1f}  x={latest['x']:5d}\n"
+                f"motion={'YES' if latest['motion'] else 'no '}  "
+                f"trigger={'FIRE' if latest['trigger'] else '-'}"
+            )
+
+        if fired:
+            self.on_camera_trigger()
+
+        self.root.after(30, self.poll)
+
+    def on_camera_trigger(self):
+        """One camera trigger = one oracle step (bit), rate-limited by the cooldown."""
+        if not (self.v_cam_drive.get() and self.running):
+            return
+        if self.session is None or self.session.finished:
+            return
+
+        try:
+            cooldown = max(0, int(self.speed.get())) / 1000.0
+        except (ValueError, tk.TclError):
+            cooldown = 0.25
+
+        now = time.perf_counter()
+        if now - self.last_trigger < cooldown:
+            return
+
+        self.last_trigger = now
+        self.advance_once()
+
+    # --------------------------------------------------------
     # RUN CONTROL
     # --------------------------------------------------------
 
@@ -824,7 +1081,18 @@ class OracleApplication:
             return
 
         self.running = True
-        self.loop()
+
+        if self.v_cam_drive.get():
+            # Camera mode: no timer. Each camera trigger reveals one bit.
+            self.start_lab()
+            self.advance_once()      # set up word 1 so the candidates show immediately
+            if not self.session.finished:
+                self.status.set(
+                    "Waiting for circuit-camera triggers — move in front of the "
+                    "viewport (one trigger = one bit)."
+                )
+        else:
+            self.loop()
 
     def step_bit(self):
         self.stop_loop()
@@ -891,9 +1159,10 @@ class OracleApplication:
         self.reg_canvas.delete("all")
         self.progress["value"] = 0
         self.forecast_var.set("Waiting for oracle.")
-        self.status.set("Oracle reset. Dataset and model preserved.")
+        self.status.set("Oracle reset. Dataset, model and camera lab preserved.")
 
     def close(self):
+        self.ctl["stop"] = True
         self.stop_loop()
         if self.debounce_id is not None:
             self.root.after_cancel(self.debounce_id)
