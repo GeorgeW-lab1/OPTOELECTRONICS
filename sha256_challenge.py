@@ -112,6 +112,71 @@ def pow_whole(header: bytes, nonce: int) -> bytes:
     return b"".join(pow_blocks(header, nonce))
 
 
+def sha256_unpad(padded: bytes):
+    """Inverse of sha256_pad: the message, or None if the padding is invalid."""
+    if len(padded) < 64 or len(padded) % 64:
+        return None
+
+    bit_length = int.from_bytes(padded[-8:], "big")
+
+    if bit_length % 8 or bit_length // 8 + 9 > len(padded):
+        return None
+
+    message = padded[:bit_length // 8]
+    return message if sha256_pad(message) == padded else None
+
+
+def extract_record(whole: bytes) -> dict:
+    """
+    Recovers header, nonce, message and hash from a completed passcode (the
+    padded message | nonce | hash record) using only the recovered bytes.
+    The last two 64-byte blocks are the padded nonce and padded hash; the
+    rest is the padded message. Each is unpadded through its own length
+    field, then checked against the others.
+    """
+    info = {"ok": False, "error": None}
+
+    if len(whole) < 192 or len(whole) % 64:
+        info["error"] = f"{len(whole)} bytes is not a padded record"
+        return info
+
+    message = sha256_unpad(whole[:-128])
+    nonce_text = sha256_unpad(whole[-128:-64])
+    digest = sha256_unpad(whole[-64:])
+
+    for name, value in (
+        ("message", message),
+        ("nonce", nonce_text),
+        ("hash", digest),
+    ):
+        if value is None:
+            info["error"] = f"the padded {name} has invalid SHA-256 padding"
+            return info
+
+    if len(digest) != 32:
+        info["error"] = "the padded hash does not hold 32 bytes"
+        return info
+
+    if not nonce_text.isdigit() or not message.endswith(nonce_text):
+        info["error"] = "the padded message does not end with the nonce"
+        return info
+
+    info.update(
+        header=message[:-len(nonce_text)],
+        nonce=int(nonce_text),
+        message=message,
+        hash=int.from_bytes(digest, "big"),
+        hash_ok=hashlib.sha256(message).digest() == digest,
+    )
+    info["zero_bits"] = PASSCODE_BITS - info["hash"].bit_length()
+    info["ok"] = info["hash_ok"]
+
+    if not info["hash_ok"]:
+        info["error"] = "SHA-256 of the extracted message is not the extracted hash"
+
+    return info
+
+
 # ==============================================================================
 # 256-BIT BIT-POOLING ORACLE
 # ==============================================================================
@@ -869,6 +934,108 @@ class SimThread(threading.Thread):
 # MAIN GUI
 # ==============================================================================
 
+class SelectableText(tk.Text):
+    """
+    Read-only text box used for every output field. Long values wrap, and the
+    text can be selected with the mouse and copied: Ctrl+C, right-click >
+    Copy, Ctrl+A to select all, or right-click > Copy All.
+    """
+
+    def __init__(self, master, text="", **kw):
+        style = ttk.Style()
+        kw.setdefault(
+            "bg",
+            style.lookup("TFrame", "background")
+            or master.winfo_toplevel().cget("background"),
+        )
+        kw.setdefault("fg", style.lookup("TLabel", "foreground") or "black")
+        kw.setdefault("font", ("Consolas", 10))
+        kw.setdefault("height", 1)
+        kw.setdefault("width", 20)
+
+        super().__init__(
+            master,
+            wrap="char",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            cursor="xterm",
+            insertwidth=0,
+            **kw,
+        )
+
+        self._shown = None
+
+        self.bind("<Button-1>", lambda e: self.focus_set(), add="+")
+        self.bind("<Control-a>", self._select_all)
+        self.bind("<Control-A>", self._select_all)
+        self.bind("<Configure>", lambda e: self._fit())
+
+        self._menu = tk.Menu(self, tearoff=0)
+        self._menu.add_command(
+            label="Copy", command=lambda: self.event_generate("<<Copy>>")
+        )
+        self._menu.add_command(label="Select All", command=self._select_all)
+        self._menu.add_command(label="Copy All", command=self.copy_all)
+
+        self.bind("<Button-3>", self._popup)
+
+        if sys.platform == "darwin":
+            self.bind("<Button-2>", self._popup)
+
+        self.set(text)
+
+    def _popup(self, event):
+        self.focus_set()
+        self._menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _select_all(self, event=None):
+        self.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def value(self) -> str:
+        return self.get("1.0", "end-1c")
+
+    def copy_all(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.value())
+
+    def set(self, text: str):
+        self.set_tagged([(text, None)])
+
+    def set_tagged(self, parts):
+        """Replaces the content with (text, tag) parts; no-op if unchanged,
+        so a selection survives refreshes that change nothing."""
+        parts = tuple(parts)
+
+        if parts == self._shown:
+            return
+
+        self._shown = parts
+
+        self.configure(state="normal")
+        self.delete("1.0", "end")
+
+        for text, tag in parts:
+            self.insert("end", text, (tag,) if tag else ())
+
+        self.configure(state="disabled")
+        self._fit()
+
+    def _fit(self):
+        try:
+            counted = self.count("1.0", "end-1c", "update", "displaylines")
+            lines = counted[0] if isinstance(counted, (tuple, list)) else counted
+        except (tk.TclError, TypeError):
+            lines = self.value().count("\n") + 1
+
+        lines = max(1, int(lines or 1))
+
+        if int(self.cget("height")) != lines:
+            self.configure(height=lines)
+
+
 class App:
     def __init__(self, window):
         self.window = window
@@ -891,6 +1058,9 @@ class App:
         self.pending_diff = None
         self.arduino_thread = None
         self._oracle_key = None
+        self._register_key = None
+        self._extracted_oracle = None
+        self._arduino_pow = None
 
         self._build_ui()
         self.window.protocol("WM_DELETE_WINDOW", self._close)
@@ -1005,41 +1175,47 @@ class App:
         )
         pow_frame.pack(fill="x", padx=5, pady=5)
 
-        self.v_link = tk.StringVar(value="Arduino: not connected")
-        self.v_pow_diff = tk.StringVar(value="")
-        self.v_pow_header = tk.StringVar(value="HEADER   -")
-        self.v_pow_nonce = tk.StringVar(value="NONCE    -")
-        self.v_pow_hash = tk.StringVar(value="HASH     -")
-        self.v_pow_padded = tk.StringVar(value="PAD MSG  -")
-        self.v_pow_padded_nonce = tk.StringVar(value="PAD NONCE -")
-        self.v_pow_padded_hash = tk.StringVar(value="PAD HASH -")
-        self.v_pow_verify = tk.StringVar(value="VERIFY   -")
-        self.v_pow_oracle = tk.StringVar(value="ORACLE   -")
-        self.v_pow_oracle_padded = tk.StringVar(value="ORACLE PADDED   -")
-        self.v_pow_oracle_verify = tk.StringVar(value="ORACLE VERIFY   -")
-        self.v_pow_match = tk.StringVar(value="")
+        # Every output field is a SelectableText: select and copy any value.
+        pow_frame.columnconfigure(1, weight=1)
 
-        for var in (
-            self.v_link,
-            self.v_pow_diff,
-            self.v_pow_header,
-            self.v_pow_nonce,
-            self.v_pow_hash,
-            self.v_pow_padded,
-            self.v_pow_padded_nonce,
-            self.v_pow_padded_hash,
-            self.v_pow_verify,
-            self.v_pow_oracle,
-            self.v_pow_oracle_padded,
-            self.v_pow_oracle_verify,
-            self.v_pow_match,
-        ):
+        fields = (
+            ("v_link", "", "Arduino: not connected"),
+            ("v_pow_diff", "", ""),
+            ("v_pow_header", "HEADER", "-"),
+            ("v_pow_nonce", "NONCE", "-"),
+            ("v_pow_hash", "HASH", "-"),
+            ("v_pow_padded", "PAD MSG", "-"),
+            ("v_pow_padded_nonce", "PAD NONCE", "-"),
+            ("v_pow_padded_hash", "PAD HASH", "-"),
+            ("v_pow_times", "TIMES", "-"),
+            ("v_pow_verify", "VERIFY", "-"),
+            ("v_pow_oracle_nonce", "ORACLE NONCE", "-"),
+            ("v_pow_oracle_hash", "ORACLE HASH", "-"),
+            ("v_pow_oracle_padded", "ORACLE PADDED", "-"),
+            ("v_pow_oracle_verify", "ORACLE VERIFY", "-"),
+            ("v_pow_match", "", ""),
+        )
+
+        self.pow_fields = []
+
+        for row, (attr, caption, initial) in enumerate(fields):
             ttk.Label(
                 pow_frame,
-                textvariable=var,
-                wraplength=1180,
+                text=caption,
                 font=("Consolas", 10),
-            ).pack(anchor="w", padx=10, pady=1)
+            ).grid(row=row, column=0, sticky="nw", padx=(10, 4), pady=1)
+
+            box = SelectableText(pow_frame, initial)
+            box.grid(row=row, column=1, sticky="ew", padx=(0, 10), pady=1)
+
+            setattr(self, attr, box)
+            self.pow_fields.append((caption, box))
+
+        ttk.Button(
+            pow_frame,
+            text="Copy All Fields",
+            command=self.copy_all_fields,
+        ).grid(row=len(fields), column=1, sticky="e", padx=10, pady=3)
 
         # Local target controls
         target_frame = ttk.LabelFrame(
@@ -1088,6 +1264,41 @@ class App:
             ),
         ).pack(side="left", padx=15, pady=5)
 
+        # Fields recovered from the completed passcode registers
+        extract_frame = ttk.LabelFrame(
+            main_frame,
+            text="Extracted from Completed Passcode",
+        )
+        extract_frame.pack(fill="x", padx=5, pady=5)
+        extract_frame.columnconfigure(1, weight=1)
+
+        self.extract_fields = []
+
+        for row, (attr, caption) in enumerate((
+            ("v_ex_header", "HEADER"),
+            ("v_ex_nonce", "NONCE"),
+            ("v_ex_message", "MESSAGE"),
+            ("v_ex_hash", "HASH"),
+            ("v_ex_check", "CHECK"),
+        )):
+            ttk.Label(
+                extract_frame,
+                text=caption,
+                font=("Consolas", 10),
+            ).grid(row=row, column=0, sticky="nw", padx=(10, 4), pady=1)
+
+            box = SelectableText(extract_frame, "-")
+            box.grid(row=row, column=1, sticky="ew", padx=(0, 10), pady=1)
+
+            setattr(self, attr, box)
+            self.extract_fields.append((caption, box))
+
+        ttk.Button(
+            extract_frame,
+            text="Copy Extracted",
+            command=self.copy_extracted,
+        ).grid(row=5, column=1, sticky="e", padx=10, pady=3)
+
         # Camera and register display
         display_frame = ttk.Frame(main_frame)
         display_frame.pack(
@@ -1128,26 +1339,36 @@ class App:
             fill="both", expand=True, padx=5, pady=5
         )
 
-        self.register_canvas = tk.Canvas(
+        self.register_text = SelectableText(
             register_frame,
-            width=760,
-            height=330,
+            "",
             bg="#121414",
-            highlightthickness=0,
+            fg="#d2e0f0",
+            width=100,
+            height=12,
         )
-        self.register_canvas.pack(
-            padx=5, pady=5
-        )
+        self.register_text.pack(fill="x", padx=5, pady=5)
 
-        self.status_label = ttk.Label(
+        self.register_text.tag_configure(
+            "label", foreground="#88a0c0", font=("Consolas", 10, "bold")
+        )
+        self.register_text.tag_configure("target", foreground="#00e676")
+        self.register_text.tag_configure("guess", foreground="#ffb300")
+        self.register_text.tag_configure("pooled", foreground="#b388ff")
+
+        self.status_label = SelectableText(
             register_frame,
-            text="Status: IDLE",
+            "Status: IDLE",
+            fg="#00e5ff",
             font=("Consolas", 11),
-            foreground="#00e5ff",
         )
-        self.status_label.pack(
-            anchor="w", padx=10, pady=5
-        )
+        self.status_label.pack(fill="x", padx=10, pady=5)
+
+        ttk.Button(
+            register_frame,
+            text="Copy Registers",
+            command=self.register_text.copy_all,
+        ).pack(anchor="e", padx=10, pady=(0, 5))
 
         # Pooling settings
         settings_frame = ttk.LabelFrame(
@@ -1238,10 +1459,15 @@ class App:
 
     def step_search(self):
         self.engine.step()
+        self._refresh_registers()
+        self._check_complete()
 
     def reset_search(self):
         self.engine.reset()
         self.v_custom_target.set("[SECURE]")
+        self._arduino_pow = None
+        self._refresh_registers()
+        self._check_complete()
 
     def list_arduino_ports(self):
         try:
@@ -1362,11 +1588,136 @@ class App:
                 "when the Arduino connects."
             )
 
+    def copy_extracted(self):
+        lines = [
+            f"{caption}: {box.value().strip()}"
+            for caption, box in self.extract_fields
+            if box.value().strip() not in ("", "-")
+        ]
+
+        self.window.clipboard_clear()
+        self.window.clipboard_append("\n".join(lines))
+
+    def _refresh_registers(self):
+        """Redraws the registers now, without waiting for a camera frame."""
+        engine = self.engine
+        revealed = self.v_reveal.get()
+
+        with engine._lock:
+            exposed = (
+                engine.oracle._target
+                if engine.converged or revealed
+                else 0
+            )
+            guess = engine.current_guess
+            pooled = engine.pooled_register
+            status = (
+                f"Status: {engine.last_status} | "
+                f"Bit Step: {engine.step_count}/{engine.bit_depth}"
+            )
+
+        self._draw_hex_rows(exposed, guess, pooled, revealed)
+        self.status_label.set(status)
+
+    def _check_complete(self):
+        """
+        When the passcode registers are complete, forces extraction of the
+        header, nonce, message and hash from the recovered value alone.
+        Clears the extracted fields when the oracle is re-armed.
+        """
+        engine = self.engine
+
+        with engine._lock:
+            oracle = engine.oracle
+            done = engine.converged
+            guess = engine.current_guess
+            depth = engine.bit_depth
+
+        if not done:
+            if self._extracted_oracle is not None:
+                self._extracted_oracle = None
+                self._show_extracted(None)
+
+            return
+
+        if oracle is self._extracted_oracle:
+            return
+
+        self._extracted_oracle = oracle
+        self._show_extracted(
+            extract_record(guess.to_bytes(depth // 8, "big"))
+        )
+
+    def _show_extracted(self, info):
+        boxes = (
+            self.v_ex_header,
+            self.v_ex_nonce,
+            self.v_ex_message,
+            self.v_ex_hash,
+        )
+
+        if info is None:
+            for box in boxes:
+                box.set("-")
+
+            self.v_ex_check.set("-")
+            return
+
+        if info.get("header") is None:
+            for box in boxes:
+                box.set("-")
+
+            self.v_ex_check.set("FAILED  " + info["error"])
+            return
+
+        text = lambda raw: raw.decode("utf-8", errors="replace")
+
+        self.v_ex_header.set(text(info["header"]))
+        self.v_ex_nonce.set(str(info["nonce"]))
+        self.v_ex_message.set(text(info["message"]))
+        self.v_ex_hash.set(f"{info['hash']:064x}")
+
+        if info["ok"]:
+            verdict = (
+                "OK  SHA256(message) equals the extracted hash, "
+                f"{info['zero_bits']} leading zero bits"
+            )
+        else:
+            verdict = "FAILED  " + info["error"]
+
+        arduino = self._arduino_pow
+
+        if arduino is not None and info["ok"]:
+            same = (
+                info["header"] == arduino["header"]
+                and info["nonce"] == arduino["nonce"]
+                and info["hash"] == arduino["hash"]
+            )
+            verdict += (
+                "; identical to the Arduino's proof of work"
+                if same
+                else "; DIFFERS from the Arduino's proof of work"
+            )
+
+        self.v_ex_check.set(verdict)
+
+    def copy_all_fields(self):
+        lines = []
+
+        for caption, box in self.pow_fields:
+            text = box.value().strip()
+
+            if text:
+                lines.append(f"{caption}: {text}" if caption else text)
+
+        self.window.clipboard_clear()
+        self.window.clipboard_append("\n".join(lines))
+
     def _show_pow(self, snap):
         predicted, arduino = snap["predicted"], snap["arduino"]
 
-        # A verified Arduino proof of work arms the SHA-256 oracle: the
-        # passcode becomes SHA256(header + nonce), i.e. the PoW hash.
+        # A verified Arduino proof of work arms the oracle: the passcode
+        # becomes the padded message | nonce | hash record.
         if arduino is not None and arduino["verify"]["ok"]:
             key = (arduino["elapsed"], arduino["nonce"])
 
@@ -1374,6 +1725,9 @@ class App:
                 self._oracle_key = key
                 self.engine.reset(arduino["header"], arduino["nonce"])
                 self.v_custom_target.set("[SECURE]")
+                self._arduino_pow = arduino
+                self._refresh_registers()
+                self._check_complete()
 
         def odds(bits):
             return f"1 in {2 ** bits:,}" if bits <= 20 else f"1 in 2^{bits}"
@@ -1384,37 +1738,36 @@ class App:
             f"hash {odds(PASSCODE_BITS - snap['diff'])}"
         )
 
+        times = []
+
         if arduino is None:
-            self.v_pow_header.set("HEADER   ...")
-            self.v_pow_nonce.set("NONCE    ...")
-            self.v_pow_hash.set("HASH     ...")
-            self.v_pow_padded.set("PAD MSG  ...")
-            self.v_pow_padded_nonce.set("PAD NONCE ...")
-            self.v_pow_padded_hash.set("PAD HASH ...")
-            self.v_pow_verify.set("VERIFY   ...")
+            for box in (
+                self.v_pow_header,
+                self.v_pow_nonce,
+                self.v_pow_hash,
+                self.v_pow_padded,
+                self.v_pow_padded_nonce,
+                self.v_pow_padded_hash,
+                self.v_pow_verify,
+            ):
+                box.set("...")
         else:
             check = arduino["verify"]
             message = check["message"].decode("utf-8", errors="replace")
 
             self.v_pow_header.set(
-                "HEADER   "
-                + arduino["header"].decode("utf-8", errors="replace")
+                arduino["header"].decode("utf-8", errors="replace")
             )
-            self.v_pow_nonce.set(f"NONCE    {arduino['nonce']}")
-            self.v_pow_hash.set(
-                f"HASH     {arduino['hash']:064x}  "
-                f"({arduino['elapsed']:.3f} s)"
-            )
-
-            self.v_pow_padded.set(
-                f"PAD MSG  {format_blocks(arduino['padded'])}"
-            )
+            self.v_pow_nonce.set(str(arduino["nonce"]))
+            self.v_pow_hash.set(f"{arduino['hash']:064x}")
+            self.v_pow_padded.set(format_blocks(arduino["padded"]))
             self.v_pow_padded_nonce.set(
-                f"PAD NONCE {format_blocks(arduino['padded_nonce'])}"
+                format_blocks(arduino["padded_nonce"])
             )
             self.v_pow_padded_hash.set(
-                f"PAD HASH {format_blocks(arduino['padded_hash'])}"
+                format_blocks(arduino["padded_hash"])
             )
+            times.append(f"Arduino {arduino['elapsed']:.3f} s")
 
             if check["ok"]:
                 verdict = (
@@ -1439,41 +1792,37 @@ class App:
                     f"{snap['diff']} required"
                 )
 
-            self.v_pow_verify.set("VERIFY   " + verdict)
+            self.v_pow_verify.set(verdict)
+
+        if predicted is None:
+            self.v_pow_oracle_nonce.set("...")
+            self.v_pow_oracle_hash.set("...")
+        else:
+            self.v_pow_oracle_nonce.set(str(predicted["nonce"]))
+            self.v_pow_oracle_hash.set(f"{predicted['hash']:064x}")
+            times.append(f"Oracle {predicted['elapsed']:.3f} s")
+
+        self.v_pow_times.set("   |   ".join(times) if times else "-")
 
         if snap["predicted_padded"] is None:
             self.v_pow_oracle_padded.set(
-                "ORACLE PADDED   ..."
-                if predicted is None
-                else "ORACLE PADDED   waiting for the header"
+                "..." if predicted is None else "waiting for the header"
             )
         else:
             self.v_pow_oracle_padded.set(
-                "ORACLE PADDED   (message | nonce | hash) "
-                + format_blocks(snap["predicted_padded"])
-            )
-
-        if predicted is None:
-            self.v_pow_oracle.set("ORACLE   ...")
-        else:
-            self.v_pow_oracle.set(
-                f"ORACLE   guess nonce {predicted['nonce']}  "
-                f"hash {predicted['hash']:064x}  "
-                f"({predicted['elapsed']:.3f} s)"
+                format_blocks(snap["predicted_padded"])
             )
 
         guess_check = predicted["verify"] if predicted is not None else None
 
         if predicted is None:
-            self.v_pow_oracle_verify.set("ORACLE VERIFY   ...")
+            self.v_pow_oracle_verify.set("...")
         elif guess_check is None:
-            self.v_pow_oracle_verify.set(
-                "ORACLE VERIFY   waiting for the header"
-            )
+            self.v_pow_oracle_verify.set("waiting for the header")
         else:
             message = guess_check["message"].decode("utf-8", errors="replace")
             detail = (
-                f"\n                 SHA256(\"{message}\") = "
+                f"\nSHA256(\"{message}\") = "
                 f"{guess_check['computed']:064x}  "
                 f"({guess_check['zero_bits']} leading zero bits, "
                 f"{snap['diff']} required)"
@@ -1486,19 +1835,15 @@ class App:
             else:
                 verdict = "FAILED  the guessed hash lacks the required leading zero bits"
 
-            self.v_pow_oracle_verify.set(
-                "ORACLE VERIFY   " + verdict + detail
-            )
+            self.v_pow_oracle_verify.set(verdict + detail)
 
         if snap["match"] is None:
-            self.v_pow_match.set("")
+            match_text = ""
         elif snap["match"]:
-            self.v_pow_match.set(
-                "MATCH: oracle nonce and hash equal the Arduino's"
-            )
+            match_text = "MATCH: oracle nonce and hash equal the Arduino's"
         else:
             nonce_text = "nonce equal" if snap["nonce_match"] else "nonce differs"
-            self.v_pow_match.set(
+            match_text = (
                 f"NO MATCH: {nonce_text}, {snap['bits_agree']}/256 hash bits "
                 f"agree (the {snap['diff']}-bit zero prefix is shared by "
                 "definition)"
@@ -1506,17 +1851,15 @@ class App:
 
         if snap["padded_agree"] is not None:
             agree, total, same = snap["padded_agree"]
-            self.v_pow_match.set(
-                self.v_pow_match.get()
-                + "\n"
-                + (
-                    "PADDED MATCH: oracle's whole padded record equals the "
-                    "Arduino's"
-                    if same
-                    else f"PADDED NO MATCH: {agree}/{total} padded-record "
-                    "bits agree"
-                )
+            match_text += "\n" + (
+                "PADDED MATCH: oracle's whole padded record equals the "
+                "Arduino's"
+                if same
+                else f"PADDED NO MATCH: {agree}/{total} padded-record "
+                "bits agree"
             )
+
+        self.v_pow_match.set(match_text.strip())
 
     def set_custom_target(self):
         text = self.v_custom_target.get()
@@ -1530,6 +1873,9 @@ class App:
 
         self.engine.reset(text.encode("utf-8"), 0)
         self.v_custom_target.set("[SECURE]")
+        self._arduino_pow = None
+        self._refresh_registers()
+        self._check_complete()
         messagebox.showinfo(
             "Oracle Armed",
             "Passcode is now the padded message, nonce and hash of that "
@@ -1539,6 +1885,9 @@ class App:
     def randomize_target(self):
         self.engine.reset()
         self.v_custom_target.set("[SECURE]")
+        self._arduino_pow = None
+        self._refresh_registers()
+        self._check_complete()
 
     def _update_pool_operator(self, event):
         operator = self.operator_combo.get()
@@ -1560,64 +1909,51 @@ class App:
         pooled_value,
         revealed,
     ):
-        self.register_canvas.delete("all")
-
         is_exposed = revealed or self.engine.converged
         active_target = target_value if is_exposed else 0
         depth = self.engine.bit_depth
         width = depth // 4
 
-        # Grow the canvas so a long header's rows are never clipped.
-        row_lines = 1 if not is_exposed else -(-width // 64)
-        row_lines_full = -(-width // 64)
-        needed = 14 + (row_lines + 2 * row_lines_full) * 15 + 3 * 8 + 30
-        self.register_canvas.config(height=max(330, needed))
+        # Frames arrive far faster than the registers change; skipping
+        # unchanged redraws keeps any text the person has selected.
+        key = (
+            is_exposed,
+            active_target,
+            guess_value,
+            pooled_value,
+            depth,
+            self.engine.step_count,
+        )
+
+        if key == self._register_key:
+            return
+
+        self._register_key = key
 
         rows = [
-            ("TARGET", active_target, "#00e676", not is_exposed),
-            ("GUESS ", guess_value, "#ffb300", False),
-            ("POOLED", pooled_value, "#b388ff", False),
+            ("TARGET", active_target, "target", not is_exposed),
+            ("GUESS", guess_value, "guess", False),
+            ("POOLED", pooled_value, "pooled", False),
         ]
 
-        y_offset = 14
+        # Label on its own line, then the value as one unbroken line that
+        # wraps on screen, so copying a register gives contiguous hex.
+        parts = []
 
-        for label, value, colour, hidden in rows:
-            self.register_canvas.create_text(
-                10,
-                y_offset,
-                text=label,
-                fill="#88a0c0",
-                anchor="w",
-                font=("Consolas", 10, "bold"),
+        for label, value, tag, hidden in rows:
+            parts.append((label + "\n", "label"))
+            parts.append(
+                ("[HIDDEN]" if hidden else f"{value:0{width}X}", tag)
             )
+            parts.append(("\n", None))
 
-            hex_text = "[HIDDEN]" if hidden else f"{value:0{width}X}"
+        parts.append((
+            f"{depth}-bit padded record | "
+            f"{self.engine.step_count}/{depth} reconstruction steps",
+            None,
+        ))
 
-            # One 64-byte block (128 hex characters) per two lines.
-            for start in range(0, len(hex_text), 64):
-                self.register_canvas.create_text(
-                    90,
-                    y_offset,
-                    text=hex_text[start:start + 64],
-                    fill=colour,
-                    anchor="w",
-                    font=("Consolas", 10),
-                )
-                y_offset += 15
-
-            y_offset += 8
-
-        self.register_canvas.create_text(
-            10,
-            y_offset + 4,
-            text=(
-                f"{depth}-bit padded record | "
-                f"{self.engine.step_count}/{depth} reconstruction steps"
-            ),
-            fill="#d2e0f0",
-            anchor="w",
-            font=("Consolas", 10),
-        )
+        self.register_text.set_tagged(parts)
 
     def _poll(self):
         try:
@@ -1639,11 +1975,11 @@ class App:
                         self.v_reveal.get(),
                     )
 
-                    self.status_label.config(
-                        text=(
-                            f"Status: {data['status']} | "
-                            f"Bit Step: {data['steps']}/{self.engine.bit_depth}"
-                        )
+                    self._check_complete()
+
+                    self.status_label.set(
+                        f"Status: {data['status']} | "
+                        f"Bit Step: {data['steps']}/{self.engine.bit_depth}"
                     )
 
                 elif event[0] == "arduino":
