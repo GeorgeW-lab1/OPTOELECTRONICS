@@ -1,19 +1,14 @@
 """
-Bit-Pooling Oracle Lock Box Lab — Parallel Optical Grid Solvers
-Python SHA-256 proof-of-work miner with pure Python emulation & parallel spatial grid processing.
-
-Each bit of the reconstructed passcode is mapped to a dedicated spatial sector grid in 
-the webcam feed. Optical modulation within each sector independently triggers and solves 
-that specific bit position.
+Bit-Pooling Oracle Lock Box Lab
+Python + Arduino SHA-256 proof-of-work miner (with Full Python Emulation).
 
 Install dependencies:
     pip install opencv-python numpy
-    (pyserial is optional; hardware Arduino communication falls back to Python software emulation)
+    (pyserial is optional now since the Arduino is emulated in software)
 """
 
 import asyncio
 import hashlib
-import math
 import queue
 import secrets
 import sys
@@ -45,6 +40,12 @@ PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
 
 
 def sha256_pad(message: bytes) -> bytes:
+    """
+    SHA-256 padding: message, 0x80, zero bytes, then the 64-bit big-endian
+    bit length, making a whole number of 64-byte blocks. For the Arduino's
+    proof of work the message is header + decimal nonce, so the nonce is
+    carried inside the padded message.
+    """
     zeros = (55 - len(message)) % 64
     return (
         message
@@ -55,12 +56,14 @@ def sha256_pad(message: bytes) -> bytes:
 
 
 def format_blocks(data: bytes) -> str:
+    """Hex of a padded message, one 64-byte block per space-separated group."""
     return " ".join(
         data[i:i + 64].hex() for i in range(0, len(data), 64)
     )
 
 
 def padded_agreement(a: bytes, b: bytes):
+    """(agreeing bits, total bits, identical) for two padded messages."""
     n = min(len(a), len(b))
     diff = int.from_bytes(a[:n], "big") ^ int.from_bytes(b[:n], "big")
     total = max(len(a), len(b)) * 8
@@ -68,6 +71,10 @@ def padded_agreement(a: bytes, b: bytes):
 
 
 def pow_blocks(header: bytes, nonce: int):
+    """
+    The three padded fields of a proof of work, each the SHA-256 padding of
+    its own bytes: (header + nonce, nonce text alone, the 32 hash bytes).
+    """
     nonce_text = str(nonce).encode("ascii")
     message = header + nonce_text
     digest = hashlib.sha256(message).digest()
@@ -80,10 +87,12 @@ def pow_blocks(header: bytes, nonce: int):
 
 
 def pow_whole(header: bytes, nonce: int) -> bytes:
+    """The whole padded record: message blocks, nonce block, hash block."""
     return b"".join(pow_blocks(header, nonce))
 
 
 def sha256_unpad(padded: bytes):
+    """Inverse of sha256_pad: the message, or None if the padding is invalid."""
     if len(padded) < 64 or len(padded) % 64:
         return None
 
@@ -97,6 +106,13 @@ def sha256_unpad(padded: bytes):
 
 
 def extract_partial(known: bytes, total: int) -> dict:
+    """
+    Forces extraction from the guess: given the bytes of the passcode
+    recovered so far (a prefix, MSB first), returns whatever the prefix
+    already determines. The passcode is padded message | padded nonce |
+    padded hash, and each field is revealed the moment its padded block is
+    complete.
+    """
     info = {
         "known": len(known),
         "total": total,
@@ -197,6 +213,7 @@ class BitPoolingOracle:
         self.schmitt_trigger = 0.5
 
         self.pooled_bits = 0
+        self.pooled_count = 0
         self.is_done = False
 
     def _padded_value(self) -> int:
@@ -210,12 +227,6 @@ class BitPoolingOracle:
         if self.is_done:
             return 0
         return 1 if self._padded_value() >= trial_val else 0
-
-    def query_single_bit_position(self, bit_index: int) -> int:
-        """Queries whether a specific bit position in target is set (MSB at index 0)."""
-        target_val = self._padded_value()
-        shift = self.bit_depth - 1 - bit_index
-        return (target_val >> shift) & 1
 
     def pool_step(self, val: int) -> int:
         bits = [(val >> i) & 1 for i in range(self.bit_depth)]
@@ -259,20 +270,18 @@ class BitPoolingOracle:
 
 
 # ==============================================================================
-# PARALLEL BIT-POOLING SEARCH ENGINE
+# 256-BIT BIT-POOLING SEARCH ENGINE
 # ==============================================================================
 
-class ParallelBitPoolingSearchEngine:
-    """
-    Search engine supporting independent parallel bit solving via spatial sectors.
-    """
+class BitPoolingSearchEngine:
     def __init__(self):
         self._lock = threading.RLock()
         self.oracle = BitPoolingOracle()
         self.bit_depth = self.oracle.bit_depth
+        self.max_val = self.oracle.max_val
 
         self.current_guess = 0
-        self.solved_bits_mask = [False] * self.bit_depth
+        self.step_count = 0
         self.history = [0]
         self.converged = False
         self.last_status = "INITIALIZED"
@@ -291,38 +300,33 @@ class ParallelBitPoolingSearchEngine:
     def _reset(self, header=None, nonce=None):
         self.oracle = BitPoolingOracle(header, nonce)
         self.bit_depth = self.oracle.bit_depth
-
+        self.max_val = self.oracle.max_val
         self.oracle.pool_op = self.pool_op
         self.oracle.kernel_size = self.kernel_size
         self.current_guess = 0
-        self.solved_bits_mask = [False] * self.bit_depth
+        self.step_count = 0
         self.history = [0]
         self.converged = False
         self.last_status = "READY"
         self._update_registers()
 
-    def solve_bit_at_index(self, bit_index: int):
-        """Solves a single bit index in parallel based on optical sector trigger."""
-        if self.converged or bit_index < 0 or bit_index >= self.bit_depth:
+    def _step(self):
+        if self.converged or self.step_count >= self.bit_depth:
             return
 
-        if self.solved_bits_mask[bit_index]:
-            return
+        self.step_count += 1
+        shift = self.bit_depth - self.step_count
+        trial_value = self.oracle.pooled_bits | (1 << shift)
+        bit = self.oracle.query_bit(trial_value)
 
-        shift = self.bit_depth - 1 - bit_index
-        bit_val = self.oracle.query_single_bit_position(bit_index)
+        if bit:
+            self.oracle.pooled_bits |= 1 << shift
 
-        if bit_val:
-            self.current_guess |= (1 << shift)
-        else:
-            self.current_guess &= ~(1 << shift)
-
-        self.solved_bits_mask[bit_index] = True
-        self.oracle.pooled_bits = self.current_guess
+        self.current_guess = self.oracle.pooled_bits
         self.history.append(self.current_guess)
         self._update_registers()
 
-        if all(self.solved_bits_mask):
+        if self.step_count >= self.bit_depth:
             self.oracle.is_done = True
             self.converged = True
 
@@ -331,17 +335,13 @@ class ParallelBitPoolingSearchEngine:
             else:
                 self.last_status = "RECONSTRUCTION MISMATCH"
 
-    def step_sequential(self):
-        """Sequential single bit step fallback."""
-        with self._lock:
-            for idx, solved in enumerate(self.solved_bits_mask):
-                if not solved:
-                    self.solve_bit_at_index(idx)
-                    break
-
     def reset(self, header=None, nonce=None):
         with self._lock:
             self._reset(header, nonce)
+
+    def step(self):
+        with self._lock:
+            self._step()
 
     def _update_registers(self):
         self.guess_reg = self.current_guess
@@ -353,13 +353,9 @@ class ParallelBitPoolingSearchEngine:
 
         self.pooled_register = self.oracle.pool_step(self.current_guess)
 
-    @property
-    def step_count(self):
-        return sum(1 for s in self.solved_bits_mask if s)
-
 
 # ==============================================================================
-# PROOF-OF-WORK SESSION & EMULATION
+# PROOF-OF-WORK SESSION
 # ==============================================================================
 
 MIN_DIFF = 0
@@ -536,7 +532,12 @@ class BackgroundPredictor(threading.Thread):
         session.set_predicted(hash_guess, nonce)
 
 
+# ==============================================================================
+# ARDUINO EMULATOR & LINK
+# ==============================================================================
+
 class EmulatedArduinoMiner:
+    """Software emulation of the Arduino SHA-256 miner sketch."""
     def __init__(self):
         self.input_data = "arduino-sha256"
         self.difficulty = 12
@@ -597,6 +598,7 @@ class EmulatedArduinoMiner:
 
 
 class ArduinoMiner:
+    """Hardware serial link wrapper, falls back gracefully if emulated."""
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 0.2):
         if port.upper() == "EMULATED":
             self.is_emulated = True
@@ -605,7 +607,9 @@ class ArduinoMiner:
             
         self.is_emulated = False
         if serial is None:
-            raise RuntimeError("pyserial is not installed. Type 'EMULATED' to use Python software emulation.")
+            raise RuntimeError(
+                "pyserial is not installed. Type 'EMULATED' into the port box to use software emulation."
+            )
 
         self.ser = serial.Serial(port, baudrate, timeout=timeout)
         time.sleep(2.0)
@@ -703,6 +707,7 @@ class ArduinoThread(threading.Thread):
 
     def run(self):
         miner = None
+
         try:
             miner = ArduinoMiner(self.port)
             connected_msg = "Connected (Software Emulation)." if miner.is_emulated else "Connected via Serial."
@@ -720,7 +725,7 @@ class ArduinoThread(threading.Thread):
                 if result is not None and self.session is not None:
                     self.session.set_arduino(*result)
                 elif miner.is_emulated:
-                    time.sleep(0.005)
+                    time.sleep(0.005) # Yield CPU slightly during emulation run
 
         except Exception as e:
             self.out.put(("arduino_error", f"{type(e).__name__}: {e}"))
@@ -736,13 +741,15 @@ class ArduinoThread(threading.Thread):
 
 
 # ==============================================================================
-# CAMERA SOURCE & PARALLEL SPATIAL GRID PROCESSING
+# CAMERA SOURCE
 # ==============================================================================
 
 class Source:
     def __init__(self, index: int):
         if cv2 is None:
-            raise RuntimeError("OpenCV is not installed. Run: pip install opencv-python")
+            raise RuntimeError(
+                "OpenCV is not installed. Run: pip install opencv-python"
+            )
 
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(index, backend)
@@ -777,12 +784,12 @@ def ppm_photo(rgb: np.ndarray) -> tk.PhotoImage:
     return tk.PhotoImage(data=data, format="PPM")
 
 
-class ParallelGridSimThread(threading.Thread):
-    """
-    Divides camera viewport into a spatial grid (1 sector per bit).
-    Processes motion/intensity per sector to independently solve bits in parallel.
-    """
-    def __init__(self, cam_index, ctl, out, engine: ParallelBitPoolingSearchEngine):
+# ==============================================================================
+# CAMERA THREAD
+# ==============================================================================
+
+class SimThread(threading.Thread):
+    def __init__(self, cam_index, ctl, out, engine):
         super().__init__(daemon=True)
         self.cam_index = cam_index
         self.ctl = ctl
@@ -802,12 +809,12 @@ class ParallelGridSimThread(threading.Thread):
             out.put(("done", None))
             return
 
-        out.put(("info", f"USB camera {self.cam_index} opened in Parallel Spatial Sector Mode."))
+        out.put(("info", f"USB camera {self.cam_index} opened."))
         out.put(("camera_started", None))
 
         previous_time = time.perf_counter()
         frame_index = 0
-        prev_gray = None
+        previous_even = False
 
         try:
             while not ctl["stop"]:
@@ -821,18 +828,22 @@ class ParallelGridSimThread(threading.Thread):
                 dt = min(max(now - previous_time, 1e-3), 0.25)
                 previous_time = now
 
-                bit_depth = engine.bit_depth
-                grid_cols = 32
-                grid_rows = math.ceil(bit_depth / grid_cols)
+                small = cv2.resize(gray, (128, 96), interpolation=cv2.INTER_AREA)
+                motion_detected = frame_index > 5 and np.std(small) > 5.0
+                motion_value = int(np.std(small) * 10) if motion_detected else 0
 
-                h, w = gray.shape
-                cell_w = w / grid_cols
-                cell_h = h / grid_rows
+                even_now = motion_value > 0 and motion_value % 2 == 0
+                even_state = even_now and previous_even
+                previous_even = even_now
+
+                if even_state and ctl.get("auto_step", True) and not engine.converged:
+                    engine.step()
 
                 rgb = src.rgb
                 if rgb is None:
                     rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-                elif rgb.ndim == 2:
+
+                if rgb.ndim == 2:
                     rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
                 elif rgb.shape[2] == 4:
                     rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2RGB)
@@ -842,44 +853,6 @@ class ParallelGridSimThread(threading.Thread):
                 if ctl.get("ir_heatmap", False):
                     preview[:, :, 0] = np.clip(preview[:, :, 0].astype(int) + 80, 0, 255)
                     preview[:, :, 2] = np.clip(preview[:, :, 2].astype(int) - 50, 0, 255)
-
-                # Process parallel spatial sectors
-                if prev_gray is not None and frame_index > 5:
-                    diff_frame = cv2.absdiff(gray, prev_gray)
-                    
-                    for bit_idx in range(bit_depth):
-                        if engine.solved_bits_mask[bit_idx]:
-                            continue
-
-                        r = bit_idx // grid_cols
-                        c = bit_idx % grid_cols
-
-                        x1, y1 = int(c * cell_w), int(r * cell_h)
-                        x2, y2 = int((c + 1) * cell_w), int((r + 1) * cell_h)
-
-                        sector = diff_frame[y1:y2, x1:x2]
-                        sector_activity = np.mean(sector)
-
-                        # Trigger parallel bit solve if sector exceeds optical activity threshold
-                        if sector_activity > 3.0 and ctl.get("auto_step", True):
-                            with engine._lock:
-                                engine.solve_bit_at_index(bit_idx)
-
-                prev_gray = gray.copy()
-
-                # Overlay spatial grid and solved bit statuses on viewport
-                scale_x = 320 / w
-                scale_y = 240 / h
-                for bit_idx in range(bit_depth):
-                    r = bit_idx // grid_cols
-                    c = bit_idx % grid_cols
-
-                    px1, py1 = int(c * cell_w * scale_x), int(r * cell_h * scale_y)
-                    px2, py2 = int((c + 1) * cell_w * scale_x), int((r + 1) * cell_h * scale_y)
-
-                    is_solved = engine.solved_bits_mask[bit_idx]
-                    color = (0, 255, 0) if is_solved else (80, 80, 80)
-                    cv2.rectangle(preview, (px1, py1), (px2, py2), color, 1)
 
                 exposed_target = (
                     engine.oracle._target
@@ -1006,7 +979,7 @@ class SelectableText(tk.Text):
 class App:
     def __init__(self, window):
         self.window = window
-        self.window.title("Bit-Pooling Oracle Lock Box Lab — Parallel Spatial Sector Solver")
+        self.window.title("Bit-Pooling Oracle Lock Box Lab — SHA-256 Padded Message (Emulated)")
 
         self.q = queue.Queue()
         self.ctl = {
@@ -1017,7 +990,7 @@ class App:
             "arduino_stop": False,
         }
 
-        self.engine = ParallelBitPoolingSearchEngine()
+        self.engine = BitPoolingSearchEngine()
         self.camera_thread = None
         self.camera_ready = False
         self.pending_diff = None
@@ -1062,10 +1035,10 @@ class App:
         control_frame = ttk.LabelFrame(main_frame, text="Laboratory Controls")
         control_frame.pack(fill="x", padx=5, pady=5)
 
-        ttk.Button(control_frame, text="Start Camera Grid", command=self.start_camera).pack(side="left", padx=5, pady=5)
-        ttk.Button(control_frame, text="Stop Camera Grid", command=self.stop_camera).pack(side="left", padx=5, pady=5)
-        ttk.Button(control_frame, text="Step Next Unsolved Bit", command=self.step_search).pack(side="left", padx=5, pady=5)
-        ttk.Button(control_frame, text="Reset Pool & Grid", command=self.reset_search).pack(side="left", padx=5, pady=5)
+        ttk.Button(control_frame, text="Start Camera", command=self.start_camera).pack(side="left", padx=5, pady=5)
+        ttk.Button(control_frame, text="Stop Camera", command=self.stop_camera).pack(side="left", padx=5, pady=5)
+        ttk.Button(control_frame, text="Step Bit Pool", command=self.step_search).pack(side="left", padx=5, pady=5)
+        ttk.Button(control_frame, text="Reset Pool", command=self.reset_search).pack(side="left", padx=5, pady=5)
 
         self.v_ir = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1175,7 +1148,7 @@ class App:
         display_frame = ttk.Frame(main_frame)
         display_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        camera_frame = ttk.LabelFrame(display_frame, text="Optoelectronic Parallel Sector Grid Viewport")
+        camera_frame = ttk.LabelFrame(display_frame, text="Optoelectronic Circuit Camera Viewport")
         camera_frame.pack(side="left", padx=5, pady=5)
 
         self.cam_canvas = tk.Canvas(camera_frame, width=320, height=240, bg="black")
@@ -1230,18 +1203,18 @@ class App:
 
     def start_camera(self):
         if self.camera_thread is not None and self.camera_thread.is_alive():
-            messagebox.showwarning("Already Running", "The camera grid is already running.")
+            messagebox.showwarning("Already Running", "The camera lab is already running.")
             return
 
         self.ctl["stop"] = False
-        self.camera_thread = ParallelGridSimThread(0, self.ctl, self.q, self.engine)
+        self.camera_thread = SimThread(0, self.ctl, self.q, self.engine)
         self.camera_thread.start()
 
     def stop_camera(self):
         self.ctl["stop"] = True
 
     def step_search(self):
-        self.engine.step_sequential()
+        self.engine.step()
         self._refresh_registers()
         self._check_complete()
 
@@ -1348,7 +1321,7 @@ class App:
             exposed = engine.oracle._target if engine.converged or revealed else 0
             guess = engine.current_guess
             pooled = engine.pooled_register
-            status = f"Status: {engine.last_status} | Solved Bits: {engine.step_count}/{engine.bit_depth}"
+            status = f"Status: {engine.last_status} | Bit Step: {engine.step_count}/{engine.bit_depth}"
 
         self._draw_hex_rows(exposed, guess, pooled, revealed)
         self.status_label.set(status)
@@ -1617,7 +1590,7 @@ class App:
             parts.append(("[HIDDEN]" if hidden else f"{value:0{width}X}", tag))
             parts.append(("\n", None))
 
-        parts.append((f"{depth}-bit padded record | {self.engine.step_count}/{depth} parallel reconstruction steps", None))
+        parts.append((f"{depth}-bit padded record | {self.engine.step_count}/{depth} reconstruction steps", None))
         self.register_text.set_tagged(parts)
 
     def _poll(self):
@@ -1631,7 +1604,7 @@ class App:
                     self.cam_canvas.itemconfig(self.cam_image_id, image=self.photo)
                     self._draw_hex_rows(data["target"], data["guess"], data["pooled"], self.v_reveal.get())
                     self._check_complete()
-                    self.status_label.set(f"Status: {data['status']} | Solved Bits: {data['steps']}/{self.engine.bit_depth}")
+                    self.status_label.set(f"Status: {data['status']} | Bit Step: {data['steps']}/{self.engine.bit_depth}")
 
                 elif event[0] == "arduino":
                     self.v_link.set(f"Miner: {event[1]}")
