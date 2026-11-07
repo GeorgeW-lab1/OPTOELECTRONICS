@@ -1,8 +1,11 @@
 """
-Bit-Pooling Factorisation Lab - N only, factors unknown, MSB-first, deferred check.
-The oracle holds only N. a is pooled MSB-first from a path counter; b is then pooled
-MSB-first by the higher-lower oracle bit (is a*b_trial <= N?), using only shifts/adds.
-The expensive check N % a == 0 runs ONCE per fully pooled path. Factors are unsealed
+Bit-Pooling Factorisation Lab - N only, factors unknown, MSB-first, A and B both
+oracle-decided (balanced P and Q), predicted pair ordering, deferred check.
+At each depth the 4 candidate bit pairs for (A, B) are ranked by a prediction score
+(distance of the cell-midpoint product from N). The best-ranked pair is proposed
+first; the oracle confirms it with an interval test that uses only N, or rejects it
+and the next best is tried. Exhausted nodes backtrack (DFS, O(1) work per step).
+The expensive check N % a == 0 runs ONCE per fully pooled leaf. Factors are unsealed
 only if it verifies.
 """
 
@@ -11,7 +14,6 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from math import isqrt
 from tkinter import ttk, messagebox
 
 import numpy as np
@@ -54,9 +56,20 @@ class BitPoolingOracle:
         self.pool_op = "POPCOUNT"
         self.schmitt_trigger = 0.5
 
-    def query_bit(self, trial_prod):
-        """Higher-lower oracle bit (loop-free): 1 if a*b_trial still fits under N."""
-        return 1 if trial_prod <= self.n else 0
+    def query_bit(self, A, B, r):
+        """Oracle bit: 1 if prefixes A, B (r bits still unpooled in each) can still
+        give a*b == N, with a <= b. Pure interval test, uses only N."""
+        if A > B:
+            return 0
+        m = (1 << r) - 1
+        alo, blo = A << r, B << r
+        return 1 if alo * blo <= self.n <= (alo + m) * (blo + m) else 0
+
+    def predict(self, A, B, r):
+        """Prediction score (lower = better): distance of the cell-midpoint product from N."""
+        m = (1 << r) - 1
+        am, bm = (A << r) + (m >> 1), (B << r) + (m >> 1)
+        return abs(am * bm - self.n)
 
     def submit(self, d):
         """The single expensive check. Unseals the factors only if N % d == 0."""
@@ -99,7 +112,7 @@ class BitPoolingOracle:
 
 
 # ==============================================================================
-# ENGINE: MSB-first bit pooling, shift/add steps, deferred check
+# ENGINE: MSB-first, A and B oracle-decided, predicted order, DFS, deferred check
 # ==============================================================================
 class SearchEngine:
     WINDOW = 32
@@ -110,34 +123,38 @@ class SearchEngine:
         self.pool_op = "POPCOUNT"
         self.oracle = None
         self.running = False
-        self.L = 2                 # bits of a
-        self.B = 2                 # bits of b
-        self.T = 4                 # steps per path
-        self.paths_total = 4
+        self.L = 2
         self._clear()
         self.last_status = "NO PROBLEM LOADED"
 
-    def _new_path(self):
-        self.a = self.b = self.base = 0       # base == a * (bits of b pooled so far)
-        self.k = 0                            # step index within the path
-
     def _clear(self):
-        self._new_path()
-        self.trial = 2                        # selects a's bits for the current path
+        self.A = self.B = 0                 # prefixes pooled so far (MSB first)
+        self.depth = 0                      # bits pooled in each register
+        self.opt = [0] * (self.L + 2)       # index into the predicted order, per depth
+        self.order = [None] * (self.L + 2)  # predicted order of the 4 bit pairs, per depth
+        self.checks = 0                     # deferred checks performed
         self.converged = False
         self.finished = False
         self.p = self.q = 0
+
+    def _rank(self):
+        """Rank the 4 (A bit, B bit) pairs at the current depth, best prediction first."""
+        o, r = self.oracle, self.L - self.depth - 1
+        sc = []
+        for i in range(4):
+            A2, B2 = (self.A << 1) | (i >> 1), (self.B << 1) | (i & 1)
+            sc.append((o.predict(A2, B2, r) if A2 <= B2 else float("inf"), i))
+        sc.sort()
+        return [i for _, i in sc]
 
     def load(self, n):
         with self.lock:
             self.running = False
             self.oracle = BitPoolingOracle(n)
             self._apply()
+            self.L = n.bit_length() // 2 + 1        # balanced: both factors fit in L bits
             self._clear()
-            self.L = max(2, isqrt(n).bit_length())   # the smaller factor fits in L bits
-            self.B = n.bit_length()                  # b = N // a fits in B bits
-            self.T = self.L + self.B
-            self.paths_total = 1 << self.L
+            self.order[0] = self._rank()
             self.last_status = "READY"
 
     def restart(self):
@@ -166,8 +183,17 @@ class SearchEngine:
             return True
         return False
 
+    def _backtrack(self):
+        if self.depth == 0:
+            self.finished, self.running = True, False
+            self.last_status = "NO BALANCED FACTOR PAIR FOUND - N is prime"
+            return
+        self.depth -= 1
+        self.A >>= 1
+        self.B >>= 1
+
     def step(self):
-        """Pool one bit, MSB first (shifts/adds only). N % a runs only when a path is full."""
+        """Pool one bit of A and B (MSB first). O(1) work, no candidate loops."""
         with self.lock:
             o = self.oracle
             if o is None or self.finished:
@@ -177,33 +203,32 @@ class SearchEngine:
                     self.finished = True
                 return
 
-            k = self.k
-            if k < self.L:                                    # phase 1: pool a, MSB first
-                s = self.L - 1 - k
-                self.a |= ((self.trial >> s) & 1) << s
-                self.k = k + 1
-                self.last_status = "POOLING a (MSB first)"
-                return
-            if k < self.T:                                    # phase 2: pool b via oracle bits
-                s = self.B - 1 - (k - self.L)
-                t = self.base + (self.a << s)                 # a * (b_pooled | bit s)
-                if o.query_bit(t):
-                    self.base = t
-                    self.b |= 1 << s
-                self.k = k + 1
-                self.last_status = "POOLING b (MSB first, oracle bits), check deferred"
+            if self.depth == self.L:                       # both registers full: deferred check
+                self.checks += 1
+                if self._accept(self.A):
+                    return
+                self.last_status = "CHECK FAILED - backtrack"
+                self._backtrack()
                 return
 
-            # path fully pooled: the single deferred check
-            if self._accept(self.a):
+            i = self.opt[self.depth]
+            if i >= 4:                                     # all predictions rejected
+                self.last_status = "BACKTRACKING"
+                self._backtrack()
                 return
-            self.trial += 1
-            if self.trial >= self.paths_total:
-                self.finished, self.running = True, False
-                self.last_status = "NO FACTOR FOUND - N is prime"
-                return
-            self._new_path()
-            self.last_status = "CHECK FAILED - next path"
+            self.opt[self.depth] = i + 1
+            combo = self.order[self.depth][i]              # i-th best predicted bit pair
+            A2 = (self.A << 1) | (combo >> 1)
+            B2 = (self.B << 1) | (combo & 1)
+            if o.query_bit(A2, B2, self.L - self.depth - 1):   # oracle confirms
+                self.A, self.B = A2, B2
+                self.depth += 1
+                self.opt[self.depth] = 0
+                if self.depth < self.L:
+                    self.order[self.depth] = self._rank()
+                self.last_status = "POOLING A and B (predicted, oracle-confirmed), check deferred"
+            else:
+                self.last_status = "ORACLE REJECTED predicted pair - trying next best"
 
     def solve_all(self):
         if self.running or self.oracle is None:
@@ -221,24 +246,33 @@ class SearchEngine:
 
     def snapshot(self):
         W, o = self.WINDOW, self.oracle
-        s = dict(W=W, n_win=0, a_win=0, b_win=0, p_win=0, pool_bits=0,
+        z = (0, 1, 0)
+        s = dict(W=W, n=z, a=z, b=z, p_win=0, pool_bits=0,
                  n_txt="—", a_txt="—", b_txt="—", p_txt="",
                  status=self.last_status, level=0, front=0, maxl=0)
         if o is None:
             return s
         with self.lock:
-            def top(x, width):
-                return x >> max(0, width - W)
-            s["level"], s["maxl"], s["front"] = self.k, self.T, self.trial
-            s["n_win"] = top(o.n, o.n.bit_length())
+            def top(x, width, pooled):
+                shown = min(W, width)                       # MSB-aligned window
+                return (x >> (width - shown), shown, min(pooled, shown))
+
+            L, d = self.L, self.depth
+            s["level"], s["maxl"], s["front"] = d, L, self.checks
+            s["n"] = top(o.n, o.n.bit_length(), W)
             s["n_txt"] = f"N top {W} bits   {fmt_big(o.n)}"
-            s["a_win"], s["b_win"] = top(self.a, self.L), top(self.b, self.B)
-            s["a_txt"] = f"A: path {self.trial:,}, top {W} of {self.L} bits (MSB first)"
-            s["b_txt"] = f"B: top {W} of {self.B} bits, set by the oracle"
-            s["p_win"], s["pool_bits"] = o.pool_step(s["a_win"], W)
+            s["a"] = top(self.A << (L - d), L, d)
+            s["b"] = top(self.B << (L - d), L, d)
+            r = L - d
+            a_pred = (self.A << r) + (((1 << r) - 1) >> 1)
+            b_pred = o.n // a_pred if a_pred else 0
+            s["a_txt"] = f"A predicted ≈ {fmt_big(a_pred) if a_pred else '—'}"
+            s["b_txt"] = f"B predicted ≈ {fmt_big(b_pred) if b_pred else '—'}"
+            s["p_win"], s["pool_bits"] = o.pool_step(s["a"][0], s["a"][1])
             s["p_txt"] = f"pooled A ({o.pool_op}, k={o.kernel_size})"
             if self.converged:
-                s["a_win"], s["b_win"] = top(self.p, self.L), top(self.q, self.B)
+                s["a"] = top(self.p, L, L)
+                s["b"] = top(self.q, L, L)
                 s["a_txt"], s["b_txt"] = "P = " + fmt_big(self.p), "Q = " + fmt_big(self.q)
         return s
 
@@ -324,7 +358,7 @@ class SimThread(threading.Thread):
 class App:
     def __init__(self, window):
         self.window = window
-        window.title("Bit-Pooling Factorisation Lab - MSB-first, deferred check")
+        window.title("Bit-Pooling Factorisation Lab - MSB-first, predicted pair, deferred check")
         self.q = queue.Queue()
         self.ctl = dict(stop=False, ir_heatmap=False, auto_step=True)
         self.thread = None
@@ -416,21 +450,23 @@ class App:
             pass
 
     def _draw(self, s):
-        c, W = self.reg_canvas, s["W"]
+        c = self.reg_canvas
         c.delete("all")
-        rows = [("N hi  ", s["n_win"], W, "#00e676", s["n_txt"]),
-                ("A     ", s["a_win"], W, "#ffb300", s["a_txt"]),
-                ("B     ", s["b_win"], W, "#ff7043", s["b_txt"]),
-                ("POOLED", s["p_win"], s["pool_bits"], "#b388ff", s["p_txt"])]
+        rows = [("N hi  ", s["n"], "#00e676", s["n_txt"]),
+                ("A     ", s["a"], "#ffb300", s["a_txt"]),
+                ("B     ", s["b"], "#ff7043", s["b_txt"]),
+                ("POOLED", (s["p_win"], s["pool_bits"], s["pool_bits"]), "#b388ff", s["p_txt"])]
         y = 6
-        for label, val, nbits, color, txt in rows:
+        for label, (val, nbits, pooled), color, txt in rows:
             c.create_text(6, y + 10, text=label, fill="#88a0c0", anchor="w", font=("Consolas", 10, "bold"))
             bx = 70
-            for b in range(nbits - 1, -1, -1):
-                bit = (val >> b) & 1
-                c.create_rectangle(bx, y, bx + 16, y + 22, fill=color if bit else "#1e2430", outline="#38445c")
-                c.create_text(bx + 8, y + 11, text=str(bit), fill="#000000" if bit else "#708090",
-                              font=("Consolas", 8, "bold"))
+            for i in range(nbits):                          # i = 0 is the MSB, drawn leftmost
+                bit = (val >> (nbits - 1 - i)) & 1
+                done = i < pooled
+                lit = bit and done
+                c.create_rectangle(bx, y, bx + 16, y + 22, fill=color if lit else "#1e2430", outline="#38445c")
+                c.create_text(bx + 8, y + 11, text=str(bit) if done else "·",
+                              fill="#000000" if lit else "#708090", font=("Consolas", 8, "bold"))
                 bx += 17
             c.create_text(70, y + 33, text=txt, fill="#d2e0f0", anchor="w", font=("Consolas", 9))
             y += 55
@@ -439,7 +475,7 @@ class App:
         s = self.engine.snapshot()
         self._draw(s)
         self.lbl_status.config(
-            text=f"Status: {s['status']} | bits pooled: {s['level']}/{s['maxl']} | path: {s['front']:,}")
+            text=f"Status: {s['status']} | bits pooled: {s['level']}/{s['maxl']} | checks: {s['front']:,}")
         self.window.after(100, self._refresh)
 
     def _poll(self):
