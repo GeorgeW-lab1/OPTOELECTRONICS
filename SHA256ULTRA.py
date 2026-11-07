@@ -1053,12 +1053,6 @@ class BitPoolingOracleApp:
 
     def start_auto(self):
 
-        if self.engine.oracle is None:
-
-            self.status_var.set("Status: No oracle target")
-
-            return
-
         if self.engine.converged:
 
             self.finish_oracle_verification()
