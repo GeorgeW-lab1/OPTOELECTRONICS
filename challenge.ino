@@ -22,7 +22,7 @@
     - Ensure common ground between the Arduino and relay/driver module.
 */
 
-const unsigned long CHALLENGE_INTERVAL_MS = 5000UL;
+const unsigned long CHALLENGE_INTERVAL_MS = 50000UL;
 const int LOCK_RELAY_PIN = 8;
 
 const uint8_t PASSCODE_BYTES = 32;
