@@ -126,53 +126,90 @@ def sha256_unpad(padded: bytes):
     return message if sha256_pad(message) == padded else None
 
 
-def extract_record(whole: bytes) -> dict:
+def extract_partial(known: bytes, total: int) -> dict:
     """
-    Recovers header, nonce, message and hash from a completed passcode (the
-    padded message | nonce | hash record) using only the recovered bytes.
-    The last two 64-byte blocks are the padded nonce and padded hash; the
-    rest is the padded message. Each is unpadded through its own length
-    field, then checked against the others.
-    """
-    info = {"ok": False, "error": None}
+    Forces extraction from the guess: given the bytes of the passcode
+    recovered so far (a prefix, MSB first), returns whatever the prefix
+    already determines. The passcode is padded message | padded nonce |
+    padded hash, and each field is revealed the moment its padded block is
+    complete:
 
-    if len(whole) < 192 or len(whole) % 64:
-        info["error"] = f"{len(whole)} bytes is not a padded record"
+      message  the first run of whole blocks with valid SHA-256 padding
+               (the length field in the block's last 8 bytes marks its end)
+      nonce    the next block, unpadded; the header is the message minus it
+      hash     the block after that, checked against SHA256(message)
+
+    Uses only the recovered bytes, never the oracle's stored values.
+    """
+    info = {
+        "known": len(known),
+        "total": total,
+        "message": None,
+        "blocks": None,
+        "header": None,
+        "nonce": None,
+        "hash": None,
+        "hash_ok": None,
+        "zero_bits": None,
+        "error": None,
+        "complete": False,
+    }
+
+    message = None
+    msg_end = None
+
+    for blocks in range(1, min(3, len(known) // 64) + 1):
+        message = sha256_unpad(known[:64 * blocks])
+
+        if message is not None:
+            info["message"] = message
+            info["blocks"] = blocks
+            msg_end = 64 * blocks
+            break
+
+    if msg_end is None:
+        if len(known) >= 192:
+            info["error"] = "no valid SHA-256 padding in the first 3 blocks"
+
         return info
 
-    message = sha256_unpad(whole[:-128])
-    nonce_text = sha256_unpad(whole[-128:-64])
-    digest = sha256_unpad(whole[-64:])
+    if len(known) < msg_end + 64:
+        return info
 
-    for name, value in (
-        ("message", message),
-        ("nonce", nonce_text),
-        ("hash", digest),
+    nonce_text = sha256_unpad(known[msg_end:msg_end + 64])
+
+    if (
+        nonce_text is None
+        or not nonce_text.isdigit()
+        or not message.endswith(nonce_text)
     ):
-        if value is None:
-            info["error"] = f"the padded {name} has invalid SHA-256 padding"
-            return info
-
-    if len(digest) != 32:
-        info["error"] = "the padded hash does not hold 32 bytes"
+        info["error"] = (
+            "the padded nonce block is invalid or the message does not "
+            "end with the nonce"
+        )
         return info
 
-    if not nonce_text.isdigit() or not message.endswith(nonce_text):
-        info["error"] = "the padded message does not end with the nonce"
+    info["nonce"] = int(nonce_text)
+    info["header"] = message[:-len(nonce_text)]
+
+    if len(known) < msg_end + 128:
         return info
 
-    info.update(
-        header=message[:-len(nonce_text)],
-        nonce=int(nonce_text),
-        message=message,
-        hash=int.from_bytes(digest, "big"),
-        hash_ok=hashlib.sha256(message).digest() == digest,
-    )
+    digest = sha256_unpad(known[msg_end + 64:msg_end + 128])
+
+    if digest is None or len(digest) != 32:
+        info["error"] = "the padded hash block is invalid"
+        return info
+
+    info["hash"] = int.from_bytes(digest, "big")
+    info["hash_ok"] = hashlib.sha256(message).digest() == digest
     info["zero_bits"] = PASSCODE_BITS - info["hash"].bit_length()
-    info["ok"] = info["hash_ok"]
+    info["complete"] = True
 
     if not info["hash_ok"]:
-        info["error"] = "SHA-256 of the extracted message is not the extracted hash"
+        info["error"] = (
+            "SHA-256 of the extracted message is not the extracted hash"
+        )
 
     return info
 
@@ -1059,7 +1096,7 @@ class App:
         self.arduino_thread = None
         self._oracle_key = None
         self._register_key = None
-        self._extracted_oracle = None
+        self._extract_key = None
         self._arduino_pow = None
 
         self._build_ui()
@@ -1067,8 +1104,43 @@ class App:
         self.window.after(15, self._poll)
 
     def _build_ui(self):
-        main_frame = ttk.Frame(self.window, padding=10)
-        main_frame.pack(fill="both", expand=True)
+        # The whole interface scrolls: a canvas holds the main frame and a
+        # vertical scrollbar drives it.
+        outer = ttk.Frame(self.window)
+        outer.pack(fill="both", expand=True)
+
+        self._scroll_canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(
+            outer,
+            orient="vertical",
+            command=self._scroll_canvas.yview,
+        )
+        self._scroll_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        main_frame = ttk.Frame(self._scroll_canvas, padding=10)
+        frame_id = self._scroll_canvas.create_window(
+            (0, 0), window=main_frame, anchor="nw"
+        )
+
+        main_frame.bind(
+            "<Configure>",
+            lambda e: self._scroll_canvas.configure(
+                scrollregion=self._scroll_canvas.bbox("all")
+            ),
+        )
+        self._scroll_canvas.bind(
+            "<Configure>",
+            lambda e: self._scroll_canvas.itemconfigure(
+                frame_id, width=e.width
+            ),
+        )
+
+        self.window.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.window.bind_all("<Button-4>", self._on_mousewheel)
+        self.window.bind_all("<Button-5>", self._on_mousewheel)
 
         # Laboratory controls
         control_frame = ttk.LabelFrame(
@@ -1437,6 +1509,21 @@ class App:
             row=1, column=1, padx=5, pady=5
         )
 
+    def _on_mousewheel(self, event):
+        # Windows/macOS send MouseWheel with a delta; Linux sends
+        # Button-4 (up) and Button-5 (down).
+        if self._scroll_canvas.yview() == (0.0, 1.0):
+            return
+
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+
+        self._scroll_canvas.yview_scroll(step, "units")
+
     def start_camera(self):
         if (
             self.camera_thread is not None
@@ -1592,7 +1679,7 @@ class App:
         lines = [
             f"{caption}: {box.value().strip()}"
             for caption, box in self.extract_fields
-            if box.value().strip() not in ("", "-")
+            if box.value().strip() not in ("", "-", "...")
         ]
 
         self.window.clipboard_clear()
@@ -1621,82 +1708,102 @@ class App:
 
     def _check_complete(self):
         """
-        When the passcode registers are complete, forces extraction of the
-        header, nonce, message and hash from the recovered value alone.
-        Clears the extracted fields when the oracle is re-armed.
+        Forces extraction from the guess register as it fills: each field is
+        revealed the moment the guess holds its whole padded block, not only
+        at the end. Re-runs whenever another whole byte of the guess is
+        recovered or the oracle is re-armed.
         """
         engine = self.engine
 
         with engine._lock:
             oracle = engine.oracle
-            done = engine.converged
+            steps = engine.step_count
             guess = engine.current_guess
             depth = engine.bit_depth
 
-        if not done:
-            if self._extracted_oracle is not None:
-                self._extracted_oracle = None
-                self._show_extracted(None)
+        known_bytes = steps // 8
+        key = (oracle, known_bytes)
 
+        if key == self._extract_key:
             return
 
-        if oracle is self._extracted_oracle:
+        self._extract_key = key
+
+        if known_bytes == 0:
+            self._show_extracted(None)
             return
 
-        self._extracted_oracle = oracle
-        self._show_extracted(
-            extract_record(guess.to_bytes(depth // 8, "big"))
-        )
+        recovered = guess.to_bytes(depth // 8, "big")[:known_bytes]
+        self._show_extracted(extract_partial(recovered, depth // 8))
 
     def _show_extracted(self, info):
-        boxes = (
-            self.v_ex_header,
-            self.v_ex_nonce,
-            self.v_ex_message,
-            self.v_ex_hash,
-        )
-
         if info is None:
-            for box in boxes:
+            for box in (
+                self.v_ex_header,
+                self.v_ex_nonce,
+                self.v_ex_message,
+                self.v_ex_hash,
+                self.v_ex_check,
+            ):
                 box.set("-")
 
-            self.v_ex_check.set("-")
-            return
-
-        if info.get("header") is None:
-            for box in boxes:
-                box.set("-")
-
-            self.v_ex_check.set("FAILED  " + info["error"])
             return
 
         text = lambda raw: raw.decode("utf-8", errors="replace")
 
-        self.v_ex_header.set(text(info["header"]))
-        self.v_ex_nonce.set(str(info["nonce"]))
-        self.v_ex_message.set(text(info["message"]))
-        self.v_ex_hash.set(f"{info['hash']:064x}")
+        self.v_ex_message.set(
+            text(info["message"]) if info["message"] is not None else "..."
+        )
+        self.v_ex_header.set(
+            text(info["header"]) if info["header"] is not None else "..."
+        )
+        self.v_ex_nonce.set(
+            str(info["nonce"]) if info["nonce"] is not None else "..."
+        )
+        self.v_ex_hash.set(
+            f"{info['hash']:064x}" if info["hash"] is not None else "..."
+        )
 
-        if info["ok"]:
+        progress = (
+            f"{info['known']}/{info['total']} bytes of the guess recovered"
+        )
+
+        if info["error"] is not None:
+            verdict = "FAILED  " + info["error"]
+        elif info["complete"]:
             verdict = (
                 "OK  SHA256(message) equals the extracted hash, "
                 f"{info['zero_bits']} leading zero bits"
             )
-        else:
-            verdict = "FAILED  " + info["error"]
 
-        arduino = self._arduino_pow
+            arduino = self._arduino_pow
 
-        if arduino is not None and info["ok"]:
-            same = (
-                info["header"] == arduino["header"]
-                and info["nonce"] == arduino["nonce"]
-                and info["hash"] == arduino["hash"]
+            if arduino is not None:
+                same = (
+                    info["header"] == arduino["header"]
+                    and info["nonce"] == arduino["nonce"]
+                    and info["hash"] == arduino["hash"]
+                )
+                verdict += (
+                    "; identical to the Arduino's proof of work"
+                    if same
+                    else "; DIFFERS from the Arduino's proof of work"
+                )
+        elif info["message"] is None:
+            verdict = (
+                f"{progress}; waiting for the first complete padded "
+                "message block"
             )
-            verdict += (
-                "; identical to the Arduino's proof of work"
-                if same
-                else "; DIFFERS from the Arduino's proof of work"
+        elif info["nonce"] is None:
+            verdict = (
+                f"{progress}; padding revealed: the message is "
+                f"{len(info['message'])} bytes in {info['blocks']} block(s); "
+                "waiting for the nonce block"
+            )
+        else:
+            verdict = (
+                f"{progress}; nonce block unpadded, header and nonce "
+                "extracted; waiting for the hash block"
             )
 
         self.v_ex_check.set(verdict)
