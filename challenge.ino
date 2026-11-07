@@ -132,7 +132,8 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-
+    lastChallengeTime = now;
+lastChallengeTime = now;
   // Issue a fresh 256-bit challenge every five seconds.
   if (!disarmed && now - lastChallengeTime >= CHALLENGE_INTERVAL_MS) {
     generateChallenge();
