@@ -903,11 +903,20 @@ class App:
             self.v_pow_arduino_msg,
             self.v_pow_match,
         ):
-            ttk.Label(
+            # Read-only Entry: text can be selected and copied (Ctrl+C).
+            ttk.Entry(
                 pow_frame,
                 textvariable=var,
                 font=("Consolas", 10),
-            ).pack(anchor="w", padx=10, pady=1)
+                state="readonly",
+            ).pack(fill="x", padx=10, pady=1)
+
+        self.b_copy_pow = ttk.Button(
+            pow_frame,
+            text="Copy Proof of Work",
+            command=self.copy_pow,
+        )
+        self.b_copy_pow.pack(anchor="w", padx=10, pady=(3, 5))
 
         # Local target controls
         target_frame = ttk.LabelFrame(
@@ -1266,6 +1275,31 @@ class App:
             self.v_pow_match.set(
                 "MISMATCH: nonce, hash or padded message differs"
             )
+
+    def copy_pow(self):
+        lines = [
+            var.get().strip()
+            for var in (
+                self.v_link,
+                self.v_pow_diff,
+                self.v_pow_oracle,
+                self.v_pow_oracle_msg,
+                self.v_pow_arduino,
+                self.v_pow_arduino_msg,
+                self.v_pow_match,
+            )
+            if var.get().strip()
+        ]
+
+        self.window.clipboard_clear()
+        self.window.clipboard_append("\n".join(lines))
+        self.window.update()  # keep the clipboard after the app closes
+
+        self.b_copy_pow.config(text="Copied!")
+        self.window.after(
+            1200,
+            lambda: self.b_copy_pow.config(text="Copy Proof of Work"),
+        )
 
     def set_custom_target(self):
         text = self.v_custom_target.get().strip()
