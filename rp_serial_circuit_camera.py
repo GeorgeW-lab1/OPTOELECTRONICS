@@ -1,329 +1,536 @@
 """
-Bit-Pooling Higher-Lower Search & Circuit Camera Lab 
-(Tkinter / OpenCV Framework with Visual Bit Registers & Auto-Revealing Oracle)
-Adapted from the RP-style optoelectronic decision circuit framework.
+Bit-Pooling Higher-Lower Search & OpenCV Camera Lab
+Command-Line Edition
+
+Features:
+    - 512-bit higher/lower oracle search
+    - OpenCV live camera
+    - Motion-triggered bit search
+    - Arduino serial target input
+    - POPCOUNT, AND, OR, XOR, MAJORITY pooling
+    - Adjustable kernel and stride
+    - Copy-ready register export
+    - Target protection until convergence or manual reveal
+
+Install:
+    pip install numpy opencv-python pyserial
+
+Run:
+    python bit_pooling_cli.py
 """
 
-import asyncio
-import queue
-import random
 import sys
-import threading
 import time
-import tkinter as tk
-from tkinter import ttk, messagebox
-import serial
+import random
+import threading
+
 import numpy as np
+import cv2
 
 try:
-    import cv2
+    import serial
 except ImportError:
-    cv2 = None
+    serial = None
 
 
-# ==============================================================================
-# BIT-POOLING HIGHER-LOWER ORACLE CLASS
-# ==============================================================================
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+BIT_DEPTH = 512
+CAMERA_INDEX = 0
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+
+
+# =============================================================================
+# ORACLE
+# =============================================================================
+
 class BitPoolingOracle:
-    """
-    Encapsulates the secret target and uses bit-pooling across successive 
-    frames/queries to accumulate bits MSB-first, mimicking the optoelectronic circuit.
-    """
+
     def __init__(self, bit_depth=512, target=None):
         self.bit_depth = bit_depth
         self.max_val = (1 << bit_depth) - 1
-        self._target = int(np.clip(target, 0, self.max_val)) if target is not None else random.randint(0, self.max_val)
-        
-        # Pooling configuration matching hardware settings
+
+        self._target = (
+            max(0, min(int(target), self.max_val))
+            if target is not None
+            else random.randint(0, self.max_val)
+        )
+
         self.kernel_size = 4
         self.stride = 2
         self.pool_op = "POPCOUNT"
         self.schmitt_trigger = 0.5
-        
-        # Pooling accumulation state
+
         self.pooled_bits = 0
-        self.pooled_count = 0
         self.is_done = False
-    def reveal(self):
-        if not self.is_done:
-            return 0
-        return self.__target
-    def query_bit(self, trial_val):
-        """
-        Oracle evaluation: determines if the secret target is >= the pooled trial value.
-        Returns the individual bit (0 or 1) for the current bit position.
-        """
+
+    def query_bit(self, trial):
         if self.is_done:
             return 0
-        
-        bit = 1 if self._target >= trial_val else 0
-        return bit
 
-    def pool_step(self, val):
-        """Applies hardware-style bit pooling (kernel, stride, operator) to a value."""
-        bits = [(val >> i) & 1 for i in range(self.bit_depth)]
-        
-        pooled_out = []
-        for i in range(0, len(bits), self.stride):
-            block = bits[i : i + self.kernel_size]
-            if not block:
-                break
-                
-            if self.pool_op == "POPCOUNT":
-                res = sum(block) / len(block)
-                res_bit = 1 if res >= self.schmitt_trigger else 0
-            elif self.pool_op == "AND":
-                res_bit = 1 if all(b == 1 for b in block) else 0
-            elif self.pool_op == "OR":
-                res_bit = 1 if any(b == 1 for b in block) else 0
-            elif self.pool_op == "XOR":
-                res_bit = sum(block) % 2
-            elif self.pool_op == "MAJORITY":
-                res_bit = 1 if sum(block) > (len(block) / 2.0) else 0
-            else:
-                res_bit = block[0]
-                
-            pooled_out.append(res_bit)
-
-        out_val = 0
-        for idx, b in enumerate(pooled_out):
-            out_val |= (b << idx)
-        return out_val
+        return int(self._target >= trial)
 
     @property
     def target(self):
-        """Raises PermissionError if accessed before search completion[cite: 1]."""
         if not self.is_done:
-            raise PermissionError("SECURITY VIOLATION: Oracle target is classified until fully pooled[cite: 1]!")
+            raise PermissionError("Target is protected.")
+
         return self._target
 
+    def pool_step(self, value):
 
-# ==============================================================================
-# BIT-POOLING SEARCH ENGINE
-# ==============================================================================
+        bits = [
+            (value >> i) & 1
+            for i in range(self.bit_depth - 1, -1, -1)
+        ]
+
+        pooled = []
+
+        for i in range(0, len(bits), self.stride):
+
+            block = bits[i:i + self.kernel_size]
+
+            if not block:
+                break
+
+            ones = sum(block)
+            count = len(block)
+
+            if self.pool_op == "POPCOUNT":
+                result = int(ones / count >= self.schmitt_trigger)
+
+            elif self.pool_op == "AND":
+                result = int(ones == count)
+
+            elif self.pool_op == "OR":
+                result = int(ones > 0)
+
+            elif self.pool_op == "XOR":
+                result = ones % 2
+
+            elif self.pool_op == "MAJORITY":
+                result = int(ones > count / 2)
+
+            else:
+                result = block[0]
+
+            pooled.append(result)
+
+        output = 0
+
+        for bit in pooled:
+            output = (output << 1) | bit
+
+        return output
+
+
+# =============================================================================
+# SEARCH ENGINE
+# =============================================================================
+
 class BitPoolingSearchEngine:
+
     def __init__(self, bit_depth=512):
+
         self.bit_depth = bit_depth
         self.max_val = (1 << bit_depth) - 1
-        
-        self.oracle = BitPoolingOracle(self.bit_depth)
-        self.current_guess = 0
-        self.step_count = 0
-        self.history = []
-        self.converged = False
-        self.last_status = "INITIALIZED"
 
-        # Hardware & Pooling Settings
         self.kernel_size = 4
         self.stride = 2
         self.pool_op = "POPCOUNT"
-        self.schmitt_trigger = 0.5
-        
-        # Registers
-        self.guess_reg = 0
-        self.target_reg = 0
-        self.pooled_register = 0
-        
-        self._update_registers()
 
-    def reset(self, new_target=None):
-        self.oracle = BitPoolingOracle(self.bit_depth, new_target)
-        self.current_guess = 0
-        self.step_count = 0
-        self.history = [self.current_guess]
-        self.converged = False
-        self.last_status = "READY"
-        self._update_registers()
+        self.lock = threading.RLock()
+
+        self.reset()
+
+    def reset(self, target=None):
+
+        with self.lock:
+
+            self.oracle = BitPoolingOracle(
+                self.bit_depth,
+                target
+            )
+
+            self.oracle.kernel_size = self.kernel_size
+            self.oracle.stride = self.stride
+            self.oracle.pool_op = self.pool_op
+
+            self.current_guess = 0
+            self.step_count = 0
+            self.history = [0]
+
+            self.guess_reg = 0
+            self.pooled_register = 0
+
+            self.converged = False
+            self.last_status = "READY"
+
+            self.update_registers()
+
+    def update_registers(self):
+
+        self.guess_reg = self.current_guess
+
+        self.pooled_register = self.oracle.pool_step(
+            self.current_guess
+        )
+
+    def set_pool_settings(self, operation=None, kernel=None, stride=None):
+
+        with self.lock:
+
+            if operation is not None:
+                self.pool_op = operation
+
+            if kernel is not None:
+                self.kernel_size = max(1, int(kernel))
+
+            if stride is not None:
+                self.stride = max(1, int(stride))
+
+            self.oracle.pool_op = self.pool_op
+            self.oracle.kernel_size = self.kernel_size
+            self.oracle.stride = self.stride
+
+            self.update_registers()
 
     def step(self):
-        """Advances the bit-pooling search by evaluating one bit per step."""
-        if self.converged or self.step_count >= self.bit_depth:
+
+        with self.lock:
+
+            if self.converged:
+                return False
+
+            if self.step_count >= self.bit_depth:
+                return False
+
+            shift = self.bit_depth - 1 - self.step_count
+
+            trial = self.current_guess | (1 << shift)
+
+            bit = self.oracle.query_bit(trial)
+
+            if bit:
+                self.current_guess |= (1 << shift)
+
+            self.oracle.pooled_bits = self.current_guess
+
+            self.step_count += 1
+
+            self.history.append(self.current_guess)
+
+            if self.step_count >= self.bit_depth:
+
+                if self.current_guess == self.oracle._target:
+
+                    self.oracle.is_done = True
+                    self.converged = True
+                    self.last_status = "LOCKED & REVEALED"
+
+                else:
+                    self.last_status = "POOL MISMATCH"
+
+            self.update_registers()
+
+            return True
+
+    def run(self, verbose=True):
+
+        while not self.converged:
+
+            self.step()
+
+            if verbose:
+                print(
+                    f"\rSearch: {self.step_count}/{self.bit_depth}",
+                    end="",
+                    flush=True
+                )
+
+        if verbose:
+            print()
+
+        return self.current_guess
+
+    def snapshot(self):
+
+        with self.lock:
+
+            return {
+                "guess": self.guess_reg,
+                "pooled": self.pooled_register,
+                "target": self.oracle._target,
+                "steps": self.step_count,
+                "status": self.last_status,
+                "converged": self.converged
+            }
+
+
+# =============================================================================
+# APPLICATION
+# =============================================================================
+
+class BitPoolingCLI:
+
+    def __init__(self):
+
+        self.engine = BitPoolingSearchEngine(BIT_DEPTH)
+
+        self.force_reveal = False
+
+        self.serial_port = None
+        self.serial_buffer = bytearray()
+
+        self.auto_step = True
+
+        self.motion_threshold = 5.0
+        self.previous_even = False
+
+        self.camera_active = False
+
+        self.frame_count = 0
+        self.fps = 0.0
+        self.fps_time = time.perf_counter()
+
+    # -------------------------------------------------------------------------
+    # FORMATTING
+    # -------------------------------------------------------------------------
+
+    def binary(self, value):
+        return format(value, f"0{BIT_DEPTH}b")
+
+    def hexadecimal(self, value):
+        return format(value, "x")
+
+    def parse_integer(self, value):
+
+        value = value.strip()
+
+        if value.lower().startswith(("0x", "0b")):
+            return int(value, 0)
+
+        return int(value, 10)
+
+    # -------------------------------------------------------------------------
+    # REGISTERS
+    # -------------------------------------------------------------------------
+
+    def show_register(self, name, value, hidden=False):
+
+        print(f"\n{name} REGISTER")
+
+        if hidden:
+            print("[HIDDEN]")
             return
 
-        self.step_count += 1
-        
-        # Build trial value based on current pooled bits (MSB first)
-        shift = self.bit_depth - self.step_count
-        trial_val = self.oracle.pooled_bits | (1 << shift)
-        
-        # Query oracle for the bit
-        bit = self.oracle.query_bit(trial_val)
-        
-        # Accumulate bit into oracle pool
-        self.oracle.pooled_bits |= (bit << shift)
-        self.current_guess = self.oracle.pooled_bits
-        
-        self.history.append(self.current_guess)
-        self._update_registers()
+        print("DECIMAL:", value)
+        print("HEX:    ", "0x" + self.hexadecimal(value))
+        print("BINARY: ", self.binary(value))
 
-        # Check if full bit depth has been gathered
-        if self.step_count >= self.bit_depth:
-            if self.current_guess == self.oracle._target:
-                self.oracle.is_done = True  # Automatically unlocks oracle access[cite: 1]
-                self.converged = True
-                self.last_status = f"LOCKED & REVEALED AT {self.current_guess}"
-            else:
-                self.last_status = "POOL MISMATCH"
+    def show_registers(self):
 
-    def _update_registers(self):
-        self.guess_reg = self.current_guess
-        try:
-            self.target_reg = self.oracle.target
-        except PermissionError:
-            self.target_reg = 0  # Masked securely while search is active[cite: 1]
-            
-        self.pooled_register = self.oracle.pool_step(self.current_guess)
+        state = self.engine.snapshot()
 
+        print("\n" + "=" * 70)
+        print("BIT-POOLING REGISTERS")
+        print("=" * 70)
 
-# ==============================================================================
-# CAMERA SOURCE HANDLING
-# ==============================================================================
-class Source:
-    def __init__(self, index: int):
-        if cv2 is None:
-            raise RuntimeError("OpenCV is not installed. Run: pip install opencv-python[cite: 1]")
-        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-        cap = cv2.VideoCapture(index, backend)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        if not (cap.isOpened() and cap.read()[0]):
-            cap.release()
-            raise RuntimeError(f"Cannot open camera {index}.")
-        self.cap = cap
-        self.rgb = None
+        self.show_register(
+            "TARGET",
+            state["target"],
+            not (state["converged"] or self.force_reveal)
+        )
 
-    def read(self):
-        ok, bgr = self.cap.read()
-        if not ok:
-            return None
-        self.rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        self.show_register("GUESS", state["guess"])
+        self.show_register("POOLED", state["pooled"])
 
-    def close(self):
-        self.cap.release()
+        print("\nSEARCH")
+        print("Steps:", state["steps"], "/", BIT_DEPTH)
+        print("Status:", state["status"])
+        print("Operator:", self.engine.pool_op)
+        print("Kernel:", self.engine.kernel_size)
+        print("Stride:", self.engine.stride)
 
+        print("=" * 70)
 
-def ppm_photo(rgb: np.ndarray) -> tk.PhotoImage:
-    h, w, _ = rgb.shape
-    data = b"P6 %d %d 255\n" % (w, h) + np.ascontiguousarray(rgb, np.uint8).tobytes()
-    return tk.PhotoImage(data=data, format="PPM")
+    def export_register(self, name):
 
+        state = self.engine.snapshot()
 
-# ==============================================================================
-# BACKGROUND SIMULATION THREAD
-# ==============================================================================
-class SimThread(threading.Thread):
-    def __init__(self, cam_index, ctl, out, engine):
-        super().__init__(daemon=True)
-        self.cam_index = cam_index
-        self.ctl = ctl
-        self.out = out
-        self.engine = engine
+        if name == "TARGET":
 
-    def run(self):
-        asyncio.run(self._run())
+            if not (state["converged"] or self.force_reveal):
+                print("Target is protected.")
+                return
 
-    async def _run(self):
-        ctl, out, engine = self.ctl, self.out, self.engine
-        try:
-            src = Source(self.cam_index)
-        except RuntimeError as e:
-            out.put(("error", str(e)))
-            out.put(("done", None))
+            value = state["target"]
+
+        elif name == "GUESS":
+            value = state["guess"]
+
+        elif name == "POOLED":
+            value = state["pooled"]
+
+        else:
             return
-        out.put(("info", f"USB camera {self.cam_index} opened[cite: 1]"))
 
-        t_prev = time.perf_counter()
-        idx = 0
-        prev_even = False
+        print("\n" + self.binary(value))
+
+    def export_all(self):
+
+        state = self.engine.snapshot()
+
+        target = (
+            self.binary(state["target"])
+            if state["converged"] or self.force_reveal
+            else "[HIDDEN]"
+        )
+
+        print("\nTARGET:", target)
+        print("GUESS: ", self.binary(state["guess"]))
+        print("POOLED:", self.binary(state["pooled"]))
+
+    # -------------------------------------------------------------------------
+    # SEARCH
+    # -------------------------------------------------------------------------
+
+    def step_search(self):
+
+        if not self.engine.step():
+            print("Search already completed.")
+            return
+
+        state = self.engine.snapshot()
+
+        print(
+            f"Step {state['steps']}/{BIT_DEPTH} | "
+            f"Guess: 0x{state['guess']:x} | "
+            f"Pooled: 0x{state['pooled']:x}"
+        )
+
+        if state["converged"]:
+            print("Target reconstructed successfully.")
+
+    def run_search(self):
+
+        print("Running search...")
+
+        start = time.perf_counter()
+
+        self.engine.run()
+
+        elapsed = time.perf_counter() - start
+
+        print("Search complete.")
+        print("Queries:", self.engine.step_count)
+        print(f"Elapsed: {elapsed:.6f} seconds")
+
+        self.show_registers()
+
+    def reset_search(self):
+
+        self.engine.reset()
+        self.force_reveal = False
+
+        print("New random target generated.")
+
+    def load_target(self, value):
+
+        if not 0 <= value <= self.engine.max_val:
+            print("Target outside 512-bit range.")
+            return
+
+        self.engine.reset(value)
+        self.force_reveal = False
+
+        print("Target loaded.")
+
+    # -------------------------------------------------------------------------
+    # POOL SETTINGS
+    # -------------------------------------------------------------------------
+
+    def configure_pooling(self):
+
+        print("\nPOOL OPERATORS")
+        print("1. POPCOUNT")
+        print("2. AND")
+        print("3. OR")
+        print("4. XOR")
+        print("5. MAJORITY")
+
+        choices = {
+            "1": "POPCOUNT",
+            "2": "AND",
+            "3": "OR",
+            "4": "XOR",
+            "5": "MAJORITY"
+        }
+
+        choice = input("Operator: ").strip()
+
+        if choice not in choices:
+            print("Invalid selection.")
+            return
+
         try:
-            while not ctl["stop"]:
-                gray = await asyncio.to_thread(src.read)
-                if gray is None:
-                    out.put(("info", "camera stopped delivering frames"))
-                    break
-                now = time.perf_counter()
-                dt = min(max(now - t_prev, 1e-3), 0.25)
-                t_prev = now
 
-                small = cv2.resize(gray, (128, 96), interpolation=cv2.INTER_AREA)
-                motion_detected = idx > 5 and np.std(small) > 5.0
-                x = int(np.std(small) * 10) if motion_detected else 0
+            kernel = int(input("Kernel size [4]: ") or "4")
+            stride = int(input("Stride [2]: ") or "2")
 
-                # Two sequential even motion triggers advance the bit-pooling step
-                even_now = x > 0 and x % 2 == 0
-                even_state = even_now and prev_even
-                prev_even = even_now
+            if kernel < 1 or stride < 1:
+                raise ValueError
 
-                if even_state and ctl.get("auto_step", True) and not engine.converged:
-                    engine.step()
-
-                rgb = src.rgb if src.rgb is not None else np.stack([gray] * 3, axis=-1)
-                pw, ph = 320, 240
-                h_img, w_img = rgb.shape[:2]
-                preview = rgb[np.arange(ph) * h_img // ph][:, np.arange(pw) * w_img // pw].copy()
-                
-                if ctl.get("ir_heatmap", False):
-                    preview[:, :, 0] = np.clip(preview[:, :, 0].astype(int) + 80, 0, 255)
-                    preview[:, :, 2] = np.clip(preview[:, :, 2].astype(int) - 50, 0, 255)
-
-                # Target exposed automatically on convergence or manual force reveal
-                exposed_target = engine.oracle._target if (engine.converged or ctl.get("force_reveal", False)) else 0
-
-                out.put(("frame", dict(
-                    preview=preview, idx=idx, dt=dt, target=exposed_target,
-                    guess=engine.current_guess, pooled=engine.pooled_register,
-                    status=engine.last_status, steps=engine.step_count,
-                    history=list(engine.history), converged=engine.converged
-                )))
-                idx += 1
-                await asyncio.sleep(0.03)
-        finally:
-            src.close()
-            out.put(("done", None))
-
-
-# ==============================================================================
-# MAIN GUI APPLICATION
-# ==============================================================================
-class App:
-    def __init__(self, window):
-        self.window = window
-        self.window.title("Bit-Pooling Oracle Search Lab — Auto-Revealing Registers")
-        self.q = queue.Queue()
-        self.ctl = dict(stop=False, ir_heatmap=False, auto_step=True, force_reveal=False)
-        self.engine = BitPoolingSearchEngine(bit_depth=512)
-        self.thread = None
-
-        self._build_ui()
-        self.window.protocol("WM_DELETE_WINDOW", self._close)
-        self.window.after(15, self._poll)
-    def connect_serial(self):
-        try:
-            port = self.v_com.get().strip()
-            baud = int(self.v_baud.get())
-
-            self.disconnect_serial()
-
-            self.serial_port = serial.Serial(port, baud, timeout=1)
-            self.serial_stop = False
-
-            self.serial_thread = threading.Thread(
-                target=self._serial_reader,
-                daemon=True
+            self.engine.set_pool_settings(
+                operation=choices[choice],
+                kernel=kernel,
+                stride=stride
             )
-            self.serial_thread.start()
 
-            self.lbl_serial.config(text=f"Serial: CONNECTED ({port})")
+            print("Pooling settings updated.")
 
-        except Exception as e:
-            messagebox.showerror("Serial Error", str(e))
+        except ValueError:
+            print("Invalid kernel or stride.")
 
+    # -------------------------------------------------------------------------
+    # SERIAL
+    # -------------------------------------------------------------------------
+
+    def connect_serial(self):
+
+        if serial is None:
+            print("Install pyserial: pip install pyserial")
+            return
+
+        port_name = input("COM port [COM3]: ").strip() or "COM3"
+        baud = int(input("Baud [115200]: ") or "115200")
+
+        self.disconnect_serial()
+
+        try:
+
+            self.serial_port = serial.Serial(
+                port_name,
+                baud,
+                timeout=0
+            )
+
+            self.serial_buffer.clear()
+
+            print(f"Connected to {port_name}.")
+
+        except Exception as exc:
+
+            self.serial_port = None
+            print("Serial error:", exc)
 
     def disconnect_serial(self):
-        self.serial_stop = True
 
-        if hasattr(self, "serial_port") and self.serial_port:
+        if self.serial_port is not None:
+
             try:
                 self.serial_port.close()
             except Exception:
@@ -331,291 +538,386 @@ class App:
 
             self.serial_port = None
 
-        if hasattr(self, "lbl_serial"):
-            self.lbl_serial.config(text="Serial: DISCONNECTED")
+        self.serial_buffer.clear()
 
+        print("Serial disconnected.")
 
-    def _serial_reader(self):
-        while not self.serial_stop:
-            try:
-                if self.serial_port and self.serial_port.is_open:
-                    line = self.serial_port.readline().decode(
-                        "ascii", errors="ignore"
-                    ).strip()
+    def process_serial(self):
 
-                    if not line:
-                        continue
+        port = self.serial_port
 
-                    value = int(line)
-
-                    if 0 <= value <= self.engine.max_val:
-                        self.q.put(("serial_target", value))
-
-            except ValueError:
-                continue
-
-            except Exception as e:
-                self.q.put(("serial_error", str(e)))
-                break
-    def copy_register(self, register):
-        if register == "TARGET":
-            if not (self.engine.converged or self.ctl["force_reveal"]):
-                messagebox.showwarning("Protected Register", "Target is still hidden.")
-                return
-            value = self.engine.oracle._target
-
-        elif register == "GUESS":
-            value = self.engine.guess_reg
-
-        elif register == "POOLED":
-            value = self.engine.pooled_register
-
-        else:
+        if port is None or not port.is_open:
             return
 
-        binary = format(value, f"0{self.engine.bit_depth}b")
-
-        self.window.clipboard_clear()
-        self.window.clipboard_append(binary)
-        self.window.update()
-
-        self.lbl_status.config(text=f"{register} register copied ({len(binary)} bits)")
-
-
-    def copy_all_registers(self):
-        if not (self.engine.converged or self.ctl["force_reveal"]):
-            target = "[HIDDEN]"
-        else:
-            target = format(
-                self.engine.oracle._target,
-                f"0{self.engine.bit_depth}b"
-            )
-
-        depth = self.engine.bit_depth
-
-        data = (
-            f"TARGET: {target}\n"
-            f"GUESS: {format(self.engine.guess_reg, f'0{depth}b')}\n"
-            f"POOLED: {format(self.engine.pooled_register, f'0{depth}b')}"
-        )
-
-        self.window.clipboard_clear()
-        self.window.clipboard_append(data)
-        self.window.update()
-
-        self.lbl_status.config(text="All registers copied to clipboard")
-
-    def set_serial_target(self, value):
-        self.engine.reset(value)
-        self.v_reveal.set(False)
-        self.ctl["force_reveal"] = False
-
-        self.lbl_status.config(
-            text="Status: NEW SERIAL TARGET LOADED"
-        )
-    def _build_ui(self):
-        main_frame = ttk.Frame(self.window, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        # Controls Top Frame
-        ctrl_frame = ttk.LabelFrame(main_frame, text="Laboratory Controls")
-        ctrl_frame.pack(fill="x", padx=5, pady=5)
-
-        ttk.Button(ctrl_frame, text="Start Lab", command=self.start_lab).pack(side="left", padx=5, pady=5)
-        ttk.Button(ctrl_frame, text="Stop Lab", command=self.stop_lab).pack(side="left", padx=5, pady=5)
-        ttk.Button(ctrl_frame, text="Step Bit Pool", command=self.step_search).pack(side="left", padx=5, pady=5)
-        ttk.Button(ctrl_frame, text="Reset Pool", command=self.reset_search).pack(side="left", padx=5, pady=5)
-
-        self.v_ir = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ctrl_frame, text="IR Thermal Heatmap", variable=self.v_ir,
-                        command=lambda: self.ctl.update(ir_heatmap=self.v_ir.get())).pack(side="left", padx=10)
-
-        # Target Management Frame
-        # Target Management Frame
-        target_frame = ttk.LabelFrame(main_frame, text="Serial Oracle Input")
-        target_frame.pack(fill="x", padx=5, pady=5)
-
-        ttk.Label(target_frame, text="COM Port:").pack(side="left", padx=5)
-
-        self.v_com = tk.StringVar(value="COM3")
-        ttk.Entry(target_frame, width=9, textvariable=self.v_com).pack(side="left", padx=5)
-
-        ttk.Label(target_frame, text="Baud:").pack(side="left", padx=5)
-
-        self.v_baud = tk.StringVar(value="115200")
-        ttk.Entry(target_frame, width=9, textvariable=self.v_baud).pack(side="left", padx=5)
-
-        ttk.Button(target_frame, text="Connect Serial",
-                   command=self.connect_serial).pack(side="left", padx=5)
-
-        ttk.Button(target_frame, text="Disconnect",
-                   command=self.disconnect_serial).pack(side="left", padx=5)
-
-        self.lbl_serial = ttk.Label(target_frame, text="Serial: DISCONNECTED")
-        self.lbl_serial.pack(side="left", padx=10)
-
-        self.v_reveal = tk.BooleanVar(value=False)
-        self.chk_reveal = ttk.Checkbutton(
-            target_frame,
-            text="Force Reveal Target",
-            variable=self.v_reveal,
-            command=lambda: self.ctl.update(force_reveal=self.v_reveal.get())
-        )
-        self.chk_reveal.pack(side="left", padx=10)
-
-        # Viewport and Registers Frame
-        display_frame = ttk.Frame(main_frame)
-        display_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Left: Circuit Camera Viewport
-        cam_frame = ttk.LabelFrame(display_frame, text="Optoelectronic Circuit Camera Viewport")
-        cam_frame.pack(side="left", padx=5, pady=5)
-        self.cam_canvas = tk.Canvas(cam_frame, width=320, height=240, bg="black")
-        self.cam_canvas.pack(padx=5, pady=5)
-        self.cam_img_id = self.cam_canvas.create_image(0, 0, anchor="nw")
-
-        # Right: Register & Hardware Status Panel
-        right_panel = ttk.Frame(display_frame)
-        right_panel.pack(side="right", fill="both", expand=True, padx=5, pady=5)
-
-        reg_frame = ttk.LabelFrame(right_panel, text="Bit-Pooling Hardware Registers")
-        reg_frame.pack(fill="x", padx=5, pady=5)
-
-        self.reg_canvas = tk.Canvas(reg_frame, width=480, height=140, bg="#121414", highlightthickness=0)
-        self.reg_canvas.pack(padx=5, pady=5)
-
-        self.lbl_status = ttk.Label(reg_frame, text="Status: IDLE", font=("Consolas", 11), foreground="#00e5ff")
-        self.lbl_status.pack(anchor="w", padx=10, pady=5)
-        copy_frame = ttk.Frame(reg_frame)
-        copy_frame.pack(fill="x", padx=5, pady=5)
-
-        ttk.Button(copy_frame, text="Copy TARGET",
-                   command=lambda: self.copy_register("TARGET")).pack(side="left", padx=3)
-
-        ttk.Button(copy_frame, text="Copy GUESS",
-                   command=lambda: self.copy_register("GUESS")).pack(side="left", padx=3)
-
-        ttk.Button(copy_frame, text="Copy POOLED",
-                   command=lambda: self.copy_register("POOLED")).pack(side="left", padx=3)
-
-        ttk.Button(copy_frame, text="Copy ALL",
-           command=self.copy_all_registers).pack(side="left", padx=3)
-        # Settings Configuration Panel
-        set_frame = ttk.LabelFrame(right_panel, text="Pooling & Algorithm Settings")
-        set_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        ttk.Label(set_frame, text="Pooling Operator:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.op_combo = ttk.Combobox(set_frame, values=["POPCOUNT", "AND", "OR", "XOR", "MAJORITY"], state="readonly")
-        self.op_combo.set("POPCOUNT")
-        self.op_combo.grid(row=0, column=1, padx=5, pady=5)
-        self.op_combo.bind("<<ComboboxSelected>>", self._update_pool_op)
-
-        ttk.Label(set_frame, text="Kernel Size:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.kernel_spin = ttk.Spinbox(set_frame, from_=2, to=8, increment=2, width=5, command=self._update_kernel)
-        self.kernel_spin.set(4)
-        self.kernel_spin.grid(row=1, column=1, sticky="w", padx=5, pady=5)
-
-    def start_lab(self):
-        self.ctl["stop"] = False
-        self.thread = SimThread(0, self.ctl, self.q, self.engine)
-        self.thread.start()
-
-    def stop_lab(self):
-        self.ctl["stop"] = True
-
-    def step_search(self):
-        self.engine.step()
-
-    def reset_search(self):
-        self.engine.reset()
-        self.v_custom_target.set("[SECURE]")
-
-    def set_custom_target(self):
         try:
-            val = int(self.v_custom_target.get())
-            if 0 <= val <= self.engine.max_val:
-                self.engine.reset(val)
-                messagebox.showinfo("Target Set", "New custom target configured for bit pooling.")
-            else:
-                messagebox.showerror("Invalid Range", f"Target must be between 0 and {self.engine.max_val}.")
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter a valid integer for the custom target.")
 
-    def randomize_target(self):
-        self.engine.reset()
-        self.v_custom_target.set("[SECURE]")
+            waiting = port.in_waiting
 
-    def _update_pool_op(self, event):
-        op = self.op_combo.get()
-        self.engine.pool_op = op
-        self.engine.oracle.pool_op = op
+            if waiting:
+                self.serial_buffer.extend(port.read(waiting))
 
-    def _update_kernel(self):
-        try:
-            k = int(self.kernel_spin.get())
-            self.engine.kernel_size = k
-            self.engine.oracle.kernel_size = k
-        except ValueError:
-            pass
+            while b"\n" in self.serial_buffer:
 
-    def _draw_bit_rows(self, target_val, guess_val, pooled_val, revealed):
-        self.reg_canvas.delete("all")
-        bit_depth = self.engine.bit_depth
-        
-        # Automatically unmask target when converged or explicitly forced
-        is_exposed = revealed or self.engine.converged
-        active_target = target_val if is_exposed else 0
+                raw, _, remainder = self.serial_buffer.partition(b"\n")
+                self.serial_buffer = bytearray(remainder)
 
-        rows = [
-            ("TARGET", active_target, "#00e676", not is_exposed),
-            ("GUESS ", guess_val, "#ffb300", False),
-            ("POOLED", pooled_val, "#b388ff", False)
+                line = raw.decode(
+                    "ascii",
+                    errors="ignore"
+                ).strip()
+
+                if not line:
+                    continue
+
+                try:
+
+                    value = self.parse_integer(line)
+
+                    if 0 <= value <= self.engine.max_val:
+
+                        self.engine.reset(value)
+                        self.force_reveal = False
+
+                        print(
+                            f"\n[SERIAL] New target loaded: {line}"
+                        )
+
+                    else:
+                        print("\n[SERIAL] Target outside 512-bit range.")
+
+                except ValueError:
+                    print(f"\n[SERIAL] Ignored: {line}")
+
+        except Exception as exc:
+
+            print("\n[SERIAL ERROR]", exc)
+            self.disconnect_serial()
+
+    # -------------------------------------------------------------------------
+    # OPENCV CAMERA
+    # -------------------------------------------------------------------------
+
+    def draw_camera_overlay(self, frame, motion_value, motion_detected):
+
+        state = self.engine.snapshot()
+
+        height, width = frame.shape[:2]
+
+        cv2.rectangle(
+            frame,
+            (0, 0),
+            (width, 135),
+            (15, 15, 15),
+            -1
+        )
+
+        lines = [
+            "BIT-POOLING CAMERA LAB",
+            f"STEP: {state['steps']}/{BIT_DEPTH}",
+            f"OPERATOR: {self.engine.pool_op}",
+            f"KERNEL: {self.engine.kernel_size} STRIDE: {self.engine.stride}",
+            f"MOTION: {motion_value:.2f}",
+            f"AUTO STEP: {'ON' if self.auto_step else 'OFF'}",
+            f"STATUS: {state['status']}"
         ]
 
-        y_offset = 10
-        for label, val, color, hidden in rows:
-            self.reg_canvas.create_text(10, y_offset + 10, text=label, fill="#88a0c0", anchor="w", font=("Consolas", 10, "bold"))
-            
-            bx = 90
-            for b in range(bit_depth - 1, -1, -1):
-                bit_state = (val >> b) & 1
-                self.reg_canvas.create_rectangle(
-                    bx, y_offset, bx + 22, y_offset + 22, 
-                    fill=color if (bit_state and not hidden) else "#1e2430", 
-                    outline="#38445c"
-                )
-                txt_val = "?" if hidden else str(bit_state)
-                txt_color = "#000000" if (bit_state and not hidden) else "#708090"
-                self.reg_canvas.create_text(bx + 11, y_offset + 11, text=txt_val, fill=txt_color, font=("Consolas", 9, "bold"))
-                bx += 26
-            
-            num_str = "[HIDDEN]" if hidden else f"[{val:4d}]"
-            self.reg_canvas.create_text(bx + 5, y_offset + 11, text=num_str, fill="#d2e0f0", anchor="w", font=("Consolas", 9))
-            y_offset += 40
+        for i, line in enumerate(lines):
 
-    def _poll(self):
+            cv2.putText(
+                frame,
+                line,
+                (12, 20 + i * 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 230, 255),
+                1,
+                cv2.LINE_AA
+            )
+
+        if motion_detected:
+
+            cv2.putText(
+                frame,
+                "MOTION DETECTED",
+                (12, height - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2
+            )
+
+    def camera_loop(self):
+
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+        if not cap.isOpened():
+
+            print("Could not open camera.")
+            return
+
+        print("\nOpenCV camera started.")
+        print("Camera controls:")
+        print("  Q = quit camera")
+        print("  SPACE = manually step")
+        print("  A = toggle automatic motion stepping")
+        print("  R = reset random target")
+        print("  V = toggle target reveal")
+        print("  S = show registers in terminal")
+        print("  E = export all registers in terminal")
+
+        previous_even = False
+        previous_time = time.perf_counter()
+
+        self.camera_active = True
+
         try:
-            for _ in range(100):
-                ev = self.q.get_nowait()
-                if ev[0] == "frame":
-                    d = ev[1]
-                    self.photo = ppm_photo(d["preview"])
-                    self.cam_canvas.itemconfig(self.cam_img_id, image=self.photo)
-                    self._draw_bit_rows(d["target"], d["guess"], d["pooled"], self.v_reveal.get())
-                    self.lbl_status.config(text=f"Status: {d['status']} | Bit Step: {d['steps']}/{self.engine.bit_depth}")
-                elif ev[0] == "error":
-                    messagebox.showerror("Camera Error", ev[1])
-        except queue.Empty:
-            pass
-        self.window.after(30, self._poll)
 
-    def _close(self):
-        self.ctl["stop"] = True
-        self.window.destroy()
+            while self.camera_active:
 
+                ok, frame = cap.read()
+
+                if not ok:
+                    print("Camera frame unavailable.")
+                    break
+
+                self.process_serial()
+
+                gray = cv2.cvtColor(
+                    frame,
+                    cv2.COLOR_BGR2GRAY
+                )
+
+                small = cv2.resize(
+                    gray,
+                    (128, 96),
+                    interpolation=cv2.INTER_AREA
+                )
+
+                motion_value = float(np.std(small))
+
+                motion_detected = (
+                    self.frame_count > 5
+                    and motion_value > self.motion_threshold
+                )
+
+                # Preserve the original two-consecutive-even-trigger rule.
+                motion_signal = (
+                    int(motion_value * 10)
+                    if motion_detected
+                    else 0
+                )
+
+                even_now = (
+                    motion_signal > 0
+                    and motion_signal % 2 == 0
+                )
+
+                even_state = even_now and previous_even
+                previous_even = even_now
+
+                if even_state and self.auto_step:
+                    self.engine.step()
+
+                self.draw_camera_overlay(
+                    frame,
+                    motion_value,
+                    motion_detected
+                )
+
+                now = time.perf_counter()
+                elapsed = now - previous_time
+                previous_time = now
+
+                if elapsed > 0:
+                    self.fps = 1.0 / elapsed
+
+                cv2.putText(
+                    frame,
+                    f"FPS: {self.fps:.1f}",
+                    (frame.shape[1] - 120, frame.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1
+                )
+
+                cv2.imshow(
+                    "Bit-Pooling Higher-Lower Camera Lab",
+                    frame
+                )
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord("q"):
+                    break
+
+                elif key == 32:
+                    self.step_search()
+
+                elif key == ord("a"):
+                    self.auto_step = not self.auto_step
+                    print("Auto stepping:", self.auto_step)
+
+                elif key == ord("r"):
+                    self.reset_search()
+
+                elif key == ord("v"):
+                    self.force_reveal = not self.force_reveal
+                    print("Target reveal:", self.force_reveal)
+
+                elif key == ord("s"):
+                    self.show_registers()
+
+                elif key == ord("e"):
+                    self.export_all()
+
+                self.frame_count += 1
+
+        finally:
+
+            self.camera_active = False
+
+            cap.release()
+            cv2.destroyAllWindows()
+
+            print("Camera stopped.")
+
+    # -------------------------------------------------------------------------
+    # MENU
+    # -------------------------------------------------------------------------
+
+    def menu(self):
+
+        print("\n" + "=" * 65)
+        print("BIT-POOLING HIGHER-LOWER SEARCH")
+        print("=" * 65)
+
+        print("1. Start OpenCV camera")
+        print("2. Step search")
+        print("3. Run complete search")
+        print("4. Show registers")
+        print("5. Configure pooling")
+        print("6. Load manual target")
+        print("7. Reset random target")
+        print("8. Toggle target reveal")
+        print("9. Export TARGET")
+        print("10. Export GUESS")
+        print("11. Export POOLED")
+        print("12. Export ALL")
+        print("13. Connect Arduino serial")
+        print("14. Read serial target")
+        print("15. Disconnect serial")
+        print("0. Exit")
+
+        print("=" * 65)
+
+    def run(self):
+
+        print("512-bit Bit-Pooling Search Initialized.")
+        print("A random oracle target has been generated.")
+
+        try:
+
+            while True:
+
+                self.menu()
+
+                choice = input("Select: ").strip()
+
+                if choice == "1":
+                    self.camera_loop()
+
+                elif choice == "2":
+                    self.step_search()
+
+                elif choice == "3":
+                    self.run_search()
+
+                elif choice == "4":
+                    self.show_registers()
+
+                elif choice == "5":
+                    self.configure_pooling()
+
+                elif choice == "6":
+
+                    raw = input("Target: ")
+
+                    try:
+                        self.load_target(
+                            self.parse_integer(raw)
+                        )
+                    except ValueError:
+                        print("Invalid target.")
+
+                elif choice == "7":
+                    self.reset_search()
+
+                elif choice == "8":
+
+                    self.force_reveal = not self.force_reveal
+
+                    print(
+                        "Target revealed."
+                        if self.force_reveal
+                        else "Target hidden."
+                    )
+
+                elif choice == "9":
+                    self.export_register("TARGET")
+
+                elif choice == "10":
+                    self.export_register("GUESS")
+
+                elif choice == "11":
+                    self.export_register("POOLED")
+
+                elif choice == "12":
+                    self.export_all()
+
+                elif choice == "13":
+                    self.connect_serial()
+
+                elif choice == "14":
+                    if self.serial_port is None:
+                        print("Connect serial first.")
+                    else:
+                        print(
+                            "Start the camera to continuously read serial, "
+                            "or send data while the camera is active."
+                        )
+
+                elif choice == "15":
+                    self.disconnect_serial()
+
+                elif choice == "0":
+                    break
+
+                else:
+                    print("Invalid selection.")
+
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+
+        finally:
+
+            self.camera_active = False
+            self.disconnect_serial()
+            cv2.destroyAllWindows()
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.geometry("860x600")
-    root.mainloop()
+
+    if cv2 is None:
+        print("OpenCV is required: pip install opencv-python")
+        sys.exit(1)
+
+    app = BitPoolingCLI()
+    app.run()
