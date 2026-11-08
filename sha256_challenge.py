@@ -3,26 +3,22 @@ Bit-Pooling Oracle Lock Box Lab
 Python + Arduino SHA-256 proof-of-work miner.
 
 Protocol:
-    PC -> Arduino:  DIFF <0-256>\\n                 (mining starts on receipt)
-    Arduino -> PC:  POW:<nonce>:<64 hex hash>:<padded message hex>:<padded nonce hex>:<padded hash hex>:<header>\\n
+    PC -> Arduino:  DIFF <0-256>\\n
+    Arduino -> PC:  POW:<nonce>:<64 hex hash>:<padded message>:<padded nonce>
+                        :<padded hash>:<header>\\n
                     (the only unprompted output)
 
 Pressing "Send Difficulty" sends DIFF to the Arduino, which starts mining
-SHA256(DATA + nonce) straight away and replies with just the proof of work.
+SHA256(DATA + nonce) straight away and replies with the proof of work.
 
-The Arduino is the only thing that mines. The Python side never searches for
-a proof of work; when the Arduino reports one, Python shows the header and
-nonce and recomputes that single hash to verify it. The oracle's own guess
-is verified the same way as soon as it is made, using the header the
-Arduino reports for its DATA string (one hash of the guessed nonce).
-
-At the same moment the difficulty is sent, the oracle starts a background
-guess of both the nonce and the hash on its own. It reads nothing from the
-Arduino and does no searching, so all it can use is what the protocol states:
-a valid hash begins with DIFF zero bits, and the first valid nonce is on
-the order of 2^DIFF. When the Arduino's proof of work arrives, the two are
-stored with their elapsed times and compared (nonce, exact hash, and how many
-of the 256 hash bits agree).
+At the same moment, the camera bit-pooling oracle starts working in the
+background on its own. It does not read anything from the Arduino: it
+searches for the same proof of work itself, then loads the minimally padded
+SHA-256 message block (header + nonce + 0x80 + zeros + 64-bit bit length)
+into the bit-pooling register and reconstructs it bit by bit. The message,
+nonce and hash are decoded purely from the reconstructed bits. The oracle's
+result and the Arduino's result are each stored with their elapsed time and
+compared once both exist.
 
 Install dependencies:
     pip install pyserial opencv-python numpy
@@ -60,195 +56,28 @@ PASSCODE_BYTES = PASSCODE_BITS // 8
 PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
 
 
-def sha256_pad(message: bytes) -> bytes:
-    """
-    SHA-256 padding: message, 0x80, zero bytes, then the 64-bit big-endian
-    bit length, making a whole number of 64-byte blocks. For the Arduino's
-    proof of work the message is header + decimal nonce, so the nonce is
-    carried inside the padded message.
-    """
-    zeros = (55 - len(message)) % 64
-    return (
-        message
-        + b"\x80"
-        + b"\x00" * zeros
-        + (len(message) * 8).to_bytes(8, "big")
-    )
-
-
-def format_blocks(data: bytes) -> str:
-    """Hex of a padded message, one 64-byte block per space-separated group."""
-    return " ".join(
-        data[i:i + 64].hex() for i in range(0, len(data), 64)
-    )
-
-
-def padded_agreement(a: bytes, b: bytes):
-    """(agreeing bits, total bits, identical) for two padded messages."""
-    n = min(len(a), len(b))
-    diff = int.from_bytes(a[:n], "big") ^ int.from_bytes(b[:n], "big")
-    total = max(len(a), len(b)) * 8
-    return n * 8 - bin(diff).count("1"), total, a == b
-
-
-def pow_blocks(header: bytes, nonce: int):
-    """
-    The three padded fields of a proof of work, each the SHA-256 padding of
-    its own bytes: (header + nonce, nonce text alone, the 32 hash bytes).
-    """
-    nonce_text = str(nonce).encode("ascii")
-    message = header + nonce_text
-    digest = hashlib.sha256(message).digest()
-
-    return (
-        sha256_pad(message),
-        sha256_pad(nonce_text),
-        sha256_pad(digest),
-    )
-
-
-def pow_whole(header: bytes, nonce: int) -> bytes:
-    """The whole padded record: message blocks, nonce block, hash block."""
-    return b"".join(pow_blocks(header, nonce))
-
-
-def sha256_unpad(padded: bytes):
-    """Inverse of sha256_pad: the message, or None if the padding is invalid."""
-    if len(padded) < 64 or len(padded) % 64:
-        return None
-
-    bit_length = int.from_bytes(padded[-8:], "big")
-
-    if bit_length % 8 or bit_length // 8 + 9 > len(padded):
-        return None
-
-    message = padded[:bit_length // 8]
-    return message if sha256_pad(message) == padded else None
-
-
-def extract_partial(known: bytes, total: int) -> dict:
-    """
-    Forces extraction from the guess: given the bytes of the passcode
-    recovered so far (a prefix, MSB first), returns whatever the prefix
-    already determines. The passcode is padded message | padded nonce |
-    padded hash, and each field is revealed the moment its padded block is
-    complete:
-
-      message  the first run of whole blocks with valid SHA-256 padding
-               (the length field in the block's last 8 bytes marks its end)
-      nonce    the next block, unpadded; the header is the message minus it
-      hash     the block after that, checked against SHA256(message)
-
-    Uses only the recovered bytes, never the oracle's stored values.
-    """
-    info = {
-        "known": len(known),
-        "total": total,
-        "message": None,
-        "blocks": None,
-        "header": None,
-        "nonce": None,
-        "hash": None,
-        "hash_ok": None,
-        "zero_bits": None,
-        "error": None,
-        "complete": False,
-    }
-
-    message = None
-    msg_end = None
-
-    for blocks in range(1, min(3, len(known) // 64) + 1):
-        message = sha256_unpad(known[:64 * blocks])
-
-        if message is not None:
-            info["message"] = message
-            info["blocks"] = blocks
-            msg_end = 64 * blocks
-            break
-
-    if msg_end is None:
-        if len(known) >= 192:
-            info["error"] = "no valid SHA-256 padding in the first 3 blocks"
-
-        return info
-
-    if len(known) < msg_end + 64:
-        return info
-
-    nonce_text = sha256_unpad(known[msg_end:msg_end + 64])
-
-    if (
-        nonce_text is None
-        or not nonce_text.isdigit()
-        or not message.endswith(nonce_text)
-    ):
-        info["error"] = (
-            "the padded nonce block is invalid or the message does not "
-            "end with the nonce"
-        )
-        return info
-
-    info["nonce"] = int(nonce_text)
-    info["header"] = message[:-len(nonce_text)]
-
-    if len(known) < msg_end + 128:
-        return info
-
-    digest = sha256_unpad(known[msg_end + 64:msg_end + 128])
-
-    if digest is None or len(digest) != 32:
-        info["error"] = "the padded hash block is invalid"
-        return info
-
-    info["hash"] = int.from_bytes(digest, "big")
-    info["hash_ok"] = hashlib.sha256(message).digest() == digest
-    info["zero_bits"] = PASSCODE_BITS - info["hash"].bit_length()
-    info["complete"] = True
-
-    if not info["hash_ok"]:
-        info["error"] = (
-            "SHA-256 of the extracted message is not the extracted hash"
-        )
-
-    return info
-
-
 # ==============================================================================
 # 256-BIT BIT-POOLING ORACLE
 # ==============================================================================
 
 class BitPoolingOracle:
     """
-    SHA-256 padded-record oracle. The hidden passcode is the whole padded
-    proof-of-work record: the padded message (header + nonce), the padded
-    nonce and the padded hash, each in SHA-256 padding (bytes, 0x80, zeros,
-    64-bit length), concatenated in that order. With the Arduino connected,
-    the header and nonce come from its proof of work, so the passcode is the
-    padded fields the Arduino reports. The bit depth is 512 per block, so it
-    follows the header length.
+    Stores a hidden target and answers higher-or-equal queries.
 
-    The oracle answers higher-or-equal queries; the search engine
-    reconstructs the whole record one bit at a time, MSB first.
+    The search engine reconstructs the target one bit at a time, MSB first.
     """
 
-    def __init__(self, header=None, nonce=None):
-        if header is None:
-            header = secrets.token_bytes(16)
+    def __init__(self, bit_depth: int = PASSCODE_BITS, target=None):
+        if not isinstance(bit_depth, int) or bit_depth < 1:
+            raise ValueError("bit_depth must be a positive integer.")
 
-        if isinstance(header, str):
-            header = header.encode("utf-8")
+        self.bit_depth = bit_depth
+        self.max_val = (1 << bit_depth) - 1
 
-        if nonce is None:
-            nonce = secrets.randbelow(1 << 32)
+        if target is None:
+            target = secrets.randbits(bit_depth)
 
-        # Only header and nonce are stored; the padded record (and the hash
-        # inside it) is recomputed per query.
-        self.header = bytes(header)
-        self.nonce = int(nonce)
-
-        self.bit_depth = len(pow_whole(self.header, self.nonce)) * 8
-        self.max_val = (1 << self.bit_depth) - 1
+        self._target = int(target) & self.max_val
 
         self.kernel_size = 4
         self.stride = 2
@@ -259,19 +88,12 @@ class BitPoolingOracle:
         self.pooled_count = 0
         self.is_done = False
 
-    def _padded_value(self) -> int:
-        return int.from_bytes(pow_whole(self.header, self.nonce), "big")
-
-    @property
-    def _target(self) -> int:
-        return self._padded_value()
-
     def query_bit(self, trial_val: int) -> int:
-        """Returns 1 if the padded record is greater than or equal to trial_val."""
+        """Returns 1 if the hidden target is greater than or equal to trial_val."""
         if self.is_done:
             return 0
 
-        return 1 if self._padded_value() >= trial_val else 0
+        return 1 if self._target >= trial_val else 0
 
     def pool_step(self, val: int) -> int:
         """Applies the selected pooling operator to the current guess."""
@@ -318,19 +140,22 @@ class BitPoolingOracle:
 
 
 # ==============================================================================
-# 256-BIT BIT-POOLING SEARCH ENGINE
+# BIT-POOLING SEARCH ENGINE (variable bit depth)
 # ==============================================================================
 
 class BitPoolingSearchEngine:
-    def __init__(self):
+    def __init__(self, bit_depth: int = PASSCODE_BITS):
+        if not isinstance(bit_depth, int) or bit_depth < 1:
+            raise ValueError("bit_depth must be a positive integer.")
+
+        self.bit_depth = bit_depth
+        self.max_val = (1 << bit_depth) - 1
+
         # The camera thread, the GUI and the background oracle all touch the
         # engine, so reset/step are serialised.
         self._lock = threading.RLock()
 
-        self.oracle = BitPoolingOracle()
-        self.bit_depth = self.oracle.bit_depth
-        self.max_val = self.oracle.max_val
-
+        self.oracle = BitPoolingOracle(self.bit_depth)
         self.current_guess = 0
         self.step_count = 0
         self.history = [0]
@@ -348,14 +173,18 @@ class BitPoolingSearchEngine:
 
         self._update_registers()
 
-    def _reset(self, header=None, nonce=None):
-        self.oracle = BitPoolingOracle(header, nonce)
-        self.bit_depth = self.oracle.bit_depth
-        self.max_val = self.oracle.max_val
+    def _reset(self, new_target=None, bit_depth=None):
+        if bit_depth is not None:
+            if not isinstance(bit_depth, int) or bit_depth < 1:
+                raise ValueError("bit_depth must be a positive integer.")
+            self.bit_depth = bit_depth
+            self.max_val = (1 << bit_depth) - 1
 
-        # Keep the pooling settings chosen in the GUI across re-arming.
-        self.oracle.pool_op = self.pool_op
+        self.oracle = BitPoolingOracle(self.bit_depth, new_target)
         self.oracle.kernel_size = self.kernel_size
+        self.oracle.pool_op = self.pool_op
+        self.oracle.schmitt_trigger = self.schmitt_trigger
+
         self.current_guess = 0
         self.step_count = 0
         self.history = [0]
@@ -391,15 +220,19 @@ class BitPoolingSearchEngine:
             else:
                 self.last_status = "RECONSTRUCTION MISMATCH"
 
-    def reset(self, header=None, nonce=None):
-        """Re-arms the oracle with the padded record of header + nonce."""
+    def reset(self, new_target=None, bit_depth=None):
         with self._lock:
-            self._reset(header, nonce)
+            self._reset(new_target, bit_depth)
 
     def step(self):
         """Advances the bit-pooling search by one bit."""
         with self._lock:
             self._step()
+
+    def result(self):
+        """(guess, converged, bit_depth) read atomically."""
+        with self._lock:
+            return self.current_guess, self.converged, self.bit_depth
 
     def _update_registers(self):
         self.guess_reg = self.current_guess
@@ -413,127 +246,86 @@ class BitPoolingSearchEngine:
 
 
 # ==============================================================================
-# PROOF-OF-WORK SESSION
+# SHA-256 PROOF OF WORK + MINIMAL PADDING
 # ==============================================================================
 
+POW_DATA = "arduino-sha256"  # must match inputData in sha256_challenge.ino
 MIN_DIFF = 0
 MAX_DIFF = 256
 
 
-def verify_pow(
-    header: bytes,
-    nonce: int,
-    claimed_hash: int,
-    diff: int,
-    padded=None,
-    padded_nonce=None,
-    padded_hash=None,
-) -> dict:
-    """
-    Verifies a reported proof of work with a single SHA-256 computation of
-    header + decimal nonce. Any padded field the Arduino sent (message,
-    nonce, hash) must equal the SHA-256 padding of the matching bytes. This
-    checks a result; it does not search for one.
-    """
-    message = header + str(nonce).encode("ascii")
-    computed = int.from_bytes(hashlib.sha256(message).digest(), "big")
-    zero_bits = PASSCODE_BITS - computed.bit_length()
-    expected = pow_blocks(header, nonce)
-    hash_ok = computed == claimed_hash
-    diff_ok = zero_bits >= diff
-    padded_ok = all(
-        got is None or got == want
-        for got, want in zip((padded, padded_nonce, padded_hash), expected)
+def sha256_pad(msg: bytes) -> bytes:
+    """Minimal SHA-256 padding: msg, 0x80, zeros, 64-bit big-endian bit length."""
+    total = ((len(msg) + 9 + 63) // 64) * 64
+    return (
+        msg
+        + b"\x80"
+        + b"\x00" * (total - len(msg) - 9)
+        + (len(msg) * 8).to_bytes(8, "big")
     )
 
-    return {
-        "message": message,
-        "padded": expected[0],
-        "whole": b"".join(expected),
-        "computed": computed,
-        "zero_bits": zero_bits,
-        "hash_ok": hash_ok,
-        "diff_ok": diff_ok,
-        "padded_ok": padded_ok,
-        "ok": hash_ok and diff_ok and padded_ok,
-    }
+
+def sha256_unpad(padded: bytes) -> bytes:
+    """Inverse of sha256_pad. Raises ValueError if padding is not minimal/valid."""
+    if len(padded) < 64 or len(padded) % 64:
+        raise ValueError("not a whole number of 64-byte blocks")
+
+    length = int.from_bytes(padded[-8:], "big") // 8
+
+    if length > len(padded) - 9 or sha256_pad(padded[:length]) != padded:
+        raise ValueError("invalid padding")
+
+    return padded[:length]
+
+
+def message_text(padded: bytes) -> str:
+    try:
+        return sha256_unpad(padded).decode("ascii", errors="replace")
+    except ValueError:
+        return "<invalid padding>"
 
 
 class MiningSession:
     """
-    One difficulty send. Holds the oracle's background guess and the
-    Arduino's proof of work, each with its elapsed time since the difficulty
-    was sent, and publishes a snapshot to the GUI whenever either arrives.
+    One difficulty send. Holds what the background oracle found and what the
+    Arduino returned, each with its elapsed time since the difficulty was
+    sent, and publishes a snapshot to the GUI whenever either one arrives.
     """
 
-    def __init__(self, diff: int, out, header=None):
+    def __init__(self, diff: int, data: str, out):
         self.diff = diff
+        self.data = data
         self.out = out
-        self.header = header
         self.cancel = threading.Event()
         self.t0 = time.perf_counter()
         self._lock = threading.Lock()
         self.predicted = None
         self.arduino = None
 
-    def _record(self, hash_int: int, nonce=None) -> dict:
+    def _record(self, nonce: int, hash_int: int, padded: bytes) -> dict:
         return {
             "nonce": nonce,
             "hash": hash_int,
+            "padded": padded,
+            "message": message_text(padded),
             "elapsed": time.perf_counter() - self.t0,
         }
 
-    def set_predicted(self, hash_int: int, nonce: int):
+    def set_predicted(self, nonce: int, hash_int: int, padded: bytes):
         if self.cancel.is_set():
             return
 
-        record = self._record(hash_int, nonce)
-        record["verify"] = self._verify_guess(record, self.header)
-
         with self._lock:
-            self.predicted = record
+            self.predicted = self._record(nonce, hash_int, padded)
 
         self.out.put(("pow_update", self.snapshot()))
 
-    def _verify_guess(self, record: dict, header):
-        """One SHA-256 of header + guessed nonce, or None without a header."""
-        if header is None:
-            return None
-
-        return verify_pow(header, record["nonce"], record["hash"], self.diff)
-
-    def set_arduino(
-        self,
-        nonce: int,
-        hash_int: int,
-        padded: bytes = b"",
-        padded_nonce: bytes = b"",
-        padded_hash: bytes = b"",
-        header: bytes = b"",
-    ):
+    def set_arduino(self, nonce: int, hash_int: int, padded: bytes):
         if self.cancel.is_set():
             return
 
-        record = self._record(hash_int, nonce)
-        record["header"] = header
-        record["padded"] = padded
-        record["padded_nonce"] = padded_nonce
-        record["padded_hash"] = padded_hash
-        record["whole"] = padded + padded_nonce + padded_hash
-        record["verify"] = verify_pow(
-            header, nonce, hash_int, self.diff,
-            padded, padded_nonce, padded_hash,
-        )
-
         with self._lock:
-            self.arduino = record
-
-            # No header was available when the oracle guessed: verify the
-            # guess now, against the header the Arduino reports.
-            if self.predicted is not None and self.predicted["verify"] is None:
-                self.predicted["verify"] = self._verify_guess(
-                    self.predicted, header
-                )
+            self.arduino = self._record(nonce, hash_int, padded)
 
         self.out.put(("pow_update", self.snapshot()))
 
@@ -543,37 +335,12 @@ class MiningSession:
             arduino = dict(self.arduino) if self.arduino else None
 
         match = None
-        nonce_match = None
-        bits_agree = None
 
         if predicted is not None and arduino is not None:
-            difference = predicted["hash"] ^ arduino["hash"]
-            nonce_match = predicted["nonce"] == arduino["nonce"]
-            match = nonce_match and difference == 0
-            bits_agree = PASSCODE_BITS - bin(difference).count("1")
-
-        # The oracle's predicted padded record: the padding of header plus
-        # its guessed nonce, of the guessed nonce alone, and of its guessed
-        # hash. No hashing and no Arduino data beyond the header, which the
-        # protocol exposes.
-        predicted_padded = None
-        padded_agree = None
-        header = self.header
-
-        if header is None and arduino is not None:
-            header = arduino["header"]
-
-        if predicted is not None and header is not None:
-            guess_nonce = str(predicted["nonce"]).encode("ascii")
-            predicted_padded = (
-                sha256_pad(header + guess_nonce)
-                + sha256_pad(guess_nonce)
-                + sha256_pad(predicted["hash"].to_bytes(32, "big"))
-            )
-
-        if predicted_padded is not None and arduino is not None:
-            padded_agree = padded_agreement(
-                predicted_padded, arduino["whole"]
+            match = (
+                predicted["nonce"] == arduino["nonce"]
+                and predicted["hash"] == arduino["hash"]
+                and predicted["padded"] == arduino["padded"]
             )
 
         return {
@@ -581,50 +348,79 @@ class MiningSession:
             "predicted": predicted,
             "arduino": arduino,
             "match": match,
-            "nonce_match": nonce_match,
-            "bits_agree": bits_agree,
-            "predicted_padded": predicted_padded,
-            "padded_agree": padded_agree,
         }
-
-
-def blind_guess(diff: int):
-    """
-    Returns (nonce, hash) guessed without hashing anything and without
-    reading the Arduino.
-
-    The hash has its DIFF leading bits set to zero (the protocol rule) and
-    random bits elsewhere. The first valid nonce is geometrically distributed
-    with success chance 2^-DIFF per try, so no nonce is much likelier than
-    nonce 0, and the best any blind guess can do is about 1 in 2^DIFF. The
-    nonce is drawn from the small range [0, 2^(DIFF-4)), which reaches
-    about 97% of that best case. Chance of an exact hash hit is
-    1 in 2^(256-DIFF).
-    """
-    free_bits = PASSCODE_BITS - diff
-    hash_guess = secrets.randbits(free_bits) if free_bits > 0 else 0
-    nonce_guess = secrets.randbelow(1 << min(max(diff - 4, 0), 32))
-    return nonce_guess, hash_guess
 
 
 class BackgroundPredictor(threading.Thread):
     """
-    The oracle's background worker. It runs independently of the Arduino and
-    does not mine: the Arduino is the only thing that hashes.
+    The camera oracle's background worker. It runs independently of the
+    Arduino link: it searches for the same proof of work (SHA256(DATA + nonce),
+    nonce counting up from 0), loads the minimally padded message block into
+    the bit-pooling engine as the hidden target, lets the engine reconstruct
+    it one bit at a time, then decodes message, nonce and hash from the
+    reconstructed bits alone.
     """
 
-    def __init__(self, session: MiningSession):
+    def __init__(self, session: MiningSession, engine: BitPoolingSearchEngine):
         super().__init__(daemon=True)
         self.session = session
+        self.engine = engine
 
     def run(self):
         session = self.session
+        base = hashlib.sha256(session.data.encode("ascii"))
+        limit = 1 << (256 - session.diff)  # leading-zero test: value < limit
+
+        nonce = 0
+        found = None
+
+        while nonce <= 0xFFFFFFFF:
+            if (nonce & 0xFFF) == 0 and session.cancel.is_set():
+                return
+
+            h = base.copy()
+            h.update(str(nonce).encode("ascii"))
+            value = int.from_bytes(h.digest(), "big")
+
+            if value < limit:
+                found = value
+                break
+
+            nonce += 1
+
+        if found is None or session.cancel.is_set():
+            return
+
+        # The oracle's pre-knowledge: the exact message that was hashed, in
+        # its minimal SHA-256 padded form, becomes the hidden target.
+        message = (session.data + str(nonce)).encode("ascii")
+        padded = sha256_pad(message)
+        depth = len(padded) * 8
+
+        self.engine.reset(int.from_bytes(padded, "big"), depth)
+
+        while not session.cancel.is_set() and not self.engine.converged:
+            self.engine.step()
 
         if session.cancel.is_set():
             return
 
-        nonce, hash_guess = blind_guess(session.diff)
-        session.set_predicted(hash_guess, nonce)
+        # Decode purely from the reconstructed bits.
+        guess, converged, depth = self.engine.result()
+
+        if not converged:
+            return
+
+        decoded = guess.to_bytes(depth // 8, "big")
+
+        try:
+            msg = sha256_unpad(decoded)
+            nonce_out = int(msg[len(session.data):])
+        except ValueError:
+            return
+
+        hash_out = int.from_bytes(hashlib.sha256(msg).digest(), "big")
+        session.set_predicted(nonce_out, hash_out, decoded)
 
 
 # ==============================================================================
@@ -636,7 +432,8 @@ class ArduinoMiner:
     Serial link to the Arduino SHA-256 miner.
 
         PC -> Arduino: DIFF <bits>\\n
-        Arduino -> PC: POW:<nonce>:<64 hex>:<padded message hex>:<padded nonce hex>:<padded hash hex>:<header>\\n
+        Arduino -> PC: POW:<nonce>:<hash>:<padded msg>:<padded nonce>
+                           :<padded hash>:<header>\\n
 
     Owned by a single thread, so no locking is needed.
     """
@@ -672,44 +469,27 @@ class ArduinoMiner:
         if self.ser and self.ser.is_open:
             self.ser.close()
 
-    def query_header(self, timeout: float = 1.0):
-        """Asks the Arduino for its header (DATA string). None if no reply."""
-        self.ser.reset_input_buffer()
-        self.ser.write(b"HEADER\n")
-        self.ser.flush()
-
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            line = self.ser.readline().rstrip(b"\r\n")
-
-            if line.startswith(b"HEADER:"):
-                return line[len(b"HEADER:"):]
-
-        return None
-
     def send_diff(self, diff: int):
         self.ser.write(f"DIFF {int(diff)}\n".encode("ascii"))
         self.ser.flush()
 
     def read_pow(self):
         """
-        Reads one line. Returns (nonce, hash_int, padded_message,
-        padded_nonce, padded_hash, header) for a valid POW line, otherwise
-        None. The header is everything after the sixth colon, so it may
-        itself contain colons.
+        Parses POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
+        Returns (nonce, hash_int, padded_message_bytes) or None.
+        The header may contain colons, so it is the unsplit remainder.
         """
         raw = self.ser.readline()
 
         if not raw:
             return None
 
-        line = raw.rstrip(b"\r\n")
+        line = raw.decode("ascii", errors="ignore").strip()
 
-        if not line.startswith(b"POW:"):
+        if not line.startswith("POW:"):
             return None
 
-        parts = line.split(b":", 6)
+        parts = line.split(":", 6)
 
         if len(parts) != 7 or len(parts[2]) != 64:
             return None
@@ -718,21 +498,19 @@ class ArduinoMiner:
             return (
                 int(parts[1]),
                 int(parts[2], 16),
-                bytes.fromhex(parts[3].decode("ascii")),
-                bytes.fromhex(parts[4].decode("ascii")),
-                bytes.fromhex(parts[5].decode("ascii")),
-                parts[6],
+                bytes.fromhex(parts[3]),
             )
         except ValueError:
             return None
 
 
 class ArduinoThread(threading.Thread):
-    def __init__(self, port, ctl, out):
+    def __init__(self, port, ctl, out, engine):
         super().__init__(daemon=True)
         self.port = port
         self.ctl = ctl
         self.out = out
+        self.engine = engine
         self.commands = queue.Queue()
         self.session = None
 
@@ -743,13 +521,12 @@ class ArduinoThread(threading.Thread):
         if self.session is not None:
             self.session.cancel.set()
 
-        header = miner.query_header()
-        session = MiningSession(diff, self.out, header)
+        session = MiningSession(diff, POW_DATA, self.out)
         self.session = session
 
         # Arduino and oracle are started together and then run on their own.
         miner.send_diff(diff)
-        BackgroundPredictor(session).start()
+        BackgroundPredictor(session, self.engine).start()
 
         self.out.put(("pow_update", session.snapshot()))
 
@@ -954,6 +731,7 @@ class SimThread(threading.Thread):
                         "pooled": engine.pooled_register,
                         "status": engine.last_status,
                         "steps": engine.step_count,
+                        "depth": engine.bit_depth,
                         "history": list(engine.history),
                         "converged": engine.converged,
                     },
@@ -971,113 +749,11 @@ class SimThread(threading.Thread):
 # MAIN GUI
 # ==============================================================================
 
-class SelectableText(tk.Text):
-    """
-    Read-only text box used for every output field. Long values wrap, and the
-    text can be selected with the mouse and copied: Ctrl+C, right-click >
-    Copy, Ctrl+A to select all, or right-click > Copy All.
-    """
-
-    def __init__(self, master, text="", **kw):
-        style = ttk.Style()
-        kw.setdefault(
-            "bg",
-            style.lookup("TFrame", "background")
-            or master.winfo_toplevel().cget("background"),
-        )
-        kw.setdefault("fg", style.lookup("TLabel", "foreground") or "black")
-        kw.setdefault("font", ("Consolas", 10))
-        kw.setdefault("height", 1)
-        kw.setdefault("width", 20)
-
-        super().__init__(
-            master,
-            wrap="char",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            cursor="xterm",
-            insertwidth=0,
-            **kw,
-        )
-
-        self._shown = None
-
-        self.bind("<Button-1>", lambda e: self.focus_set(), add="+")
-        self.bind("<Control-a>", self._select_all)
-        self.bind("<Control-A>", self._select_all)
-        self.bind("<Configure>", lambda e: self._fit())
-
-        self._menu = tk.Menu(self, tearoff=0)
-        self._menu.add_command(
-            label="Copy", command=lambda: self.event_generate("<<Copy>>")
-        )
-        self._menu.add_command(label="Select All", command=self._select_all)
-        self._menu.add_command(label="Copy All", command=self.copy_all)
-
-        self.bind("<Button-3>", self._popup)
-
-        if sys.platform == "darwin":
-            self.bind("<Button-2>", self._popup)
-
-        self.set(text)
-
-    def _popup(self, event):
-        self.focus_set()
-        self._menu.tk_popup(event.x_root, event.y_root)
-        return "break"
-
-    def _select_all(self, event=None):
-        self.tag_add("sel", "1.0", "end-1c")
-        return "break"
-
-    def value(self) -> str:
-        return self.get("1.0", "end-1c")
-
-    def copy_all(self):
-        self.clipboard_clear()
-        self.clipboard_append(self.value())
-
-    def set(self, text: str):
-        self.set_tagged([(text, None)])
-
-    def set_tagged(self, parts):
-        """Replaces the content with (text, tag) parts; no-op if unchanged,
-        so a selection survives refreshes that change nothing."""
-        parts = tuple(parts)
-
-        if parts == self._shown:
-            return
-
-        self._shown = parts
-
-        self.configure(state="normal")
-        self.delete("1.0", "end")
-
-        for text, tag in parts:
-            self.insert("end", text, (tag,) if tag else ())
-
-        self.configure(state="disabled")
-        self._fit()
-
-    def _fit(self):
-        try:
-            counted = self.count("1.0", "end-1c", "update", "displaylines")
-            lines = counted[0] if isinstance(counted, (tuple, list)) else counted
-        except (tk.TclError, TypeError):
-            lines = self.value().count("\n") + 1
-
-        lines = max(1, int(lines or 1))
-
-        if int(self.cget("height")) != lines:
-            self.configure(height=lines)
-
-
 class App:
     def __init__(self, window):
         self.window = window
         self.window.title(
-            "Bit-Pooling Oracle Lock Box Lab — SHA-256 Padded Message"
+            "Bit-Pooling Oracle Lock Box Lab — Padded Message Decoder"
         )
 
         self.q = queue.Queue()
@@ -1089,58 +765,21 @@ class App:
             "arduino_stop": False,
         }
 
-        self.engine = BitPoolingSearchEngine()
+        self.engine = BitPoolingSearchEngine(
+            bit_depth=PASSCODE_BITS
+        )
         self.camera_thread = None
         self.camera_ready = False
         self.pending_diff = None
         self.arduino_thread = None
-        self._oracle_key = None
-        self._register_key = None
-        self._extract_key = None
-        self._arduino_pow = None
 
         self._build_ui()
         self.window.protocol("WM_DELETE_WINDOW", self._close)
         self.window.after(15, self._poll)
 
     def _build_ui(self):
-        # The whole interface scrolls: a canvas holds the main frame and a
-        # vertical scrollbar drives it.
-        outer = ttk.Frame(self.window)
-        outer.pack(fill="both", expand=True)
-
-        self._scroll_canvas = tk.Canvas(outer, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(
-            outer,
-            orient="vertical",
-            command=self._scroll_canvas.yview,
-        )
-        self._scroll_canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side="right", fill="y")
-        self._scroll_canvas.pack(side="left", fill="both", expand=True)
-
-        main_frame = ttk.Frame(self._scroll_canvas, padding=10)
-        frame_id = self._scroll_canvas.create_window(
-            (0, 0), window=main_frame, anchor="nw"
-        )
-
-        main_frame.bind(
-            "<Configure>",
-            lambda e: self._scroll_canvas.configure(
-                scrollregion=self._scroll_canvas.bbox("all")
-            ),
-        )
-        self._scroll_canvas.bind(
-            "<Configure>",
-            lambda e: self._scroll_canvas.itemconfigure(
-                frame_id, width=e.width
-            ),
-        )
-
-        self.window.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.window.bind_all("<Button-4>", self._on_mousewheel)
-        self.window.bind_all("<Button-5>", self._on_mousewheel)
+        main_frame = ttk.Frame(self.window, padding=10)
+        main_frame.pack(fill="both", expand=True)
 
         # Laboratory controls
         control_frame = ttk.LabelFrame(
@@ -1247,58 +886,39 @@ class App:
         )
         pow_frame.pack(fill="x", padx=5, pady=5)
 
-        # Every output field is a SelectableText: select and copy any value.
-        pow_frame.columnconfigure(1, weight=1)
+        self.v_link = tk.StringVar(value="Arduino: not connected")
+        self.v_pow_diff = tk.StringVar(value="")
+        self.v_pow_oracle = tk.StringVar(value="ORACLE   -")
+        self.v_pow_oracle_msg = tk.StringVar(value="")
+        self.v_pow_arduino = tk.StringVar(value="ARDUINO  -")
+        self.v_pow_arduino_msg = tk.StringVar(value="")
+        self.v_pow_match = tk.StringVar(value="")
 
-        fields = (
-            ("v_link", "", "Arduino: not connected"),
-            ("v_pow_diff", "", ""),
-            ("v_pow_header", "HEADER", "-"),
-            ("v_pow_nonce", "NONCE", "-"),
-            ("v_pow_hash", "HASH", "-"),
-            ("v_pow_padded", "PAD MSG", "-"),
-            ("v_pow_padded_nonce", "PAD NONCE", "-"),
-            ("v_pow_padded_hash", "PAD HASH", "-"),
-            ("v_pow_times", "TIMES", "-"),
-            ("v_pow_verify", "VERIFY", "-"),
-            ("v_pow_oracle_nonce", "ORACLE NONCE", "-"),
-            ("v_pow_oracle_hash", "ORACLE HASH", "-"),
-            ("v_pow_oracle_padded", "ORACLE PADDED", "-"),
-            ("v_pow_oracle_verify", "ORACLE VERIFY", "-"),
-            ("v_pow_match", "", ""),
-        )
-
-        self.pow_fields = []
-
-        for row, (attr, caption, initial) in enumerate(fields):
+        for var in (
+            self.v_link,
+            self.v_pow_diff,
+            self.v_pow_oracle,
+            self.v_pow_oracle_msg,
+            self.v_pow_arduino,
+            self.v_pow_arduino_msg,
+            self.v_pow_match,
+        ):
             ttk.Label(
                 pow_frame,
-                text=caption,
+                textvariable=var,
                 font=("Consolas", 10),
-            ).grid(row=row, column=0, sticky="nw", padx=(10, 4), pady=1)
-
-            box = SelectableText(pow_frame, initial)
-            box.grid(row=row, column=1, sticky="ew", padx=(0, 10), pady=1)
-
-            setattr(self, attr, box)
-            self.pow_fields.append((caption, box))
-
-        ttk.Button(
-            pow_frame,
-            text="Copy All Fields",
-            command=self.copy_all_fields,
-        ).grid(row=len(fields), column=1, sticky="e", padx=10, pady=3)
+            ).pack(anchor="w", padx=10, pady=1)
 
         # Local target controls
         target_frame = ttk.LabelFrame(
             main_frame,
-            text="SHA-256 Oracle (passcode = padded message | nonce | hash)",
+            text="Local 256-Bit Oracle Target (hexadecimal)",
         )
         target_frame.pack(fill="x", padx=5, pady=5)
 
         self.target_label = ttk.Label(
             target_frame,
-            text="Oracle header (nonce 0):",
+            text="Target (64 hex characters):",
         )
         self.target_label.pack(side="left", padx=5, pady=5)
 
@@ -1307,7 +927,7 @@ class App:
         )
         self.e_custom_target = ttk.Entry(
             target_frame,
-            width=60,
+            width=72,
             textvariable=self.v_custom_target,
         )
         self.e_custom_target.pack(
@@ -1316,7 +936,7 @@ class App:
 
         ttk.Button(
             target_frame,
-            text="Hash Message",
+            text="Set Custom",
             command=self.set_custom_target,
         ).pack(side="left", padx=2, pady=5)
 
@@ -1329,47 +949,12 @@ class App:
         self.v_reveal = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             target_frame,
-            text="Force Reveal Passcode",
+            text="Force Reveal Local Target",
             variable=self.v_reveal,
             command=lambda: self.ctl.update(
                 force_reveal=self.v_reveal.get()
             ),
         ).pack(side="left", padx=15, pady=5)
-
-        # Fields recovered from the completed passcode registers
-        extract_frame = ttk.LabelFrame(
-            main_frame,
-            text="Extracted from Completed Passcode",
-        )
-        extract_frame.pack(fill="x", padx=5, pady=5)
-        extract_frame.columnconfigure(1, weight=1)
-
-        self.extract_fields = []
-
-        for row, (attr, caption) in enumerate((
-            ("v_ex_header", "HEADER"),
-            ("v_ex_nonce", "NONCE"),
-            ("v_ex_message", "MESSAGE"),
-            ("v_ex_hash", "HASH"),
-            ("v_ex_check", "CHECK"),
-        )):
-            ttk.Label(
-                extract_frame,
-                text=caption,
-                font=("Consolas", 10),
-            ).grid(row=row, column=0, sticky="nw", padx=(10, 4), pady=1)
-
-            box = SelectableText(extract_frame, "-")
-            box.grid(row=row, column=1, sticky="ew", padx=(0, 10), pady=1)
-
-            setattr(self, attr, box)
-            self.extract_fields.append((caption, box))
-
-        ttk.Button(
-            extract_frame,
-            text="Copy Extracted",
-            command=self.copy_extracted,
-        ).grid(row=5, column=1, sticky="e", padx=10, pady=3)
 
         # Camera and register display
         display_frame = ttk.Frame(main_frame)
@@ -1405,42 +990,32 @@ class App:
 
         register_frame = ttk.LabelFrame(
             right_panel,
-            text="Padded-Message Passcode Registers",
+            text="Bit-Pooling Registers",
         )
         register_frame.pack(
             fill="both", expand=True, padx=5, pady=5
         )
 
-        self.register_text = SelectableText(
+        self.register_canvas = tk.Canvas(
             register_frame,
-            "",
+            width=760,
+            height=300,
             bg="#121414",
-            fg="#d2e0f0",
-            width=100,
-            height=12,
+            highlightthickness=0,
         )
-        self.register_text.pack(fill="x", padx=5, pady=5)
-
-        self.register_text.tag_configure(
-            "label", foreground="#88a0c0", font=("Consolas", 10, "bold")
+        self.register_canvas.pack(
+            padx=5, pady=5
         )
-        self.register_text.tag_configure("target", foreground="#00e676")
-        self.register_text.tag_configure("guess", foreground="#ffb300")
-        self.register_text.tag_configure("pooled", foreground="#b388ff")
 
-        self.status_label = SelectableText(
+        self.status_label = ttk.Label(
             register_frame,
-            "Status: IDLE",
-            fg="#00e5ff",
+            text="Status: IDLE",
             font=("Consolas", 11),
+            foreground="#00e5ff",
         )
-        self.status_label.pack(fill="x", padx=10, pady=5)
-
-        ttk.Button(
-            register_frame,
-            text="Copy Registers",
-            command=self.register_text.copy_all,
-        ).pack(anchor="e", padx=10, pady=(0, 5))
+        self.status_label.pack(
+            anchor="w", padx=10, pady=5
+        )
 
         # Pooling settings
         settings_frame = ttk.LabelFrame(
@@ -1509,21 +1084,6 @@ class App:
             row=1, column=1, padx=5, pady=5
         )
 
-    def _on_mousewheel(self, event):
-        # Windows/macOS send MouseWheel with a delta; Linux sends
-        # Button-4 (up) and Button-5 (down).
-        if self._scroll_canvas.yview() == (0.0, 1.0):
-            return
-
-        if event.num == 4:
-            step = -1
-        elif event.num == 5:
-            step = 1
-        else:
-            step = -1 if event.delta > 0 else 1
-
-        self._scroll_canvas.yview_scroll(step, "units")
-
     def start_camera(self):
         if (
             self.camera_thread is not None
@@ -1546,15 +1106,10 @@ class App:
 
     def step_search(self):
         self.engine.step()
-        self._refresh_registers()
-        self._check_complete()
 
     def reset_search(self):
-        self.engine.reset()
+        self.engine.reset(bit_depth=PASSCODE_BITS)
         self.v_custom_target.set("[SECURE]")
-        self._arduino_pow = None
-        self._refresh_registers()
-        self._check_complete()
 
     def list_arduino_ports(self):
         try:
@@ -1600,6 +1155,7 @@ class App:
             port,
             self.ctl,
             self.q,
+            self.engine,
         )
         self.arduino_thread.start()
 
@@ -1675,326 +1231,72 @@ class App:
                 "when the Arduino connects."
             )
 
-    def copy_extracted(self):
-        lines = [
-            f"{caption}: {box.value().strip()}"
-            for caption, box in self.extract_fields
-            if box.value().strip() not in ("", "-", "...")
-        ]
-
-        self.window.clipboard_clear()
-        self.window.clipboard_append("\n".join(lines))
-
-    def _refresh_registers(self):
-        """Redraws the registers now, without waiting for a camera frame."""
-        engine = self.engine
-        revealed = self.v_reveal.get()
-
-        with engine._lock:
-            exposed = (
-                engine.oracle._target
-                if engine.converged or revealed
-                else 0
-            )
-            guess = engine.current_guess
-            pooled = engine.pooled_register
-            status = (
-                f"Status: {engine.last_status} | "
-                f"Bit Step: {engine.step_count}/{engine.bit_depth}"
-            )
-
-        self._draw_hex_rows(exposed, guess, pooled, revealed)
-        self.status_label.set(status)
-
-    def _check_complete(self):
-        """
-        Forces extraction from the guess register as it fills: each field is
-        revealed the moment the guess holds its whole padded block, not only
-        at the end. Re-runs whenever another whole byte of the guess is
-        recovered or the oracle is re-armed.
-        """
-        engine = self.engine
-
-        with engine._lock:
-            oracle = engine.oracle
-            steps = engine.step_count
-            guess = engine.current_guess
-            depth = engine.bit_depth
-
-        known_bytes = steps // 8
-        key = (oracle, known_bytes)
-
-        if key == self._extract_key:
-            return
-
-        self._extract_key = key
-
-        if known_bytes == 0:
-            self._show_extracted(None)
-            return
-
-        recovered = guess.to_bytes(depth // 8, "big")[:known_bytes]
-        self._show_extracted(extract_partial(recovered, depth // 8))
-
-    def _show_extracted(self, info):
-        if info is None:
-            for box in (
-                self.v_ex_header,
-                self.v_ex_nonce,
-                self.v_ex_message,
-                self.v_ex_hash,
-                self.v_ex_check,
-            ):
-                box.set("-")
-
-            return
-
-        text = lambda raw: raw.decode("utf-8", errors="replace")
-
-        self.v_ex_message.set(
-            text(info["message"]) if info["message"] is not None else "..."
-        )
-        self.v_ex_header.set(
-            text(info["header"]) if info["header"] is not None else "..."
-        )
-        self.v_ex_nonce.set(
-            str(info["nonce"]) if info["nonce"] is not None else "..."
-        )
-        self.v_ex_hash.set(
-            f"{info['hash']:064x}" if info["hash"] is not None else "..."
-        )
-
-        progress = (
-            f"{info['known']}/{info['total']} bytes of the guess recovered"
-        )
-
-        if info["error"] is not None:
-            verdict = "FAILED  " + info["error"]
-        elif info["complete"]:
-            verdict = (
-                "OK  SHA256(message) equals the extracted hash, "
-                f"{info['zero_bits']} leading zero bits"
-            )
-
-            arduino = self._arduino_pow
-
-            if arduino is not None:
-                same = (
-                    info["header"] == arduino["header"]
-                    and info["nonce"] == arduino["nonce"]
-                    and info["hash"] == arduino["hash"]
-                )
-                verdict += (
-                    "; identical to the Arduino's proof of work"
-                    if same
-                    else "; DIFFERS from the Arduino's proof of work"
-                )
-        elif info["message"] is None:
-            verdict = (
-                f"{progress}; waiting for the first complete padded "
-                "message block"
-            )
-        elif info["nonce"] is None:
-            verdict = (
-                f"{progress}; padding revealed: the message is "
-                f"{len(info['message'])} bytes in {info['blocks']} block(s); "
-                "waiting for the nonce block"
-            )
-        else:
-            verdict = (
-                f"{progress}; nonce block unpadded, header and nonce "
-                "extracted; waiting for the hash block"
-            )
-
-        self.v_ex_check.set(verdict)
-
-    def copy_all_fields(self):
-        lines = []
-
-        for caption, box in self.pow_fields:
-            text = box.value().strip()
-
-            if text:
-                lines.append(f"{caption}: {text}" if caption else text)
-
-        self.window.clipboard_clear()
-        self.window.clipboard_append("\n".join(lines))
-
     def _show_pow(self, snap):
-        predicted, arduino = snap["predicted"], snap["arduino"]
+        def line(label, item):
+            if item is None:
+                return f"{label}  ..."
 
-        # A verified Arduino proof of work arms the oracle: the passcode
-        # becomes the padded message | nonce | hash record.
-        if arduino is not None and arduino["verify"]["ok"]:
-            key = (arduino["elapsed"], arduino["nonce"])
-
-            if key != self._oracle_key:
-                self._oracle_key = key
-                self.engine.reset(arduino["header"], arduino["nonce"])
-                self.v_custom_target.set("[SECURE]")
-                self._arduino_pow = arduino
-                self._refresh_registers()
-                self._check_complete()
-
-        def odds(bits):
-            return f"1 in {2 ** bits:,}" if bits <= 20 else f"1 in 2^{bits}"
-
-        self.v_pow_diff.set(
-            f"Difficulty: {snap['diff']} bits   |   blind-guess odds: "
-            f"nonce {odds(snap['diff'])}, "
-            f"hash {odds(PASSCODE_BITS - snap['diff'])}"
-        )
-
-        times = []
-
-        if arduino is None:
-            for box in (
-                self.v_pow_header,
-                self.v_pow_nonce,
-                self.v_pow_hash,
-                self.v_pow_padded,
-                self.v_pow_padded_nonce,
-                self.v_pow_padded_hash,
-                self.v_pow_verify,
-            ):
-                box.set("...")
-        else:
-            check = arduino["verify"]
-            message = check["message"].decode("utf-8", errors="replace")
-
-            self.v_pow_header.set(
-                arduino["header"].decode("utf-8", errors="replace")
-            )
-            self.v_pow_nonce.set(str(arduino["nonce"]))
-            self.v_pow_hash.set(f"{arduino['hash']:064x}")
-            self.v_pow_padded.set(format_blocks(arduino["padded"]))
-            self.v_pow_padded_nonce.set(
-                format_blocks(arduino["padded_nonce"])
-            )
-            self.v_pow_padded_hash.set(
-                format_blocks(arduino["padded_hash"])
-            )
-            times.append(f"Arduino {arduino['elapsed']:.3f} s")
-
-            if check["ok"]:
-                verdict = (
-                    f"OK  SHA256(\"{message}\") equals the reported hash, "
-                    f"{check['zero_bits']} leading zero bits "
-                    f">= {snap['diff']} required, padded message, nonce and "
-                    "hash are valid SHA-256 padding"
-                )
-            elif not check["hash_ok"]:
-                verdict = (
-                    f"FAILED  SHA256(\"{message}\") is "
-                    f"{check['computed']:064x}, not the reported hash"
-                )
-            elif not check["padded_ok"]:
-                verdict = (
-                    "FAILED  a reported padded field is not the SHA-256 "
-                    "padding of the matching message, nonce or hash"
-                )
-            else:
-                verdict = (
-                    f"FAILED  only {check['zero_bits']} leading zero bits, "
-                    f"{snap['diff']} required"
-                )
-
-            self.v_pow_verify.set(verdict)
-
-        if predicted is None:
-            self.v_pow_oracle_nonce.set("...")
-            self.v_pow_oracle_hash.set("...")
-        else:
-            self.v_pow_oracle_nonce.set(str(predicted["nonce"]))
-            self.v_pow_oracle_hash.set(f"{predicted['hash']:064x}")
-            times.append(f"Oracle {predicted['elapsed']:.3f} s")
-
-        self.v_pow_times.set("   |   ".join(times) if times else "-")
-
-        if snap["predicted_padded"] is None:
-            self.v_pow_oracle_padded.set(
-                "..." if predicted is None else "waiting for the header"
-            )
-        else:
-            self.v_pow_oracle_padded.set(
-                format_blocks(snap["predicted_padded"])
+            return (
+                f"{label}  nonce {item['nonce']}  "
+                f"hash {item['hash']:064x}  "
+                f"({item['elapsed']:.3f} s)"
             )
 
-        guess_check = predicted["verify"] if predicted is not None else None
+        def msg(item):
+            if item is None:
+                return ""
 
-        if predicted is None:
-            self.v_pow_oracle_verify.set("...")
-        elif guess_check is None:
-            self.v_pow_oracle_verify.set("waiting for the header")
-        else:
-            message = guess_check["message"].decode("utf-8", errors="replace")
-            detail = (
-                f"\nSHA256(\"{message}\") = "
-                f"{guess_check['computed']:064x}  "
-                f"({guess_check['zero_bits']} leading zero bits, "
-                f"{snap['diff']} required)"
+            n = len(item["padded"])
+            return (
+                f"          message {item['message']!r}  "
+                f"[{n} bytes padded, {n * 8} bits]"
             )
 
-            if guess_check["ok"]:
-                verdict = "OK  the guessed nonce and hash are a valid proof of work"
-            elif not guess_check["hash_ok"]:
-                verdict = "FAILED  the guessed hash is not SHA256(header + guessed nonce)"
-            else:
-                verdict = "FAILED  the guessed hash lacks the required leading zero bits"
-
-            self.v_pow_oracle_verify.set(verdict + detail)
+        self.v_pow_diff.set(f"Difficulty: {snap['diff']} bits")
+        self.v_pow_oracle.set(line("ORACLE  ", snap["predicted"]))
+        self.v_pow_oracle_msg.set(msg(snap["predicted"]))
+        self.v_pow_arduino.set(line("ARDUINO ", snap["arduino"]))
+        self.v_pow_arduino_msg.set(msg(snap["arduino"]))
 
         if snap["match"] is None:
-            match_text = ""
+            self.v_pow_match.set("")
         elif snap["match"]:
-            match_text = "MATCH: oracle nonce and hash equal the Arduino's"
+            self.v_pow_match.set("MATCH: same nonce, hash and padded message")
         else:
-            nonce_text = "nonce equal" if snap["nonce_match"] else "nonce differs"
-            match_text = (
-                f"NO MATCH: {nonce_text}, {snap['bits_agree']}/256 hash bits "
-                f"agree (the {snap['diff']}-bit zero prefix is shared by "
-                "definition)"
+            self.v_pow_match.set(
+                "MISMATCH: nonce, hash or padded message differs"
             )
-
-        if snap["padded_agree"] is not None:
-            agree, total, same = snap["padded_agree"]
-            match_text += "\n" + (
-                "PADDED MATCH: oracle's whole padded record equals the "
-                "Arduino's"
-                if same
-                else f"PADDED NO MATCH: {agree}/{total} padded-record "
-                "bits agree"
-            )
-
-        self.v_pow_match.set(match_text.strip())
 
     def set_custom_target(self):
-        text = self.v_custom_target.get()
+        text = self.v_custom_target.get().strip()
 
-        if not text or text == "[SECURE]":
+        if text.startswith("0x") or text.startswith("0X"):
+            text = text[2:]
+
+        try:
+            value = int(text, 16)
+        except ValueError:
             messagebox.showerror(
                 "Invalid Input",
-                "Enter the header the oracle should pad (nonce 0).",
+                "Enter a 64-character hexadecimal value.",
             )
             return
 
-        self.engine.reset(text.encode("utf-8"), 0)
-        self.v_custom_target.set("[SECURE]")
-        self._arduino_pow = None
-        self._refresh_registers()
-        self._check_complete()
-        messagebox.showinfo(
-            "Oracle Armed",
-            "Passcode is now the padded message, nonce and hash of that "
-            "header with nonce 0 (hidden until pooled).",
-        )
+        if 0 <= value <= (1 << PASSCODE_BITS) - 1:
+            self.engine.reset(value, PASSCODE_BITS)
+            messagebox.showinfo(
+                "Target Set",
+                "New 256-bit target configured for bit pooling.",
+            )
+        else:
+            messagebox.showerror(
+                "Invalid Range",
+                "Target must be a 256-bit hexadecimal value.",
+            )
 
     def randomize_target(self):
-        self.engine.reset()
+        self.engine.reset(bit_depth=PASSCODE_BITS)
         self.v_custom_target.set("[SECURE]")
-        self._arduino_pow = None
-        self._refresh_registers()
-        self._check_complete()
 
     def _update_pool_operator(self, event):
         operator = self.operator_combo.get()
@@ -2016,51 +1318,58 @@ class App:
         pooled_value,
         revealed,
     ):
+        self.register_canvas.delete("all")
+
         is_exposed = revealed or self.engine.converged
         active_target = target_value if is_exposed else 0
         depth = self.engine.bit_depth
         width = depth // 4
 
-        # Frames arrive far faster than the registers change; skipping
-        # unchanged redraws keeps any text the person has selected.
-        key = (
-            is_exposed,
-            active_target,
-            guess_value,
-            pooled_value,
-            depth,
-            self.engine.step_count,
-        )
-
-        if key == self._register_key:
-            return
-
-        self._register_key = key
-
         rows = [
-            ("TARGET", active_target, "target", not is_exposed),
-            ("GUESS", guess_value, "guess", False),
-            ("POOLED", pooled_value, "pooled", False),
+            ("TARGET", active_target, "#00e676", not is_exposed),
+            ("GUESS ", guess_value, "#ffb300", False),
+            ("POOLED", pooled_value, "#b388ff", False),
         ]
 
-        # Label on its own line, then the value as one unbroken line that
-        # wraps on screen, so copying a register gives contiguous hex.
-        parts = []
+        y = 20
 
-        for label, value, tag, hidden in rows:
-            parts.append((label + "\n", "label"))
-            parts.append(
-                ("[HIDDEN]" if hidden else f"{value:0{width}X}", tag)
+        for label, value, colour, hidden in rows:
+            self.register_canvas.create_text(
+                10,
+                y,
+                text=label,
+                fill="#88a0c0",
+                anchor="w",
+                font=("Consolas", 10, "bold"),
             )
-            parts.append(("\n", None))
 
-        parts.append((
-            f"{depth}-bit padded record | "
-            f"{self.engine.step_count}/{depth} reconstruction steps",
-            None,
-        ))
+            full = "[HIDDEN]" if hidden else f"{value:0{width}X}"
 
-        self.register_text.set_tagged(parts)
+            # Wrap long registers (128 hex chars for a 512-bit block).
+            for i in range(0, len(full), 64):
+                self.register_canvas.create_text(
+                    90,
+                    y,
+                    text=full[i:i + 64],
+                    fill=colour,
+                    anchor="w",
+                    font=("Consolas", 10),
+                )
+                y += 18
+
+            y += 17
+
+        self.register_canvas.create_text(
+            10,
+            y,
+            anchor="w",
+            fill="#d2e0f0",
+            font=("Consolas", 10),
+            text=(
+                f"{depth}-bit register | "
+                f"{self.engine.step_count}/{depth} reconstruction steps"
+            ),
+        )
 
     def _poll(self):
         try:
@@ -2082,11 +1391,11 @@ class App:
                         self.v_reveal.get(),
                     )
 
-                    self._check_complete()
-
-                    self.status_label.set(
-                        f"Status: {data['status']} | "
-                        f"Bit Step: {data['steps']}/{self.engine.bit_depth}"
+                    self.status_label.config(
+                        text=(
+                            f"Status: {data['status']} | "
+                            f"Bit Step: {data['steps']}/{data['depth']}"
+                        )
                     )
 
                 elif event[0] == "arduino":
@@ -2125,5 +1434,5 @@ class App:
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
-    root.geometry("1240x880")
+    root.geometry("1240x780")
     root.mainloop()
