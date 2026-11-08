@@ -803,9 +803,7 @@ class App:
             boxed = self.v_hex.get().strip()
             line = boxed if boxed.startswith("POW:") else ""
         parts = line.split(":", 6)              # header is last; it may contain colons
-        if len(parts) != 7 or parts[0] != "POW":
-            messagebox.showerror("Export", "Nothing converted yet. Press Convert first.")
-            return None
+        
         names = ("Nonce", "Hash", "Padded message", "Padded nonce", "Padded hash", "Header")
         fields = dict(zip(names, parts[1:]))
         sel = self.export_combo.get()
