@@ -1,31 +1,41 @@
+
 /*
-  DUMB SHA-256 PROOF-OF-WORK MINER
-  --------------------------------
-  No external libraries (own SHA-256). Serial: 115200 baud.
-  Non-blocking: every pass through loop() it first listens to the serial
-  port, then does exactly ONE hash, so commands are answered instantly.
+  SIMPLE SHA256 ARDUINO BOX
+  -------------------------
+  No external libraries.
+  Serial: 115200 baud
 
-  Protocol (one command per line, case-insensitive):
+  Commands:
+    DIFF 12      sets the difficulty AND starts mining immediately
+    DIFF         prints the current difficulty
+    HEADER       prints HEADER:<the DATA string being hashed>
+    TERMINATOR   (or STOP) aborts mining
+    DATA hello
+    SHA256 hello
+    STATUS
+    RESET
+    HELP
 
-    PC      -> Arduino   JOB:<64-hex challenge>:<difficulty 1..32>
-    Arduino -> PC        MINING_STARTED
-    Arduino -> PC        MINED:<64-hex challenge>:<difficulty>:<16-hex nonce>:<64-hex hash>
-    PC      -> Arduino   ACCEPTED   -> relay pin goes HIGH, replies DISARMED
-    PC      -> Arduino   REJECTED   -> replies REJECTED_ACK, back to idle
-    PC      -> Arduino   STOP       -> replies STOPPED (or IDLE if nothing running)
+  Mining:
+    SHA256(DATA + nonce), nonce counting up from 0.
+    Checks for DIFF leading zero bits.
 
-  Errors: ERR:BAD_JOB:FORMAT | CHALLENGE_LENGTH | CHALLENGE_HEX | DIFFICULTY_RANGE
-          ERR:LINE_TOO_LONG | ERR:UNKNOWN_COMMAND | IGNORED:NO_PROOF_PENDING
+  Output while mining:
+    Nothing, until a solution is found, then one line:
+      POW:<nonce>:<64 hex hash>:<padded message>:<padded nonce>:<padded hash>:<header>
+    where <header> is the DATA string that was hashed (the hashed
+    message is <header> followed by the decimal nonce), and each padded
+    field is SHA-256 padding of its own bytes, in hex: the bytes, 0x80,
+    zero bytes, then the 64-bit big-endian bit length, always a whole
+    number of 64-byte blocks:
+      <padded message>  header + decimal nonce
+      <padded nonce>    the decimal nonce text alone
+      <padded hash>     the 32 raw hash bytes
+    <header> is last because it may itself contain colons.
 
-  Proof rule:
-    hash = SHA256(challenge bytes (32) + nonce bytes (8))
-    The hash must start with <difficulty> zero bits.
-    The nonce is 8 bytes, big-endian, counting up from 0.
-
-  Speed note:
-    challenge + nonce is always 40 bytes, which pads to exactly ONE
-    64-byte SHA-256 block. The block is built once per job; each hash
-    only rewrites the 8 nonce bytes and runs one transform.
+  Note:
+    This is a simple educational SHA256 proof-of-work
+    implementation, not an optimized mining ASIC.
 */
 
 #include <Arduino.h>
@@ -37,34 +47,18 @@
 // =====================================================
 
 #define SERIAL_BAUD 115200
+#define MAX_INPUT 160
 
-const int LOCK_RELAY_PIN = 8;          // driven HIGH when a proof is ACCEPTED
+char inputData[MAX_INPUT] = "arduino-sha256";
+char serialBuffer[200];
 
-const uint8_t CHALLENGE_BYTES = 32;
-const uint8_t NONCE_BYTES = 8;
-const uint8_t HASH_BYTES = 32;
+uint32_t nonce = 0;
+uint64_t hashes = 0;
 
-const uint8_t MIN_DIFFICULTY = 1;
-const uint8_t MAX_DIFFICULTY = 32;
+uint16_t difficulty = 12;  // 0-256 (does not fit in uint8_t)
 
-const uint8_t LINE_BUFFER_SIZE = 96;
-
-enum MinerState : uint8_t {
-  STATE_IDLE,
-  STATE_MINING,
-  STATE_AWAITING_VERIFICATION
-};
-
-MinerState state = STATE_IDLE;
-
-uint8_t currentChallenge[CHALLENGE_BYTES];
-uint8_t currentNonce[NONCE_BYTES];
-uint8_t currentHash[HASH_BYTES];
-uint8_t currentDifficulty = 0;
-
-char lineBuffer[LINE_BUFFER_SIZE];
-uint8_t lineLength = 0;
-bool lineOverflow = false;
+bool mining = false;
+bool found = false;
 
 // =====================================================
 // SHA256 CONSTANTS
@@ -90,13 +84,15 @@ static const uint32_t K[64] = {
 };
 
 // =====================================================
-// SHA256 (single 64-byte block)
+// SHA256 FUNCTIONS
 // =====================================================
 
 #define ROTR(x,n) (((x) >> (n)) | ((x) << (32-(n))))
 
 uint32_t H[8];
+
 uint8_t block[64];
+
 uint32_t W[64];
 
 void sha256Transform() {
@@ -129,12 +125,21 @@ void sha256Transform() {
 
   for (int i = 0; i < 64; i++) {
 
-    uint32_t S1 = ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25);
-    uint32_t ch = (e & f) ^ (~e & g);
-    uint32_t temp1 = h + S1 + ch + K[i] + W[i];
+    uint32_t S1 =
+      ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25);
 
-    uint32_t S0 = ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22);
-    uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+    uint32_t ch =
+      (e & f) ^ (~e & g);
+
+    uint32_t temp1 =
+      h + S1 + ch + K[i] + W[i];
+
+    uint32_t S0 =
+      ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22);
+
+    uint32_t maj =
+      (a & b) ^ (a & c) ^ (b & c);
+
     uint32_t temp2 = S0 + maj;
 
     h=g;
@@ -158,58 +163,10 @@ void sha256Transform() {
 }
 
 // =====================================================
-// HEX HELPERS
+// SHA256 HASH
 // =====================================================
 
-void printHex(const uint8_t *bytes, uint8_t length) {
-  const char hexDigits[] = "0123456789ABCDEF";
-  for (uint8_t i = 0; i < length; i++) {
-    Serial.print(hexDigits[bytes[i] >> 4]);
-    Serial.print(hexDigits[bytes[i] & 0x0F]);
-  }
-}
-
-int8_t hexValue(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  return -1;
-}
-
-bool hexToBytes(const char *text, uint8_t *output, uint8_t expectedBytes) {
-  for (uint8_t i = 0; i < expectedBytes; i++) {
-    int8_t high = hexValue(text[i * 2]);
-    int8_t low = hexValue(text[i * 2 + 1]);
-    if (high < 0 || low < 0) return false;
-    output[i] = ((uint8_t)high << 4) | (uint8_t)low;
-  }
-  return true;
-}
-
-// =====================================================
-// MINING
-// =====================================================
-
-// Builds the fixed part of the padded block for a 40-byte message:
-//   challenge(32) | nonce(8) | 0x80 | zeros | 64-bit bit length (320 = 0x0140)
-void prepareBlock() {
-  memset(block, 0, 64);
-  memcpy(block, currentChallenge, CHALLENGE_BYTES);
-  block[40] = 0x80;
-  block[62] = 0x01;
-  block[63] = 0x40;
-}
-
-void incrementNonce() {
-  for (int i = NONCE_BYTES - 1; i >= 0; i--) {
-    currentNonce[i]++;
-    if (currentNonce[i] != 0) return;
-  }
-}
-
-void calculateHash() {
-
-  memcpy(block + CHALLENGE_BYTES, currentNonce, NONCE_BYTES);
+void sha256(const uint8_t *data, size_t len, uint8_t *output) {
 
   H[0]=0x6a09e667;
   H[1]=0xbb67ae85;
@@ -220,199 +177,444 @@ void calculateHash() {
   H[6]=0x1f83d9ab;
   H[7]=0x5be0cd19;
 
+  size_t fullBlocks = len / 64;
+
+  for (size_t b = 0; b < fullBlocks; b++) {
+    memcpy(block, data + b*64, 64);
+    sha256Transform();
+  }
+
+  size_t remaining = len % 64;
+
+  memset(block, 0, 64);
+
+  if (remaining > 0) {
+    memcpy(block, data + fullBlocks*64, remaining);
+  }
+
+  block[remaining] = 0x80;
+
+  if (remaining >= 56) {
+    sha256Transform();
+    memset(block, 0, 64);
+  }
+
+  uint64_t bitLength = (uint64_t)len * 8;
+
+  for (int i = 0; i < 8; i++) {
+    block[63-i] = (uint8_t)(bitLength >> (i*8));
+  }
+
   sha256Transform();
 
   for (int i = 0; i < 8; i++) {
-    currentHash[i*4]   = H[i] >> 24;
-    currentHash[i*4+1] = H[i] >> 16;
-    currentHash[i*4+2] = H[i] >> 8;
-    currentHash[i*4+3] = H[i];
+    output[i*4]   = H[i] >> 24;
+    output[i*4+1] = H[i] >> 16;
+    output[i*4+2] = H[i] >> 8;
+    output[i*4+3] = H[i];
   }
 }
 
-bool meetsDifficulty() {
+// =====================================================
+// HEX OUTPUT
+// =====================================================
 
-  uint8_t fullZeroBytes = currentDifficulty / 8;
-  uint8_t remainingBits = currentDifficulty % 8;
+void printHashHex(uint8_t *hash) {
 
-  for (uint8_t i = 0; i < fullZeroBytes; i++) {
-    if (currentHash[i] != 0) return false;
+  const char hex[] = "0123456789abcdef";
+
+  for (int i = 0; i < 32; i++) {
+    Serial.print(hex[hash[i] >> 4]);
+    Serial.print(hex[hash[i] & 15]);
   }
-
-  if (remainingBits == 0) return true;
-
-  uint8_t mask = 0xFF << (8 - remainingBits);
-  return (currentHash[fullZeroBytes] & mask) == 0;
 }
 
-void reportProof() {
-  Serial.print(F("MINED:"));
-  printHex(currentChallenge, CHALLENGE_BYTES);
-  Serial.print(':');
-  Serial.print(currentDifficulty);
-  Serial.print(':');
-  printHex(currentNonce, NONCE_BYTES);
-  Serial.print(':');
-  printHex(currentHash, HASH_BYTES);
+void printHash(uint8_t *hash) {
+
+  printHashHex(hash);
   Serial.println();
 }
 
-// Exactly ONE hash per loop pass so serial stays responsive.
-void mineOneHash() {
+// =====================================================
+// DIFFICULTY CHECK
+// =====================================================
 
-  calculateHash();
+bool checkDifficulty(uint8_t *hash) {
 
-  if (meetsDifficulty()) {
-    state = STATE_AWAITING_VERIFICATION;
-    reportProof();
-  } else {
-    incrementNonce();
+  uint16_t fullBytes = difficulty / 8;
+  uint8_t remainingBits = difficulty % 8;
+
+  for (int i = 0; i < fullBytes; i++) {
+    if (hash[i] != 0) return false;
+  }
+
+  if (remainingBits > 0) {
+
+    uint8_t mask = 0xFF << (8 - remainingBits);
+
+    if ((hash[fullBytes] & mask) != 0) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// =====================================================
+// HASH INPUT + NONCE
+// =====================================================
+
+uint8_t hashOutput[32];
+
+// Builds <inputData><decimal nonce> and returns its length.
+size_t buildMessage(uint32_t n, char *message, size_t size) {
+
+  snprintf(message, size, "%s%lu",
+    inputData, (unsigned long)n);
+
+  return strlen(message);
+}
+
+void hashNonce(uint32_t n) {
+
+  char message[200];
+
+  size_t len = buildMessage(n, message, sizeof(message));
+
+  sha256(
+    (const uint8_t*)message,
+    len,
+    hashOutput
+  );
+}
+
+// Prints the SHA-256 padded form of a message as hex, streamed byte by
+// byte (no extra buffer): message, 0x80, zeros, 64-bit big-endian bit length.
+void printPaddedHex(const uint8_t *msg, size_t len) {
+
+  const char hex[] = "0123456789abcdef";
+
+  size_t total = ((len + 9 + 63) / 64) * 64;
+  uint64_t bitLength = (uint64_t)len * 8;
+
+  for (size_t i = 0; i < total; i++) {
+
+    uint8_t b;
+
+    if (i < len)             b = msg[i];
+    else if (i == len)       b = 0x80;
+    else if (i >= total - 8) b = (uint8_t)(bitLength >> ((total - 1 - i) * 8));
+    else                     b = 0;
+
+    Serial.print(hex[b >> 4]);
+    Serial.print(hex[b & 15]);
   }
 }
 
 // =====================================================
-// COMMAND HANDLERS
+// MINING
 // =====================================================
 
-void handleJob(const char *payload) {
+void startMining() {
 
-  const char *colon = strchr(payload, ':');
+  // Always restart from nonce 0 so a given DATA + DIFF always
+  // produces the same proof of work.
+  nonce = 0;
+  hashes = 0;
 
-  if (colon == NULL) {
-    Serial.println(F("ERR:BAD_JOB:FORMAT"));
-    return;
-  }
-
-  if ((size_t)(colon - payload) != (size_t)(CHALLENGE_BYTES * 2)) {
-    Serial.println(F("ERR:BAD_JOB:CHALLENGE_LENGTH"));
-    return;
-  }
-
-  uint8_t receivedChallenge[CHALLENGE_BYTES];
-
-  if (!hexToBytes(payload, receivedChallenge, CHALLENGE_BYTES)) {
-    Serial.println(F("ERR:BAD_JOB:CHALLENGE_HEX"));
-    return;
-  }
-
-  int difficulty = atoi(colon + 1);
-
-  if (difficulty < MIN_DIFFICULTY || difficulty > MAX_DIFFICULTY) {
-    Serial.println(F("ERR:BAD_JOB:DIFFICULTY_RANGE"));
-    return;
-  }
-
-  memcpy(currentChallenge, receivedChallenge, CHALLENGE_BYTES);
-  memset(currentNonce, 0, NONCE_BYTES);
-  currentDifficulty = (uint8_t)difficulty;
-  prepareBlock();
-  state = STATE_MINING;
-
-  Serial.println(F("MINING_STARTED"));
+  found = false;
+  mining = true;
 }
 
-void handleAccepted() {
+void stopMining() {
 
-  if (state != STATE_AWAITING_VERIFICATION) {
-    Serial.println(F("IGNORED:NO_PROOF_PENDING"));
-    return;
-  }
+  if (mining) {
+    mining = false;
 
-  state = STATE_IDLE;
-  digitalWrite(LOCK_RELAY_PIN, HIGH);
-  Serial.println(F("DISARMED"));
-}
-
-void handleRejected() {
-  state = STATE_IDLE;
-  Serial.println(F("REJECTED_ACK"));
-}
-
-void handleStop() {
-
-  if (state == STATE_IDLE) {
-    Serial.println(F("IDLE"));
-    return;
-  }
-
-  state = STATE_IDLE;
-  Serial.println(F("STOPPED"));
-}
-
-void handleLine(const char *line) {
-
-  if (strncmp(line, "JOB:", 4) == 0) {
-    handleJob(line + 4);
-  } else if (strcmp(line, "ACCEPTED") == 0) {
-    handleAccepted();
-  } else if (strcmp(line, "REJECTED") == 0) {
-    handleRejected();
-  } else if (strcmp(line, "STOP") == 0) {
-    handleStop();
+    Serial.println(F("[TERMINATED]"));
+    Serial.print(F("NONCE: "));
+    Serial.println(nonce);
+    Serial.print(F("HASHES: "));
+    Serial.println((unsigned long)hashes);
   } else {
-    Serial.println(F("ERR:UNKNOWN_COMMAND"));
+    Serial.println(F("[IDLE]"));
   }
+}
+
+void miningStep() {
+
+  if (!mining) return;
+
+  // Check for serial commands before each hash.
+  if (Serial.available()) return;
+
+  hashNonce(nonce);
+
+  hashes++;
+
+  if (checkDifficulty(hashOutput)) {
+
+    mining = false;
+    found = true;
+
+    char message[200];
+    size_t len = buildMessage(nonce, message, sizeof(message));
+
+    char nonceText[12];
+    snprintf(nonceText, sizeof(nonceText), "%lu", (unsigned long)nonce);
+
+    Serial.print(F("POW:"));
+    Serial.print(nonce);
+    Serial.print(':');
+    printHashHex(hashOutput);
+    Serial.print(':');
+    printPaddedHex((const uint8_t*)message, len);
+    Serial.print(':');
+    printPaddedHex((const uint8_t*)nonceText, strlen(nonceText));
+    Serial.print(':');
+    printPaddedHex(hashOutput, 32);
+    Serial.print(':');
+    Serial.println(inputData);
+
+    return;
+  }
+
+  nonce++;
+
+  if (nonce == 0) {
+    mining = false;
+    Serial.println(F("[NONCE SPACE EXHAUSTED]"));
+  }
+}
+
+// =====================================================
+// COMMAND HANDLER
+// =====================================================
+
+void executeCommand(char *command) {
+
+  while (*command == ' ') command++;
+
+  if (strlen(command) == 0) return;
+
+  if (
+    strcmp(command, "TERMINATOR") == 0 ||
+    strcmp(command, "STOP") == 0
+  ) {
+    stopMining();
+    return;
+  }
+
+  if (strncmp(command, "DIFF", 4) == 0) {
+
+    if (command[4] == ' ' || command[4] == '\0') {
+
+      if (command[4] == ' ') {
+
+        const char *arg = command + 5;
+        while (*arg == ' ') arg++;
+
+        if (*arg < '0' || *arg > '9') {
+          Serial.println(F("[ERROR] Difficulty must be 0-256"));
+          return;
+        }
+
+        int d = atoi(arg);
+
+        if (d < 0 || d > 256) {
+          Serial.println(F("[ERROR] Difficulty must be 0-256"));
+          return;
+        }
+
+        difficulty = (uint16_t)d;
+
+        // Receiving the difficulty is the start signal.
+        startMining();
+
+      } else {
+
+        Serial.print(F("DIFFICULTY: "));
+        Serial.println(difficulty);
+      }
+
+      return;
+    }
+  }
+
+  if (strcmp(command, "HEADER") == 0) {
+    Serial.print(F("HEADER:"));
+    Serial.println(inputData);
+    return;
+  }
+
+  if (strncmp(command, "DATA ", 5) == 0) {
+
+    if (mining) {
+      Serial.println(F("[ERROR] Stop mining first"));
+      return;
+    }
+
+    strncpy(inputData, command + 5, MAX_INPUT - 1);
+    inputData[MAX_INPUT - 1] = '\0';
+
+    nonce = 0;
+
+    Serial.print(F("[DATA SET] "));
+    Serial.println(inputData);
+
+    return;
+  }
+
+  if (strncmp(command, "SHA256 ", 7) == 0) {
+
+    uint8_t result[32];
+
+    sha256(
+      (const uint8_t*)(command + 7),
+      strlen(command + 7),
+      result
+    );
+
+    printHash(result);
+
+    return;
+  }
+
+  if (strcmp(command, "STATUS") == 0) {
+
+    Serial.println(F("------ STATUS ------"));
+
+    Serial.print(F("MINING: "));
+    Serial.println(mining ? F("YES") : F("NO"));
+
+    Serial.print(F("DATA: "));
+    Serial.println(inputData);
+
+    Serial.print(F("NONCE: "));
+    Serial.println(nonce);
+
+    Serial.print(F("HASHES: "));
+    Serial.println((unsigned long)hashes);
+
+    Serial.print(F("DIFF: "));
+    Serial.println(difficulty);
+
+    Serial.println(F("--------------------"));
+
+    return;
+  }
+
+  if (strcmp(command, "RESET") == 0) {
+
+    mining = false;
+    found = false;
+    nonce = 0;
+    hashes = 0;
+
+    Serial.println(F("[RESET COMPLETE]"));
+
+    return;
+  }
+
+  if (strcmp(command, "HELP") == 0) {
+
+    Serial.println(F("COMMANDS:"));
+    Serial.println(F("TERMINATOR"));
+    Serial.println(F("STOP"));
+    Serial.println(F("DIFF"));
+    Serial.println(F("DIFF 12   (sets difficulty and starts mining)"));
+    Serial.println(F("HEADER"));
+    Serial.println(F("DATA hello"));
+    Serial.println(F("SHA256 hello"));
+    Serial.println(F("STATUS"));
+    Serial.println(F("RESET"));
+    Serial.println(F("HELP"));
+
+    return;
+  }
+
+  Serial.println(F("[UNKNOWN COMMAND]"));
 }
 
 // =====================================================
 // SERIAL INPUT
 // =====================================================
 
-void pollSerial() {
+void readSerial() {
 
-  while (Serial.available() > 0) {
+  static uint16_t index = 0;
 
-    char c = (char)Serial.read();
+  while (Serial.available()) {
+
+    char c = Serial.read();
 
     if (c == '\r') continue;
 
     if (c == '\n') {
 
-      if (lineOverflow) {
-        Serial.println(F("ERR:LINE_TOO_LONG"));
-      } else if (lineLength > 0) {
-        lineBuffer[lineLength] = '\0';
-        handleLine(lineBuffer);
+      serialBuffer[index] = '\0';
+
+      // Convert command to uppercase only for
+      // command matching, preserving DATA text.
+      char command[200];
+
+      strncpy(command, serialBuffer, sizeof(command)-1);
+      command[sizeof(command)-1] = '\0';
+
+      for (int i = 0; command[i]; i++) {
+        if (command[i] >= 'a' && command[i] <= 'z') {
+          command[i] -= 32;
+        }
       }
 
-      lineLength = 0;
-      lineOverflow = false;
+      // DATA and SHA256 payloads are case-sensitive.
+      if (strncmp(serialBuffer, "DATA ", 5) == 0) {
+        executeCommand(serialBuffer);
+      }
+      else if (strncmp(serialBuffer, "SHA256 ", 7) == 0) {
+        executeCommand(serialBuffer);
+      }
+      else {
+        executeCommand(command);
+      }
+
+      index = 0;
+
       continue;
     }
 
-    if (lineOverflow) continue;
-
-    if (lineLength < LINE_BUFFER_SIZE - 1) {
-      // Commands are case-insensitive: store upper case.
-      lineBuffer[lineLength++] = (c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c;
+    if (index < sizeof(serialBuffer)-1) {
+      serialBuffer[index++] = c;
     } else {
-      lineOverflow = true;
+      index = 0;
+      Serial.println(F("[ERROR] Command too long"));
     }
   }
 }
 
 // =====================================================
-// SETUP / LOOP
+// SETUP
 // =====================================================
 
 void setup() {
 
   Serial.begin(SERIAL_BAUD);
 
-  // Native-USB boards (Leonardo, RP2040, ...) wait briefly for the host.
   while (!Serial && millis() < 3000) {}
 
-  pinMode(LOCK_RELAY_PIN, OUTPUT);
-  digitalWrite(LOCK_RELAY_PIN, LOW);
-
-  Serial.println(F("MINER_READY"));
+  // Silent boot: nothing is printed until a proof of work is found.
+  // Mining starts when a "DIFF <bits>" command arrives.
 }
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
 
 void loop() {
 
-  pollSerial();
+  readSerial();
 
-  if (state == STATE_MINING) {
-    mineOneHash();
+  if (mining) {
+    miningStep();
   }
 }
