@@ -2,6 +2,9 @@
 Bit-Pooling Higher-Lower Search & Circuit Camera Lab
 (Tkinter / OpenCV Framework with Visual Bit Registers, Serial-Hex Receive & Forced Serial Read)
 Adapted from the RP-style optoelectronic decision circuit framework.
+
+Export: the oracle target is calculated from scratch by the bit-pooling steps.
+Once revealed, Copy / Save only converts that hex into text (no mining, no POW line).
 """
 
 import asyncio
@@ -40,8 +43,7 @@ CHALLENGE_BYTES = 32                    # 256-bit challenge -> 64 hex chars
 NONCE_BYTES = 8                         # 64-bit nonce      -> 16 hex chars
 HASH_BYTES = 32                         # SHA-256 digest    -> 64 hex chars
 BIT_DEPTH = CHALLENGE_BYTES * 8         # 256 bits
-EXPORT_CHOICES = ["Full POW line", "Nonce", "Hash", "Padded message", "Padded nonce",
-                  "Padded hash", "Header", "All fields (one per line)"]
+EXPORT_CHOICES = ["Text (decoded from hex)", "Hex", "Hex + Text"]
 MAX_HEADER = 159                        # sketch: MAX_INPUT 160 incl. terminator
 HEX_DIGITS = CHALLENGE_BYTES * 2        # 64
 
@@ -68,12 +70,6 @@ def build_pow_line(header: str, nonce: int, digest: bytes) -> str:
     """
     Exactly the line the sketch prints when it finds a solution:
       POW:<nonce>:<hash>:<padded message>:<padded nonce>:<padded hash>:<header>
-      nonce            decimal
-      hash             64 lowercase hex
-      padded message   SHA-256 padding of  header + decimal nonce   (ASCII)
-      padded nonce     SHA-256 padding of  the decimal nonce text alone
-      padded hash      SHA-256 padding of  the 32 raw hash bytes
-      header           the DATA string (last, because it may contain colons)
     """
     ntext = str(nonce).encode("ascii")
     msg = header.encode("utf-8") + ntext
@@ -509,6 +505,7 @@ class App:
         ttk.Button(ctrl_frame, text="Start Lab", command=self.start_lab).pack(side="left", padx=5, pady=5)
         ttk.Button(ctrl_frame, text="Stop Lab", command=self.stop_lab).pack(side="left", padx=5, pady=5)
         ttk.Button(ctrl_frame, text="Step Bit Pool", command=self.step_search).pack(side="left", padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Solve Pool", command=self.solve_pool).pack(side="left", padx=5, pady=5)
         ttk.Button(ctrl_frame, text="Reset Pool", command=self.reset_search).pack(side="left", padx=5, pady=5)
 
         self.v_ir = tk.BooleanVar(value=False)
@@ -555,10 +552,10 @@ class App:
         self.diff_spin.pack(side="left", padx=2, pady=5)
         ttk.Button(target_frame, text="Send diff n", command=self.send_diff).pack(side="left", padx=5, pady=5)
 
-        # Export row: hand the converted hex to another tool
-        exp_frame = ttk.LabelFrame(main_frame, text="Export Converted Hex")
+        # Export row: oracle target (hex) -> text
+        exp_frame = ttk.LabelFrame(main_frame, text="Export Oracle Target (hex to text)")
         exp_frame.pack(fill="x", padx=5, pady=5)
-        ttk.Label(exp_frame, text="Field:").pack(side="left", padx=(5, 2), pady=5)
+        ttk.Label(exp_frame, text="Format:").pack(side="left", padx=(5, 2), pady=5)
         self.export_combo = ttk.Combobox(exp_frame, state="readonly", width=24, values=EXPORT_CHOICES)
         self.export_combo.set(EXPORT_CHOICES[0])
         self.export_combo.pack(side="left", padx=2, pady=5)
@@ -642,6 +639,12 @@ class App:
 
     def step_search(self):
         self.engine.step()
+        self._draw_current()
+
+    def solve_pool(self):
+        """Run every remaining bit-pool step (MSB first) until the target is calculated."""
+        while not self.engine.converged and self.engine.step_count < self.engine.bit_depth:
+            self.engine.step()
         self._draw_current()
 
     def reset_search(self):
@@ -796,110 +799,56 @@ class App:
         self._show_rx()
         self._refresh_serial_label(f"(converted: nonce={nonce}, {hashes} hashes)")
 
-    
+    # ---------------------------------------------------------------- export (oracle hex -> text)
     def _export_text(self):
-        """Safely extract the selected field from the current POW line."""
-        boxed = self.v_hex.get().strip()
-
-        # Prefer the current RX box if it contains a POW line.
-        if boxed.upper().startswith("POW:"):
-            line = boxed
-        else:
-            line = self.rx_line.strip()
-
-        if not line:
-            messagebox.showwarning("Export", "No converted POW data available.")
+        """Oracle target (calculated by the bit pool) -> hex -> text. No mining, no POW line."""
+        o = self.engine.oracle
+        if not (o.is_done or self.ctl.get("serial_loaded")):
+            messagebox.showwarning(
+                "Export", "Target is still classified. Run all 256 bit-pool steps first "
+                          "(Step Bit Pool / motion triggers / Solve Pool).")
             return None
 
-        # Split into exactly seven fields; preserve colons in the header.
-        parts = line.split(":", 6)
-
-        if len(parts) != 7 or parts[0] != "POW":
-            messagebox.showerror("Export", "Invalid POW line. Expected 7 fields.")
-            return None
-
-        names = (
-            "Nonce",
-            "Hash",
-            "Padded message",
-            "Padded nonce",
-            "Padded hash",
-            "Header"
-        )
-
-        fields = dict(zip(names, parts[1:]))
-
-        # Validate that all exported fields exist.
-        if any(not value for value in fields.values()):
-            messagebox.showerror("Export", "POW line contains missing fields.")
-            return None
+        hex_str = pad_hex(o._target, CHALLENGE_BYTES)           # 64 hex chars
+        raw = bytes.fromhex(hex_str).strip(b"\x00")             # drop zero padding
+        text = raw.decode("utf-8", "replace")
 
         selection = self.export_combo.get()
-
-        if selection == "Full POW line":
-            return line
-
-        if selection == "All fields (one per line)":
-            return "\n".join(
-                f"{name}: {value}" for name, value in fields.items()
-            )
-
-        if selection not in fields:
-            messagebox.showerror(
-                "Export",
-                f"Unknown export selection: {selection}"
-            )
-            return None
-
-        return fields[selection]
+        if selection == "Hex":
+            return hex_str
+        if selection == "Hex + Text":
+            return f"Hex: {hex_str}\nText: {text}"
+        return text
 
     def copy_export(self):
-        """Copy the selected export field to the clipboard."""
+        """Copy the oracle target (as hex / text) to the clipboard."""
         text = self._export_text()
-
         if text is None:
             return
-
         try:
             self.window.clipboard_clear()
             self.window.clipboard_append(text)
             self.window.update_idletasks()
-            self._refresh_serial_label(
-                f"(copied {self.export_combo.get().lower()})"
-            )
+            self._refresh_serial_label(f"(copied {self.export_combo.get().lower()})")
         except tk.TclError as e:
             messagebox.showerror("Copy Error", str(e))
 
     def save_export(self):
-        """Save the selected export field to a text file."""
+        """Save the oracle target (as hex / text) to a file."""
         text = self._export_text()
-
         if text is None:
             return
 
         selection = self.export_combo.get()
-
-        filename = {
-            "Full POW line": "pow_line.txt",
-            "Nonce": "pow_nonce.txt",
-            "Hash": "pow_hash.txt",
-            "Padded message": "padded_message.txt",
-            "Padded nonce": "padded_nonce.txt",
-            "Padded hash": "padded_hash.txt",
-            "Header": "pow_header.txt",
-            "All fields (one per line)": "pow_all_fields.txt"
-        }.get(selection, "pow_export.txt")
+        filename = {"Text (decoded from hex)": "oracle_text.txt",
+                    "Hex": "oracle_hex.txt",
+                    "Hex + Text": "oracle_hex_text.txt"}.get(selection, "oracle_export.txt")
 
         path = filedialog.asksaveasfilename(
-            title="Save POW Export",
+            title="Save Oracle Export",
             defaultextension=".txt",
             initialfile=filename,
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("All files", "*.*")
-            ]
-        )
-
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not path:
             return
 
@@ -908,16 +857,9 @@ class App:
                 f.write(text)
                 if not text.endswith("\n"):
                     f.write("\n")
-
             saved_name = path.replace("\\", "/").rsplit("/", 1)[-1]
-
             self._refresh_serial_label(f"(saved {saved_name})")
-
-            messagebox.showinfo(
-                "Export Successful",
-                f"Successfully saved:\n{path}"
-            )
-
+            messagebox.showinfo("Export Successful", f"Successfully saved:\n{path}")
         except (OSError, UnicodeError) as e:
             messagebox.showerror("Save Error", str(e))
 
