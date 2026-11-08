@@ -796,47 +796,130 @@ class App:
         self._show_rx()
         self._refresh_serial_label(f"(converted: nonce={nonce}, {hashes} hashes)")
 
+    
     def _export_text(self):
-        """Text for the Export row's selected field, or None (after a message) if nothing converted."""
-        line = self.rx_line
+        """Safely extract the selected field from the current POW line."""
+        boxed = self.v_hex.get().strip()
+
+        # Prefer the current RX box if it contains a POW line.
+        if boxed.upper().startswith("POW:"):
+            line = boxed
+        else:
+            line = self.rx_line.strip()
+
         if not line:
-            boxed = self.v_hex.get().strip()
-            line = boxed if boxed.startswith("POW:") else ""
-        parts = line.split(":", 6)              # header is last; it may contain colons
-        
-        names = ("Nonce", "Hash", "Padded message", "Padded nonce", "Padded hash", "Header")
+            messagebox.showwarning("Export", "No converted POW data available.")
+            return None
+
+        # Split into exactly seven fields; preserve colons in the header.
+        parts = line.split(":", 6)
+
+        if len(parts) != 7 or parts[0] != "POW":
+            messagebox.showerror("Export", "Invalid POW line. Expected 7 fields.")
+            return None
+
+        names = (
+            "Nonce",
+            "Hash",
+            "Padded message",
+            "Padded nonce",
+            "Padded hash",
+            "Header"
+        )
+
         fields = dict(zip(names, parts[1:]))
-        sel = self.export_combo.get()
-        if sel == EXPORT_CHOICES[0]:
+
+        # Validate that all exported fields exist.
+        if any(not value for value in fields.values()):
+            messagebox.showerror("Export", "POW line contains missing fields.")
+            return None
+
+        selection = self.export_combo.get()
+
+        if selection == "Full POW line":
             return line
-        if sel == EXPORT_CHOICES[-1]:
-            return "\n".join(f"{k}: {v}" for k, v in fields.items())
-        return fields[sel]
+
+        if selection == "All fields (one per line)":
+            return "\n".join(
+                f"{name}: {value}" for name, value in fields.items()
+            )
+
+        if selection not in fields:
+            messagebox.showerror(
+                "Export",
+                f"Unknown export selection: {selection}"
+            )
+            return None
+
+        return fields[selection]
 
     def copy_export(self):
+        """Copy the selected export field to the clipboard."""
         text = self._export_text()
+
         if text is None:
             return
-        self.window.clipboard_clear()
-        self.window.clipboard_append(text)
-        self._refresh_serial_label(f"(copied {self.export_combo.get().lower()})")
+
+        try:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(text)
+            self.window.update_idletasks()
+            self._refresh_serial_label(
+                f"(copied {self.export_combo.get().lower()})"
+            )
+        except tk.TclError as e:
+            messagebox.showerror("Copy Error", str(e))
 
     def save_export(self):
+        """Save the selected export field to a text file."""
         text = self._export_text()
+
         if text is None:
             return
+
+        selection = self.export_combo.get()
+
+        filename = {
+            "Full POW line": "pow_line.txt",
+            "Nonce": "pow_nonce.txt",
+            "Hash": "pow_hash.txt",
+            "Padded message": "padded_message.txt",
+            "Padded nonce": "padded_nonce.txt",
+            "Padded hash": "padded_hash.txt",
+            "Header": "pow_header.txt",
+            "All fields (one per line)": "pow_all_fields.txt"
+        }.get(selection, "pow_export.txt")
+
         path = filedialog.asksaveasfilename(
-            defaultextension=".txt", initialfile="pow_converted.txt",
-            filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+            title="Save POW Export",
+            defaultextension=".txt",
+            initialfile=filename,
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*")
+            ]
+        )
+
         if not path:
             return
+
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text + "\n")
-        except OSError as e:
-            messagebox.showerror("Export", str(e))
-            return
-        self._refresh_serial_label(f"(saved {path.split('/')[-1].split(chr(92))[-1]})")
+                f.write(text)
+                if not text.endswith("\n"):
+                    f.write("\n")
+
+            saved_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+
+            self._refresh_serial_label(f"(saved {saved_name})")
+
+            messagebox.showinfo(
+                "Export Successful",
+                f"Successfully saved:\n{path}"
+            )
+
+        except (OSError, UnicodeError) as e:
+            messagebox.showerror("Save Error", str(e))
 
     def copy_conv(self):
         text = self.v_hex.get()
