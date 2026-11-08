@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 
@@ -32,7 +32,7 @@ except ImportError:
 # ==============================================================================
 # SERIAL RECEIVER (serial port -> hex input)
 # ==============================================================================
-START_CMD = b"start\n"        # sent once before reading; change terminator here if needed
+START_CMD = b"HEADER\n"       # sketch has no "start"; HEADER makes it reply HEADER:<DATA string>
 DIFF_CMD_FMT = "diff {n}\n"   # sent by the 'Send diff n' button; edit to match the sketch
 
 # Sizes / padding, matching sha256_challenge.ino
@@ -40,6 +40,9 @@ CHALLENGE_BYTES = 32                    # 256-bit challenge -> 64 hex chars
 NONCE_BYTES = 8                         # 64-bit nonce      -> 16 hex chars
 HASH_BYTES = 32                         # SHA-256 digest    -> 64 hex chars
 BIT_DEPTH = CHALLENGE_BYTES * 8         # 256 bits
+EXPORT_CHOICES = ["Full POW line", "Nonce", "Hash", "Padded message", "Padded nonce",
+                  "Padded hash", "Header", "All fields (one per line)"]
+MAX_HEADER = 159                        # sketch: MAX_INPUT 160 incl. terminator
 HEX_DIGITS = CHALLENGE_BYTES * 2        # 64
 
 
@@ -56,6 +59,44 @@ def sha_pad(msg: bytes) -> bytes:
     return bytes(out) + (len(msg) * 8).to_bytes(8, "big")
 
 
+def meets_difficulty(digest: bytes, difficulty: int) -> bool:
+    """True if the digest has at least `difficulty` leading zero bits (as checkDifficulty())."""
+    return (int.from_bytes(digest, "big") >> (256 - difficulty)) == 0
+
+
+def build_pow_line(header: str, nonce: int, digest: bytes) -> str:
+    """
+    Exactly the line the sketch prints when it finds a solution:
+      POW:<nonce>:<hash>:<padded message>:<padded nonce>:<padded hash>:<header>
+      nonce            decimal
+      hash             64 lowercase hex
+      padded message   SHA-256 padding of  header + decimal nonce   (ASCII)
+      padded nonce     SHA-256 padding of  the decimal nonce text alone
+      padded hash      SHA-256 padding of  the 32 raw hash bytes
+      header           the DATA string (last, because it may contain colons)
+    """
+    ntext = str(nonce).encode("ascii")
+    msg = header.encode("utf-8") + ntext
+    return ":".join(["POW", str(nonce), digest.hex(),
+                     sha_pad(msg).hex(), sha_pad(ntext).hex(), sha_pad(digest).hex(),
+                     header])
+
+
+def mine_pow(header: str, difficulty: int, stop=None, limit: int = 1 << 32):
+    """
+    Same search as the sketch: SHA256(header + decimal nonce), nonce counting up from 0.
+    Returns (nonce, digest, hashes); nonce is None if cancelled or the nonce space ran out.
+    """
+    prefix = hashlib.sha256(header.encode("utf-8"))
+    for nonce in range(limit):
+        if stop is not None and nonce % 20000 == 0 and stop.is_set():
+            return None, None, nonce
+        h = prefix.copy()
+        h.update(str(nonce).encode("ascii"))
+        digest = h.digest()
+        if meets_difficulty(digest, difficulty):
+            return nonce, digest, nonce + 1
+    return None, None, limit
 
 
 class SerialReceiver:
@@ -131,16 +172,15 @@ class SerialReceiver:
 # ==============================================================================
 class MessageExtractor:
     """
-    Reassembles newline-terminated serial lines and extracts protocol fields:
-        POW:<64-hex challenge>:<difficulty>
-        SOLUTION:<16-hex nonce>:<64-hex hash>
-        LOCKBOX_READY | DISARMED | REJECTED
+    Reassembles newline-terminated serial lines from sha256_challenge.ino:
+        POW:<nonce>:<64-hex hash>:<padded message>:<padded nonce>:<padded hash>:<header>
+        HEADER:<DATA string>
+        [TERMINATED] / [IDLE] / [ERROR] ... (any line starting with '[')
     feed() returns a list of dicts, each with a "kind" key.
     """
-    POW_RE = re.compile(rf"^POW:([0-9A-Fa-f]{{{HEX_DIGITS}}}):(\d{{1,3}})$")
-    SOL_RE = re.compile(rf"^SOLUTION:([0-9A-Fa-f]{{{NONCE_BYTES * 2}}}):([0-9A-Fa-f]{{{HASH_BYTES * 2}}})$")
-    STATUS = ("LOCKBOX_READY", "DISARMED", "REJECTED")
-    MAX_LINE = 256
+    POW_RE = re.compile(r"^POW:(\d{1,10}):([0-9A-Fa-f]{64}):([0-9A-Fa-f]+):"
+                        r"([0-9A-Fa-f]+):([0-9A-Fa-f]+):(.*)$")
+    MAX_LINE = 1024                                 # longest sketch line is ~880 chars
 
     def __init__(self):
         self._buf = bytearray()
@@ -155,7 +195,7 @@ class MessageExtractor:
         for b in data:
             if b == 0x0A:                                   # '\n' ends a message
                 if not self._overflow:
-                    msg = self._parse(bytes(self._buf).decode("ascii", "replace").strip())
+                    msg = self._parse(bytes(self._buf).decode("utf-8", "replace").strip())
                     if msg is not None:
                         out.append(msg)
                 self._buf.clear()
@@ -171,21 +211,18 @@ class MessageExtractor:
             return None
         m = self.POW_RE.match(line)
         if m:
-            difficulty = int(m.group(2))
-            if difficulty > BIT_DEPTH:
-                return dict(kind="BAD", text=line)
-            challenge = bytes.fromhex(m.group(1))
-            return dict(kind="POW", challenge=challenge,
-                        hex=m.group(1).upper(), difficulty=difficulty)
-        m = self.SOL_RE.match(line)
-        if m:
-            return dict(kind="SOLUTION", nonce=bytes.fromhex(m.group(1)),
-                        hash=bytes.fromhex(m.group(2)),
-                        nonce_hex=m.group(1).upper(), hash_hex=m.group(2).upper())
-        if line in self.STATUS:
+            nonce = int(m.group(1))
+            padded = (m.group(3), m.group(4), m.group(5))
+            if nonce >= 1 << 32 or any(len(f) % 128 for f in padded):
+                return dict(kind="BAD", text=line)          # padded fields are whole 64-byte blocks
+            return dict(kind="POW", nonce=nonce, hash_hex=m.group(2).lower(),
+                        header=m.group(6), line=line)
+        if line.startswith("HEADER:"):
+            return dict(kind="HEADER", header=line[7:])
+        if line.startswith("POW:"):
+            return dict(kind="BAD", text=line)              # right prefix, wrong format
+        if line.startswith("["):
             return dict(kind="STATUS", text=line)
-        if line.startswith(("POW:", "SOLUTION:")):
-            return dict(kind="BAD", text=line)              # right prefix, wrong size/format
         return dict(kind="TEXT", text=line)
 
 
@@ -446,10 +483,13 @@ class App:
         self.engine = BitPoolingSearchEngine(bit_depth=BIT_DEPTH)
         self.serial = SerialReceiver()
         self.extractor = MessageExtractor()
-        self.rx_buf = b""          # last extracted challenge (32 bytes)
-        self.rx_difficulty = None  # difficulty from the last POW message
-        self.rx_nonce = b""        # last SOLUTION nonce (8 bytes)
-        self.rx_hash = b""         # last SOLUTION hash (32 bytes)
+        self.rx_header = ""        # header / DATA string (the "hex" in the RX Hex box)
+        self.rx_buf = b""          # header as 32 bytes, only if it is 64 hex chars
+        self.rx_difficulty = None
+        self.rx_line = ""          # converted POW line for rx_header (device's or ours)
+        self.convert_mode = False  # RX Hex box shows the converted POW line
+        self.mining_conv = False   # a local Convert search is running
+        self.mine_stop = threading.Event()
         self.thread = None
         self.photo = None
 
@@ -497,6 +537,10 @@ class App:
         self.v_hex = tk.StringVar(value="")
         self.e_hex = ttk.Entry(target_frame, width=24, textvariable=self.v_hex)
         self.e_hex.pack(side="left", padx=2, pady=5)
+        self.btn_convert = ttk.Button(target_frame, text="Convert", command=self.convert_rx)
+        self.btn_convert.pack(side="left", padx=2, pady=5)
+        ttk.Button(target_frame, text="Copy", command=self.copy_conv).pack(side="left", padx=2, pady=5)
+
         ttk.Button(target_frame, text="Randomize Target", command=self.randomize_target).pack(side="left", padx=5, pady=5)
 
         self.v_force_serial = tk.BooleanVar(value=False)
@@ -510,6 +554,16 @@ class App:
         self.diff_spin.set(8)
         self.diff_spin.pack(side="left", padx=2, pady=5)
         ttk.Button(target_frame, text="Send diff n", command=self.send_diff).pack(side="left", padx=5, pady=5)
+
+        # Export row: hand the converted hex to another tool
+        exp_frame = ttk.LabelFrame(main_frame, text="Export Converted Hex")
+        exp_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Label(exp_frame, text="Field:").pack(side="left", padx=(5, 2), pady=5)
+        self.export_combo = ttk.Combobox(exp_frame, state="readonly", width=24, values=EXPORT_CHOICES)
+        self.export_combo.set(EXPORT_CHOICES[0])
+        self.export_combo.pack(side="left", padx=2, pady=5)
+        ttk.Button(exp_frame, text="Copy", command=self.copy_export).pack(side="left", padx=5, pady=5)
+        ttk.Button(exp_frame, text="Save to File...", command=self.save_export).pack(side="left", padx=2, pady=5)
 
         # Viewport and registers
         display_frame = ttk.Frame(main_frame)
@@ -626,10 +680,13 @@ class App:
         self._refresh_serial_label()
 
     def _clear_rx(self):
+        self.mine_stop.set()                    # cancel any running Convert search
+        self.mining_conv = False
+        self.rx_header = ""
         self.rx_buf = b""
         self.rx_difficulty = None
-        self.rx_nonce = b""
-        self.rx_hash = b""
+        self.rx_line = ""
+        self.convert_mode = False
         self.extractor.reset()
         self._show_rx()
         self._refresh_serial_label()
@@ -662,8 +719,126 @@ class App:
             self.btn_connect.config(text="Connect")
             self._refresh_serial_label("(send failed)")
 
-   
+    def _set_header(self, text: str):
+        self.rx_header = text
+        self.rx_buf = (bytes.fromhex(text)
+                       if re.fullmatch(rf"[0-9A-Fa-f]{{{HEX_DIGITS}}}", text) else b"")
 
+    def _show_rx(self):
+        """RX Hex box: the converted POW line in convert mode, otherwise the raw header."""
+        if self.convert_mode and self.rx_line:
+            self.v_hex.set(self.rx_line)
+        else:
+            self.v_hex.set(self.rx_header)
+        self.e_hex.icursor(0)
+        self.e_hex.xview_moveto(0)
+        self.btn_convert.config(
+            text="Cancel" if self.mining_conv else ("Show Raw" if self.convert_mode else "Convert"))
+
+    def convert_rx(self):
+        """Convert the RX Hex text into the sketch's POW line (searches the nonce from 0)."""
+        if self.mining_conv:                    # pressed while searching: cancel
+            self.mine_stop.set()
+            self._refresh_serial_label("(cancelling...)")
+            return
+        if self.convert_mode:                   # pressed while converted: back to raw header
+            self.convert_mode = False
+            self._show_rx()
+            self._refresh_serial_label("(showing raw header)")
+            return
+
+        header = self.v_hex.get().strip() or self.rx_header
+        if header.upper().startswith("POW:"):
+            messagebox.showinfo("Convert", "RX Hex already holds a POW line.")
+            return
+        if not header:
+            messagebox.showerror("Convert", "RX Hex is empty: paste a header, or use Force Serial Read.")
+            return
+        if len(header) > MAX_HEADER:
+            messagebox.showerror("Convert", f"Header is {len(header)} characters; the sketch allows {MAX_HEADER}.")
+            return
+        try:
+            diff = int(self.diff_spin.get())
+        except ValueError:
+            messagebox.showerror("Convert", "Difficulty must be an integer.")
+            return
+        if not 0 <= diff <= BIT_DEPTH:
+            messagebox.showerror("Convert", f"Difficulty must be 0-{BIT_DEPTH}.")
+            return
+        if diff > 26 and not messagebox.askokcancel(
+                "Convert", f"Difficulty {diff} may take a very long time in Python. Continue?"):
+            return
+
+        self.mine_stop = threading.Event()
+        self.mining_conv = True
+        self._set_header(header)
+        self._show_rx()                         # button becomes Cancel
+        self._refresh_serial_label(f"(searching nonce, diff {diff}...)")
+        threading.Thread(target=self._mine_worker, args=(header, diff, self.mine_stop),
+                         daemon=True).start()
+
+    def _mine_worker(self, header, diff, stop):
+        res = mine_pow(header, diff, stop)
+        self.q.put(("mined", dict(header=header, result=res, stop=stop)))
+
+    def _on_mined(self, d):
+        if d["stop"] is not self.mine_stop:     # result of an older, replaced search
+            return
+        self.mining_conv = False
+        nonce, digest, hashes = d["result"]
+        if nonce is None:
+            self._show_rx()
+            self._refresh_serial_label("(convert cancelled)")
+            return
+        self._set_header(d["header"])
+        self.rx_line = build_pow_line(d["header"], nonce, digest)
+        self.convert_mode = True
+        self._show_rx()
+        self._refresh_serial_label(f"(converted: nonce={nonce}, {hashes} hashes)")
+
+    def _export_text(self):
+        """Text for the Export row's selected field, or None (after a message) if nothing converted."""
+        line = self.rx_line
+        if not line:
+            boxed = self.v_hex.get().strip()
+            line = boxed if boxed.startswith("POW:") else ""
+        parts = line.split(":", 6)              # header is last; it may contain colons
+        if len(parts) != 7 or parts[0] != "POW":
+            messagebox.showerror("Export", "Nothing converted yet. Press Convert first.")
+            return None
+        names = ("Nonce", "Hash", "Padded message", "Padded nonce", "Padded hash", "Header")
+        fields = dict(zip(names, parts[1:]))
+        sel = self.export_combo.get()
+        if sel == EXPORT_CHOICES[0]:
+            return line
+        if sel == EXPORT_CHOICES[-1]:
+            return "\n".join(f"{k}: {v}" for k, v in fields.items())
+        return fields[sel]
+
+    def copy_export(self):
+        text = self._export_text()
+        if text is None:
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self._refresh_serial_label(f"(copied {self.export_combo.get().lower()})")
+
+    def save_export(self):
+        text = self._export_text()
+        if text is None:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt", initialfile="pow_converted.txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            messagebox.showerror("Export", str(e))
+            return
+        self._refresh_serial_label(f"(saved {path.split('/')[-1].split(chr(92))[-1]})")
 
     def copy_conv(self):
         text = self.v_hex.get()
@@ -685,9 +860,9 @@ class App:
 
     def _refresh_serial_label(self, note=""):
         conn = f"{self.serial.port_name} @{self.serial.baud}" if self.serial.is_open else "disconnected"
-        if self.rx_buf:
-            h = self.rx_buf.hex().upper()
-            rx = f"{h[:8]}...{h[-8:]}"
+        if self.rx_header:
+            h = self.rx_header
+            rx = h if len(h) <= 20 else f"{h[:8]}...{h[-8:]}"
             if self.rx_difficulty is not None:
                 rx += f" d={self.rx_difficulty}"
         else:
@@ -833,19 +1008,21 @@ class App:
             for msg in self.extractor.feed(new):
                 kind = msg["kind"]
                 if kind == "POW":
-                    self.rx_buf = msg["challenge"]
-                    self.rx_difficulty = msg["difficulty"]
-                    self.rx_nonce = b""         # old solution belongs to the old challenge
-                    self.rx_hash = b""
+                    self._set_header(msg["header"])
+                    self.rx_line = msg["line"]
+                    self._show_rx()
+                    self._refresh_serial_label(f"POW nonce={msg['nonce']}")
+                    if self.v_force_serial.get():
+                        self._apply_rx()
+                elif kind == "HEADER":
+                    if msg["header"] != self.rx_header:
+                        self.rx_line = ""
+                        self.convert_mode = False
+                    self._set_header(msg["header"])
                     self._show_rx()
                     self._refresh_serial_label()
                     if self.v_force_serial.get():
                         self._apply_rx()
-                elif kind == "SOLUTION":
-                    self.rx_nonce = msg["nonce"]
-                    self.rx_hash = msg["hash"]
-                   
-                    self._refresh_serial_label(f"SOLUTION nonce={msg['nonce_hex']}")
                 elif kind in ("STATUS", "BAD"):
                     self._refresh_serial_label(f"[{kind}: {msg['text'][:24]}]")
         elif self.btn_connect.cget("text") == "Disconnect" and not self.serial.is_open:
@@ -863,6 +1040,8 @@ class App:
                     self._draw_bit_rows(d["target"], d["guess"], d["pooled"], exposed)
                     self.lbl_status.config(
                         text=f"Status: {d['status']} | Bit Step: {d['steps']}/{self.engine.bit_depth}")
+                elif ev[0] == "mined":
+                    self._on_mined(ev[1])
                 elif ev[0] == "error":
                     messagebox.showerror("Camera Error", ev[1])
         except queue.Empty:
