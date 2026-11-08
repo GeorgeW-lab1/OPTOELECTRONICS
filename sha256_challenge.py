@@ -591,7 +591,7 @@ class App:
         e.pack(side="left", padx=4)
         e.bind("<Return>", lambda ev: self.send_line())
         ttk.Button(row2, text="Send", command=self.send_line).pack(side="left")
-        ttk.Label(row2, text="(commands: SET <text|0xhex|dec> | RESET | STEP | GET)", foreground="#708090").pack(side="left", padx=10)
+        ttk.Label(row2, text="(commands: TERMINATOR | STOP | DIFF | DIFF 12 | HEADER | DATA hello | SHA256 hello | STATUS | RESET | HELP)", foreground="#708090").pack(side="left", padx=10)
 
         wrap = ttk.Frame(ser_frame)
         wrap.pack(fill="both", expand=True, padx=5, pady=5)
