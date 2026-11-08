@@ -31,7 +31,8 @@ except ImportError:
 # ==============================================================================
 # SERIAL RECEIVER (serial port -> hex input)
 # ==============================================================================
-START_CMD = b"start\n"   # sent once before reading; change terminator here if needed
+START_CMD = b"start\n"        # sent once before reading; change terminator here if needed
+DIFF_CMD_FMT = "diff {n}\n"   # sent by the 'Send diff n' button; edit to match the sketch
 
 # Sizes / padding, matching sha256_challenge.ino
 CHALLENGE_BYTES = 32                    # 256-bit challenge -> 64 hex chars
@@ -46,8 +47,37 @@ def pad_hex(value: int, nbytes: int) -> str:
     return f"{value:0{nbytes * 2}X}"
 
 
+def sha_pad(msg: bytes) -> bytes:
+    """SHA-256 padding: msg + 0x80 + zeros + 64-bit big-endian bit length (multiple of 64 bytes)."""
+    out = bytearray(msg) + b"\x80"
+    while len(out) % 64 != 56:
+        out.append(0)
+    return bytes(out) + (len(msg) * 8).to_bytes(8, "big")
+
+
+def convert_pow(challenge: bytes, nonce: bytes, digest: bytes) -> str:
+    """
+    Build:  POW:<nonce>:<hash>:<padded message>:<padded nonce>:<padded hash>:<header>
+      nonce / hash     : as received (16 / 64 hex)
+      padded message   : SHA-256 padded block of challenge || nonce
+      padded nonce     : SHA-256 padded block of nonce
+      padded hash      : SHA-256 padded block of hash
+      header           : the 32-byte challenge
+    Edit this function if your circuit expects different fields.
+    """
+    return ":".join([
+        "POW",
+        nonce.hex().upper(),
+        digest.hex().upper(),
+        sha_pad(challenge + nonce).hex().upper(),
+        sha_pad(nonce).hex().upper(),
+        sha_pad(digest).hex().upper(),
+        challenge.hex().upper(),
+    ])
+
+
 class SerialReceiver:
-    """Serial channel. Receives hex; only ever transmits the START command."""
+    """Serial channel. Receives hex; transmits only the START and DIFF commands."""
     def __init__(self):
         self._port = None
         self.port_name = None
@@ -86,6 +116,17 @@ class SerialReceiver:
             return False
         try:
             self._port.write(START_CMD)
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def send_diff(self, n: int):
+        """Send the difficulty command, e.g. 'diff 12\\n'."""
+        if self._port is None:
+            return False
+        try:
+            self._port.write(DIFF_CMD_FMT.format(n=n).encode("ascii"))
             return True
         except Exception:
             self.close()
@@ -425,15 +466,13 @@ class App:
         self.extractor = MessageExtractor()
         self.rx_buf = b""          # last extracted challenge (32 bytes)
         self.rx_difficulty = None  # difficulty from the last POW message
-        self.rx_nonce = b""        # nonce from the last SOLUTION message (8 bytes)
-        self.rx_hash = b""         # hash from the last SOLUTION message (32 bytes)
-        self.rx_status = ""        # last LOCKBOX_READY / DISARMED / REJECTED line
+        self.rx_nonce = b""        # last SOLUTION nonce (8 bytes)
+        self.rx_hash = b""         # last SOLUTION hash (32 bytes)
         self.thread = None
         self.photo = None
 
         self._build_ui()
         self._draw_current()
-        self._update_msg_dump()
         self.window.protocol("WM_DELETE_WINDOW", self._close)
         self.window.after(15, self._poll)
 
@@ -454,8 +493,8 @@ class App:
         ttk.Checkbutton(ctrl_frame, text="IR Thermal Heatmap", variable=self.v_ir,
                         command=lambda: self.ctl.update(ir_heatmap=self.v_ir.get())).pack(side="left", padx=10)
 
-        # Serial-hex receive frame
-        target_frame = ttk.LabelFrame(main_frame, text="Serial-Hex Input (Receive Only)")
+        # Serial-hex frame (receives hex; sends START and DIFF commands)
+        target_frame = ttk.LabelFrame(main_frame, text="Serial-Hex Input")
         target_frame.pack(fill="x", padx=5, pady=5)
 
         ttk.Label(target_frame, text="Port:").pack(side="left", padx=(5, 2), pady=5)
@@ -485,6 +524,21 @@ class App:
             command=self._on_force_serial)
         self.chk_force_serial.pack(side="left", padx=10, pady=5)
 
+        ttk.Label(target_frame, text="diff n:").pack(side="left", padx=(10, 2), pady=5)
+        self.diff_spin = ttk.Spinbox(target_frame, from_=0, to=BIT_DEPTH, increment=1, width=5)
+        self.diff_spin.set(8)
+        self.diff_spin.pack(side="left", padx=2, pady=5)
+        ttk.Button(target_frame, text="Send diff n", command=self.send_diff).pack(side="left", padx=5, pady=5)
+
+        # Convert row: POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
+        conv_frame = ttk.LabelFrame(main_frame, text="Convert")
+        conv_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Button(conv_frame, text="Convert", command=self.convert_rx).pack(side="left", padx=5, pady=5)
+        self.v_conv = tk.StringVar(value="")
+        ttk.Entry(conv_frame, textvariable=self.v_conv, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=2, pady=5)
+        ttk.Button(conv_frame, text="Copy", command=self.copy_conv).pack(side="left", padx=5, pady=5)
+
         # Viewport and registers
         display_frame = ttk.Frame(main_frame)
         display_frame.pack(fill="both", expand=True, padx=5, pady=5)
@@ -508,21 +562,15 @@ class App:
         dump_frame = ttk.LabelFrame(reg_frame, text="Register Dump (select / copy)")
         dump_frame.pack(fill="x", padx=5, pady=(0, 5))
 
-        dump_body = ttk.Frame(dump_frame)
-        dump_body.pack(fill="x", padx=5, pady=5)
-        self.txt_dump = tk.Text(dump_body, width=56, height=14, wrap="char",
+        self.txt_dump = tk.Text(dump_frame, width=58, height=7, wrap="char",
                                 font=("Consolas", 9), bg="#121414", fg="#d2e0f0",
                                 insertbackground="#d2e0f0", selectbackground="#38445c",
                                 relief="flat", undo=False)
-        dump_scroll = ttk.Scrollbar(dump_body, orient="vertical", command=self.txt_dump.yview)
-        self.txt_dump.configure(yscrollcommand=dump_scroll.set)
-        self.txt_dump.pack(side="left", fill="x", expand=True)
-        dump_scroll.pack(side="right", fill="y")
+        self.txt_dump.pack(fill="x", padx=5, pady=5)
         self._dump_text = None
         self.txt_dump.bind("<Key>", self._dump_key)
         self.txt_dump.bind("<Button-1>", lambda e: self.txt_dump.focus_set())
 
-        self._menu_target = self.txt_dump
         self.dump_menu = tk.Menu(self.window, tearoff=0)
         self.dump_menu.add_command(label="Copy", command=self._copy_selection)
         self.dump_menu.add_command(label="Select All", command=self._select_all_dump)
@@ -534,29 +582,6 @@ class App:
         ttk.Button(dump_btns, text="Copy Hex", command=lambda: self._copy_registers("hex")).pack(side="left", padx=2)
         ttk.Button(dump_btns, text="Copy Binary", command=lambda: self._copy_registers("bin")).pack(side="left", padx=2)
         ttk.Button(dump_btns, text="Copy All", command=lambda: self._copy_registers("all")).pack(side="left", padx=2)
-
-        # Protocol message dump: the POW / SOLUTION lines and fields from sha256_challenge.ino
-        msg_frame = ttk.LabelFrame(reg_frame, text="Protocol Messages: Nonce / Message (select / copy)")
-        msg_frame.pack(fill="x", padx=5, pady=(0, 5))
-
-        self.txt_msg = tk.Text(msg_frame, width=58, height=12, wrap="char",
-                               font=("Consolas", 9), bg="#121414", fg="#d2e0f0",
-                               insertbackground="#d2e0f0", selectbackground="#38445c",
-                               relief="flat", undo=False)
-        self.txt_msg.pack(fill="x", padx=5, pady=5)
-        self._msg_text = None
-        self._msg_parts = {}
-        self.txt_msg.bind("<Key>", self._dump_key)
-        self.txt_msg.bind("<Button-1>", lambda e: self.txt_msg.focus_set())
-        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
-            self.txt_msg.bind(seq, self._dump_popup)
-
-        msg_btns = ttk.Frame(msg_frame)
-        msg_btns.pack(fill="x", padx=5, pady=(0, 5))
-        ttk.Button(msg_btns, text="Copy POW", command=lambda: self._copy_msg("pow")).pack(side="left", padx=2)
-        ttk.Button(msg_btns, text="Copy Nonce", command=lambda: self._copy_msg("nonce")).pack(side="left", padx=2)
-        ttk.Button(msg_btns, text="Copy SOLUTION", command=lambda: self._copy_msg("solution")).pack(side="left", padx=2)
-        ttk.Button(msg_btns, text="Copy All", command=lambda: self._copy_msg("all")).pack(side="left", padx=2)
 
         self.lbl_status = ttk.Label(reg_frame, text="Status: IDLE", font=("Consolas", 11), foreground="#00e5ff")
         self.lbl_status.pack(anchor="w", padx=10, pady=(5, 0))
@@ -606,7 +631,7 @@ class App:
         self.ctl["serial_loaded"] = False
         self._draw_current()
 
-    # ---------------------------------------------------------------- serial hex (RX only)
+    # ---------------------------------------------------------------- serial hex
     def _refresh_ports(self):
         self.port_combo["values"] = SerialReceiver.list_ports()
 
@@ -633,10 +658,9 @@ class App:
         self.rx_difficulty = None
         self.rx_nonce = b""
         self.rx_hash = b""
-        self.rx_status = ""
         self.extractor.reset()
         self.v_hex.set("")
-        self._update_msg_dump()
+        self.v_conv.set("")
         self._refresh_serial_label()
 
     def _on_force_serial(self):
@@ -647,6 +671,45 @@ class App:
         else:
             self.ctl["serial_loaded"] = False
             self._draw_current()
+
+    def send_diff(self):
+        """Send 'diff <n>' to the device using the value in the diff spinbox."""
+        try:
+            n = int(self.diff_spin.get())
+        except ValueError:
+            messagebox.showerror("Serial Error", "Difficulty must be an integer.")
+            return
+        if not 0 <= n <= BIT_DEPTH:
+            messagebox.showerror("Serial Error", f"Difficulty must be 0-{BIT_DEPTH}.")
+            return
+        if not self.serial.is_open:
+            messagebox.showerror("Serial Error", "Connect to a serial port first.")
+            return
+        if self.serial.send_diff(n):
+            self._refresh_serial_label(f"TX: diff {n}")
+        else:
+            self.btn_connect.config(text="Connect")
+            self._refresh_serial_label("(send failed)")
+
+    def convert_rx(self):
+        """Convert the last received challenge + SOLUTION into the long POW line."""
+        if not self.rx_buf:
+            messagebox.showerror("Convert", "No POW challenge received yet.")
+            return
+        if not (self.rx_nonce and self.rx_hash):
+            messagebox.showerror("Convert", "No SOLUTION (nonce/hash) received yet.")
+            return
+        line = convert_pow(self.rx_buf, self.rx_nonce, self.rx_hash)
+        self.v_conv.set(line)
+        self._refresh_serial_label("(converted)")
+
+    def copy_conv(self):
+        text = self.v_conv.get()
+        if not text:
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self._refresh_serial_label("(copied converted line)")
 
     def _apply_rx(self):
         """Load the received hex value as the oracle target and unmask TARGET."""
@@ -745,26 +808,11 @@ class App:
 
     def _update_dump(self, target_val, guess_val, pooled_val, exposed):
         regs = self._register_strings(target_val, guess_val, pooled_val, exposed)
-        bd = self.engine.bit_depth
-        nbytes = (bd + 7) // 8
-        vals = {"TARGET": target_val, "GUESS": guess_val, "POOLED": pooled_val}
         lines = []
         for name, (h, b) in regs.items():
-            lines.append(f"== {name} ({nbytes}B / {bd} bits) ==")
-            lines.append(f"HEX: {h}")
-            if h == "[HIDDEN]":
-                lines.append("BYTES: [HIDDEN]")
-                lines.append("")
-                continue
-            raw = vals[name].to_bytes(nbytes, "big")          # byte 00 = MSB
-            for i in range(0, nbytes, 8):
-                chunk = raw[i:i + 8]
-                lines.append(f"HEX {i:02d}-{i + len(chunk) - 1:02d}: " + " ".join(f"{x:02X}" for x in chunk))
-            for i in range(0, nbytes, 4):
-                chunk = raw[i:i + 4]
-                lines.append(f"BIN {i:02d}-{i + len(chunk) - 1:02d}: " + " ".join(f"{x:08b}" for x in chunk))
-            lines.append("")
-        text = "\n".join(lines).rstrip()
+            lines.append(f"{name} HEX: {h}")
+            lines.append(f"{name} BIN: {b}")
+        text = "\n".join(lines)
         if text == self._dump_text:          # unchanged: keep the user's selection
             return
         self._dump_text = text
@@ -776,7 +824,7 @@ class App:
         ctrl = (event.state & 0x4) != 0
         if ctrl and event.keysym.lower() in ("c", "a", "insert"):
             if event.keysym.lower() == "a":
-                self._select_all_dump(event.widget)
+                self._select_all_dump()
                 return "break"
             return None
         if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
@@ -784,20 +832,18 @@ class App:
             return None
         return "break"
 
-    def _select_all_dump(self, widget=None):
-        widget = widget or self._menu_target
-        widget.tag_add("sel", "1.0", "end-1c")
-        widget.focus_set()
+    def _select_all_dump(self):
+        self.txt_dump.tag_add("sel", "1.0", "end-1c")
+        self.txt_dump.focus_set()
 
     def _dump_popup(self, event):
-        self._menu_target = event.widget
-        event.widget.focus_set()
+        self.txt_dump.focus_set()
         self.dump_menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
     def _copy_selection(self):
         try:
-            text = self._menu_target.get("sel.first", "sel.last")
+            text = self.txt_dump.get("sel.first", "sel.last")
         except tk.TclError:
             return
         self.window.clipboard_clear()
@@ -817,52 +863,6 @@ class App:
         self.window.clipboard_append("\n".join(lines))
         self._refresh_serial_label(f"(copied {mode})")
 
-    # ---------------------------------------------------------------- protocol message dump
-    def _update_msg_dump(self):
-        """Show the messages exactly as the .ino sends/expects them, plus their fields."""
-        none = "[NONE]"
-        chal = self.rx_buf.hex().upper() if self.rx_buf else ""
-        diff = str(self.rx_difficulty) if self.rx_difficulty is not None else ""
-        nonce = self.rx_nonce.hex().upper() if self.rx_nonce else ""
-        hsh = self.rx_hash.hex().upper() if self.rx_hash else ""
-
-        pow_line = f"POW:{chal}:{diff}" if chal else ""
-        sol_line = f"SOLUTION:{nonce}:{hsh}" if (nonce and hsh) else ""
-        self._msg_parts = dict(pow=pow_line, nonce=nonce, solution=sol_line,
-                               challenge=chal, hash=hsh)
-
-        text = "\n".join([
-            "== POW  (Arduino -> PC) ==",
-            f"MESSAGE: {pow_line or none}",
-            f"CHALLENGE ({CHALLENGE_BYTES}B): {chal or none}",
-            f"DIFFICULTY: {diff or none}",
-            "",
-            "== SOLUTION  (PC -> Arduino) ==",
-            f"MESSAGE: {sol_line or none}",
-            f"NONCE ({NONCE_BYTES}B): {nonce or none}",
-            f"HASH ({HASH_BYTES}B): {hsh or none}",
-            "",
-            "== REPLY ==",
-            f"LAST: {self.rx_status or none}",
-        ])
-        if text == self._msg_text:           # unchanged: keep the user's selection
-            return
-        self._msg_text = text
-        self.txt_msg.delete("1.0", "end")
-        self.txt_msg.insert("1.0", text)
-
-    def _copy_msg(self, mode):
-        parts = self._msg_parts
-        if mode == "all":
-            text = self._msg_text or ""
-        else:
-            text = parts.get(mode, "")
-        if not text:
-            return
-        self.window.clipboard_clear()
-        self.window.clipboard_append(text)
-        self._refresh_serial_label(f"(copied {mode})")
-
     # ---------------------------------------------------------------- polling
     def _poll(self):
         # Receive serial hex; always shown, only applied while Force Serial Read is on
@@ -874,21 +874,15 @@ class App:
                     self.rx_buf = msg["challenge"]
                     self.rx_difficulty = msg["difficulty"]
                     self.v_hex.set(msg["hex"])
-                    self._update_msg_dump()
                     self._refresh_serial_label()
                     if self.v_force_serial.get():
                         self._apply_rx()
                 elif kind == "SOLUTION":
                     self.rx_nonce = msg["nonce"]
                     self.rx_hash = msg["hash"]
-                    self._update_msg_dump()
                     self._refresh_serial_label(f"SOLUTION nonce={msg['nonce_hex']}")
-                elif kind == "STATUS":
-                    self.rx_status = msg["text"]
-                    self._update_msg_dump()
-                    self._refresh_serial_label(f"[{msg['text']}]")
-                elif kind == "BAD":
-                    self._refresh_serial_label(f"[BAD: {msg['text'][:24]}]")
+                elif kind in ("STATUS", "BAD"):
+                    self._refresh_serial_label(f"[{kind}: {msg['text'][:24]}]")
         elif self.btn_connect.cget("text") == "Disconnect" and not self.serial.is_open:
             self.btn_connect.config(text="Connect")
             self._refresh_serial_label("(port lost)")
@@ -919,5 +913,5 @@ class App:
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
-    root.geometry("860x960")
+    root.geometry("860x600")
     root.mainloop()
