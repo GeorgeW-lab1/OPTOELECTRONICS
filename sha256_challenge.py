@@ -586,7 +586,7 @@ class App:
         row2 = ttk.Frame(ser_frame)
         row2.pack(fill="x", padx=5)
         ttk.Label(row2, text="Send line:").pack(side="left")
-        self.v_tx = tk.StringVar(value="SET arduino-sha256123")
+        self.v_tx = tk.StringVar(value="diff 25")
         e = ttk.Entry(row2, width=30, textvariable=self.v_tx)
         e.pack(side="left", padx=4)
         e.bind("<Return>", lambda ev: self.send_line())
