@@ -20,6 +20,8 @@ nonce and hash are decoded purely from the reconstructed bits. The oracle's
 result and the Arduino's result are each stored with their elapsed time and
 compared once both exist.
 
+An emulated Arduino (checkbox in the GUI) can stand in for the board.
+
 Install dependencies:
     pip install pyserial opencv-python numpy
 """
@@ -58,6 +60,40 @@ PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
 
 # ==============================================================================
 # 256-BIT BIT-POOLING ORACLE
+def pool_bits(val, bit_depth, kernel_size, stride, pool_op, schmitt_trigger):
+    """Applies a pooling operator to a register value."""
+    bits = [(val >> i) & 1 for i in range(bit_depth)]
+    pooled_out = []
+
+    for i in range(0, len(bits), stride):
+        block = bits[i:i + kernel_size]
+
+        if not block:
+            break
+
+        if pool_op == "POPCOUNT":
+            result = sum(block) / len(block)
+            output_bit = 1 if result >= schmitt_trigger else 0
+        elif pool_op == "AND":
+            output_bit = 1 if all(b == 1 for b in block) else 0
+        elif pool_op == "OR":
+            output_bit = 1 if any(b == 1 for b in block) else 0
+        elif pool_op == "XOR":
+            output_bit = sum(block) % 2
+        elif pool_op == "MAJORITY":
+            output_bit = 1 if sum(block) > (len(block) / 2.0) else 0
+        else:
+            output_bit = block[0]
+
+        pooled_out.append(output_bit)
+
+    output_value = 0
+    for index, bit in enumerate(pooled_out):
+        output_value |= bit << index
+
+    return output_value
+
+
 # ==============================================================================
 
 class BitPoolingOracle:
@@ -112,36 +148,14 @@ class BitPoolingOracle:
 
     def pool_step(self, val: int) -> int:
         """Applies the selected pooling operator to the current guess."""
-        bits = [(val >> i) & 1 for i in range(self.bit_depth)]
-        pooled_out = []
-
-        for i in range(0, len(bits), self.stride):
-            block = bits[i:i + self.kernel_size]
-
-            if not block:
-                break
-
-            if self.pool_op == "POPCOUNT":
-                result = sum(block) / len(block)
-                output_bit = 1 if result >= self.schmitt_trigger else 0
-            elif self.pool_op == "AND":
-                output_bit = 1 if all(b == 1 for b in block) else 0
-            elif self.pool_op == "OR":
-                output_bit = 1 if any(b == 1 for b in block) else 0
-            elif self.pool_op == "XOR":
-                output_bit = sum(block) % 2
-            elif self.pool_op == "MAJORITY":
-                output_bit = 1 if sum(block) > (len(block) / 2.0) else 0
-            else:
-                output_bit = block[0]
-
-            pooled_out.append(output_bit)
-
-        output_value = 0
-        for index, bit in enumerate(pooled_out):
-            output_value |= bit << index
-
-        return output_value
+        return pool_bits(
+            val,
+            self.bit_depth,
+            self.kernel_size,
+            self.stride,
+            self.pool_op,
+            self.schmitt_trigger,
+        )
 
     @property
     def target(self) -> int:
@@ -155,10 +169,16 @@ class BitPoolingOracle:
 
 
 # ==============================================================================
-# BIT-POOLING SEARCH ENGINE (variable bit depth)
+# BIT-POOLING REGISTERS (passive: no work of their own)
 # ==============================================================================
 
-class BitPoolingSearchEngine:
+class BitPoolingRegisters:
+    """
+    Passive registers. They do no work of their own: no searching, no
+    stepping, no querying. They only hold what the oracle pushes into them
+    (the revealed bits so far) and pool that value for display.
+    """
+
     def __init__(self, bit_depth: int = PASSCODE_BITS):
         if not isinstance(bit_depth, int) or bit_depth < 1:
             raise ValueError("bit_depth must be a positive integer.")
@@ -166,98 +186,64 @@ class BitPoolingSearchEngine:
         self.bit_depth = bit_depth
         self.max_val = (1 << bit_depth) - 1
 
-        # The camera thread, the GUI and the background oracle all touch the
-        # engine, so reset/step are serialised.
         self._lock = threading.RLock()
-
-        self.oracle = BitPoolingOracle(self.bit_depth)
-        self.current_guess = 0
-        self.step_count = 0
-        self.history = [0]
-        self.converged = False
-        self.last_status = "INITIALIZED"
 
         self.kernel_size = 4
         self.stride = 2
         self.pool_op = "POPCOUNT"
         self.schmitt_trigger = 0.5
 
-        self.guess_reg = 0
-        self.target_reg = 0
-        self.pooled_register = 0
+        self.reset()
 
-        self._update_registers()
-
-    def _reset(self, new_target=None, bit_depth=None):
-        if bit_depth is not None:
-            if not isinstance(bit_depth, int) or bit_depth < 1:
-                raise ValueError("bit_depth must be a positive integer.")
-            self.bit_depth = bit_depth
-            self.max_val = (1 << bit_depth) - 1
-
-        self.oracle = BitPoolingOracle(self.bit_depth, new_target)
-        self.oracle.kernel_size = self.kernel_size
-        self.oracle.pool_op = self.pool_op
-        self.oracle.schmitt_trigger = self.schmitt_trigger
-
-        self.current_guess = 0
-        self.step_count = 0
-        self.history = [0]
-        self.converged = False
-        self.last_status = "READY"
-        self._update_registers()
-
-    def _step(self):
-        """Advances the bit-pooling search by one bit."""
-        if self.converged or self.step_count >= self.bit_depth:
-            return
-
-        self.step_count += 1
-
-        shift = self.bit_depth - self.step_count
-        trial_value = self.oracle.pooled_bits | (1 << shift)
-
-        bit = self.oracle.query_bit(trial_value)
-
-        if bit:
-            self.oracle.pooled_bits |= 1 << shift
-
-        self.current_guess = self.oracle.pooled_bits
-        self.history.append(self.current_guess)
-        self._update_registers()
-
-        if self.step_count >= self.bit_depth:
-            self.oracle.is_done = True
-            self.converged = True
-
-            if self.current_guess == self.oracle._target:
-                self.last_status = "LOCKED & REVEALED"
-            else:
-                self.last_status = "RECONSTRUCTION MISMATCH"
-
-    def reset(self, new_target=None, bit_depth=None):
+    def reset(self, bit_depth=None, linked=False):
+        """Clears the registers. They stay idle until the oracle fills them."""
         with self._lock:
-            self._reset(new_target, bit_depth)
+            if bit_depth is not None:
+                if not isinstance(bit_depth, int) or bit_depth < 1:
+                    raise ValueError("bit_depth must be a positive integer.")
+                self.bit_depth = bit_depth
+                self.max_val = (1 << bit_depth) - 1
 
-    def step(self):
-        """Advances the bit-pooling search by one bit."""
+            self.linked = linked
+            self.current_guess = 0
+            self.step_count = 0
+            self.history = [0]
+            self.converged = False
+            self.last_status = "READY" if linked else "IDLE"
+            self.target_reg = 0
+            self._refresh()
+
+    def receive(self, guess, steps, depth, done, status, target=0):
+        """Takes the oracle's current state. The only way values get in."""
         with self._lock:
-            self._step()
+            if depth != self.bit_depth:
+                self.bit_depth = depth
+                self.max_val = (1 << depth) - 1
+
+            self.linked = True
+            self.current_guess = guess
+            self.step_count = steps
+            self.history.append(guess)
+            self.converged = done
+            self.last_status = status
+            self.target_reg = target
+            self._refresh()
 
     def result(self):
         """(guess, converged, bit_depth) read atomically."""
         with self._lock:
             return self.current_guess, self.converged, self.bit_depth
 
-    def _update_registers(self):
+    def _refresh(self):
         self.guess_reg = self.current_guess
-
-        try:
-            self.target_reg = self.oracle.target
-        except PermissionError:
-            self.target_reg = 0
-
-        self.pooled_register = self.oracle.pool_step(self.current_guess)
+        self.pooled_register = pool_bits(
+            self.current_guess,
+            self.bit_depth,
+            self.kernel_size,
+            self.stride,
+            self.pool_op,
+            self.schmitt_trigger,
+        )
 
 
 # ==============================================================================
@@ -461,44 +447,119 @@ class MiningSession:
         }
 
 
-class BackgroundPredictor(threading.Thread):
+class CameraOracle:
     """
-    The camera oracle's background worker. It runs independently of the
-    Arduino link: its target is not generated or stored, it is connected to
-    the mining result (SHA256(DATA + nonce), nonce counting up from 0) through
-    a PowLink, so the minimally padded message block only exists as the
-    oracle's answers. The engine reconstructs it one bit at a time, then
-    message, nonce and hash are decoded from the reconstructed bits alone.
+    The camera-driven oracle. All the work happens here, none in the
+    registers. It is connected to the mining result through a PowLink, and
+    each camera-triggered step reveals one more bit of the target (MSB first)
+    by asking the link, then pushes the revealed state into the registers.
     """
 
-    def __init__(self, session: MiningSession, engine: BitPoolingSearchEngine):
+    def __init__(self, registers: BitPoolingRegisters):
+        self.registers = registers
+        self._lock = threading.RLock()
+        self._pool = None
+        self.session = None
+        self.depth = 0
+        self.steps = 0
+        self.done = False
+
+    def arm(self, session, link, depth: int):
+        """Connects the oracle to a mining result; the camera does the rest."""
+        with self._lock:
+            self.session = session
+            self._pool = BitPoolingOracle(depth, link)
+            self.depth = depth
+            self.steps = 0
+            self.done = False
+            self.registers.reset(depth, linked=True)
+
+    def reset(self):
+        with self._lock:
+            self.session = None
+            self._pool = None
+            self.depth = 0
+            self.steps = 0
+            self.done = False
+            self.registers.reset(PASSCODE_BITS)
+
+    def step(self):
+        """Reveals one bit. Driven by the camera (or the Step button)."""
+        with self._lock:
+            pool = self._pool
+
+            if pool is None or self.done:
+                return
+
+            self.steps += 1
+
+            shift = self.depth - self.steps
+            trial_value = pool.pooled_bits | (1 << shift)
+
+            if pool.query_bit(trial_value):
+                pool.pooled_bits |= 1 << shift
+
+            guess = pool.pooled_bits
+            target = 0
+            status = "REVEALING"
+
+            if self.steps >= self.depth:
+                pool.is_done = True
+                self.done = True
+                target = pool.target
+
+                status = (
+                    "LOCKED & REVEALED"
+                    if guess == target
+                    else "RECONSTRUCTION MISMATCH"
+                )
+
+            self.registers.receive(
+                guess, self.steps, self.depth, self.done, status, target
+            )
+
+            if self.session is not None:
+                self.session.set_live(guess, self.steps, self.depth)
+
+
+class BackgroundPredictor(threading.Thread):
+    """
+    The oracle's background worker. It runs independently of the Arduino
+    link: it connects the camera oracle to the mining result (SHA256(DATA +
+    nonce), nonce counting up from 0) through a PowLink, then waits while the
+    camera drives the reveal. When the registers have been filled, message,
+    nonce and hash are decoded from the registers' bits alone.
+    """
+
+    def __init__(self, session: MiningSession, oracle: CameraOracle):
         super().__init__(daemon=True)
         self.session = session
-        self.engine = engine
+        self.oracle = oracle
 
     def run(self):
         session = self.session
+        oracle = self.oracle
 
-        # The oracle is connected to the mining result; it does not generate
-        # or store a target of its own.
         link = PowLink(session.data, session.diff, session.cancel)
         depth = link.depth()
 
         if depth is None or session.cancel.is_set():
             return
 
-        self.engine.reset(link, depth)
+        oracle.arm(session, link, depth)
 
-        while not session.cancel.is_set() and not self.engine.converged:
-            self.engine.step()
-            live_guess, _, live_depth = self.engine.result()
-            session.set_live(live_guess, self.engine.step_count, live_depth)
+        while (
+            not session.cancel.is_set()
+            and oracle.session is session
+            and not oracle.done
+        ):
+            time.sleep(0.01)
 
-        if session.cancel.is_set():
+        if session.cancel.is_set() or oracle.session is not session:
             return
 
-        # Decode purely from the reconstructed bits.
-        guess, converged, depth = self.engine.result()
+        # Decode purely from the registers' bits.
+        guess, converged, depth = oracle.registers.result()
 
         if not converged:
             return
@@ -566,43 +627,156 @@ class ArduinoMiner:
         self.ser.flush()
 
     def read_pow(self):
-        """
-        Parses POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
-        Returns (nonce, hash_int, padded_message_bytes) or None.
-        The header may contain colons, so it is the unsplit remainder.
-        """
+        """Reads one line. Returns (nonce, hash_int, padded_bytes) or None."""
         raw = self.ser.readline()
 
         if not raw:
             return None
 
-        line = raw.decode("ascii", errors="ignore").strip()
+        return parse_pow_line(raw.decode("ascii", errors="ignore").strip())
 
-        if not line.startswith("POW:"):
-            return None
 
-        parts = line.split(":", 6)
+def parse_pow_line(line: str):
+    """
+    Parses POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
+    Returns (nonce, hash_int, padded_message_bytes) or None.
+    The header may contain colons, so it is the unsplit remainder.
+    """
+    if not line.startswith("POW:"):
+        return None
 
-        if len(parts) != 7 or len(parts[2]) != 64:
-            return None
+    parts = line.split(":", 6)
 
+    if len(parts) != 7 or len(parts[2]) != 64:
+        return None
+
+    try:
+        return (
+            int(parts[1]),
+            int(parts[2], 16),
+            bytes.fromhex(parts[3]),
+        )
+    except ValueError:
+        return None
+
+
+class EmulatedArduino:
+    """
+    Software stand-in for the physical Arduino. Same interface as
+    ArduinoMiner (send_diff / read_pow / close) and the same behaviour as the
+    sketch: DIFF <bits> starts mining SHA256(DATA + nonce) from nonce 0 at a
+    throttled hash rate, silently, and one POW line is emitted when a hash
+    has the required leading zero bits. The hash rate is configurable so the
+    emulated board can be as slow as a real one.
+    """
+
+    def __init__(self, hashes_per_second: float = 300.0, data: str = POW_DATA):
+        self.rate = max(1.0, float(hashes_per_second))
+        self.data = data
+        self._commands = queue.Queue()
+        self._lines = queue.Queue()
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def list_ports():
+        return ["EMULATOR"]
+
+    def close(self):
+        self._stop.set()
+
+    def send_diff(self, diff: int):
+        self._commands.put(("DIFF", int(diff)))
+
+    def stop_mining(self):
+        self._commands.put(("STOP", 0))
+
+    def read_pow(self):
         try:
-            return (
-                int(parts[1]),
-                int(parts[2], 16),
-                bytes.fromhex(parts[3]),
-            )
-        except ValueError:
+            line = self._lines.get(timeout=0.2)
+        except queue.Empty:
             return None
+
+        return parse_pow_line(line)
+
+    def _format(self, nonce: int, digest: bytes) -> str:
+        """The sketch's POW line: padded message, nonce and hash, then header."""
+        nonce_text = str(nonce).encode("ascii")
+        message = self.data.encode("ascii") + nonce_text
+
+        return ":".join((
+            "POW",
+            str(nonce),
+            digest.hex(),
+            sha256_pad(message).hex(),
+            sha256_pad(nonce_text).hex(),
+            sha256_pad(digest).hex(),
+            self.data,
+        ))
+
+    def _run(self):
+        mining = False
+        nonce = 0
+        base = None
+        limit = 0
+        budget = 0.0
+        last = time.perf_counter()
+
+        while not self._stop.is_set():
+            try:
+                while True:
+                    command, arg = self._commands.get_nowait()
+
+                    if command == "DIFF":
+                        base = hashlib.sha256(self.data.encode("ascii"))
+                        limit = 1 << (256 - arg)
+                        nonce = 0
+                        budget = 0.0
+                        last = time.perf_counter()
+                        mining = True
+                    else:
+                        mining = False
+            except queue.Empty:
+                pass
+
+            if not mining:
+                time.sleep(0.01)
+                continue
+
+            now = time.perf_counter()
+            budget += (now - last) * self.rate
+            last = now
+            count = int(budget)
+            budget -= count
+
+            for _ in range(count):
+                h = base.copy()
+                h.update(str(nonce).encode("ascii"))
+                digest = h.digest()
+
+                if int.from_bytes(digest, "big") < limit:
+                    self._lines.put(self._format(nonce, digest))
+                    mining = False
+                    break
+
+                nonce += 1
+
+                if nonce > 0xFFFFFFFF:
+                    mining = False
+                    break
+
+            time.sleep(0.01)
 
 
 class ArduinoThread(threading.Thread):
-    def __init__(self, port, ctl, out, engine):
+    def __init__(self, port, ctl, out, oracle, emulate=False, rate=300.0):
         super().__init__(daemon=True)
+        self.emulate = emulate
+        self.rate = rate
         self.port = port
         self.ctl = ctl
         self.out = out
-        self.engine = engine
+        self.oracle = oracle
         self.commands = queue.Queue()
         self.session = None
 
@@ -618,7 +792,7 @@ class ArduinoThread(threading.Thread):
 
         # Arduino and oracle are started together and then run on their own.
         miner.send_diff(diff)
-        BackgroundPredictor(session, self.engine).start()
+        BackgroundPredictor(session, self.oracle).start()
 
         self.out.put(("pow_update", session.snapshot()))
 
@@ -626,10 +800,16 @@ class ArduinoThread(threading.Thread):
         miner = None
 
         try:
-            miner = ArduinoMiner(self.port)
+            if self.emulate:
+                miner = EmulatedArduino(self.rate)
+                label = f"Connected (emulated, {self.rate:g} hashes/s)."
+            else:
+                miner = ArduinoMiner(self.port)
+                label = "Connected."
+
             self.out.put((
                 "arduino",
-                "Connected. Set a difficulty and press Send Difficulty.",
+                f"{label} Set a difficulty and press Send Difficulty.",
             ))
 
             while not self.ctl["arduino_stop"]:
@@ -710,18 +890,18 @@ def ppm_photo(rgb: np.ndarray) -> tk.PhotoImage:
 # ==============================================================================
 
 class SimThread(threading.Thread):
-    def __init__(self, cam_index, ctl, out, engine):
+    def __init__(self, cam_index, ctl, out, oracle):
         super().__init__(daemon=True)
         self.cam_index = cam_index
         self.ctl = ctl
         self.out = out
-        self.engine = engine
+        self.oracle = oracle
 
     def run(self):
         asyncio.run(self._run())
 
     async def _run(self):
-        ctl, out, engine = self.ctl, self.out, self.engine
+        ctl, out, oracle = self.ctl, self.out, self.oracle
 
         try:
             src = Source(self.cam_index)
@@ -771,9 +951,9 @@ class SimThread(threading.Thread):
                 if (
                     even_state
                     and ctl.get("auto_step", True)
-                    and not engine.converged
+                    and not oracle.done
                 ):
-                    engine.step()
+                    oracle.step()
 
                 rgb = src.rgb
 
@@ -803,29 +983,12 @@ class SimThread(threading.Thread):
                         255,
                     )
 
-                exposed_target = (
-                    engine.oracle._target
-                    if (
-                        engine.converged
-                        or ctl.get("force_reveal", False)
-                    )
-                    else 0
-                )
-
                 out.put((
                     "frame",
                     {
                         "preview": preview,
                         "idx": frame_index,
                         "dt": dt,
-                        "target": exposed_target,
-                        "guess": engine.current_guess,
-                        "pooled": engine.pooled_register,
-                        "status": engine.last_status,
-                        "steps": engine.step_count,
-                        "depth": engine.bit_depth,
-                        "history": list(engine.history),
-                        "converged": engine.converged,
                     },
                 ))
 
@@ -857,9 +1020,10 @@ class App:
             "arduino_stop": False,
         }
 
-        self.engine = BitPoolingSearchEngine(
+        self.engine = BitPoolingRegisters(
             bit_depth=PASSCODE_BITS
         )
+        self.oracle = CameraOracle(self.engine)
         self.camera_thread = None
         self.camera_ready = False
         self.pending_diff = None
@@ -971,6 +1135,35 @@ class App:
             command=self.send_difficulty,
         ).pack(side="left", padx=5, pady=5)
 
+        # Arduino emulator (use instead of the physical board)
+        emulator_frame = ttk.LabelFrame(
+            main_frame,
+            text="Arduino Emulator (no hardware needed)",
+        )
+        emulator_frame.pack(fill="x", padx=5, pady=5)
+
+        self.v_emulate = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            emulator_frame,
+            text="Emulate Arduino instead of the serial port",
+            variable=self.v_emulate,
+        ).pack(side="left", padx=5, pady=5)
+
+        ttk.Label(
+            emulator_frame,
+            text="Emulated speed (hashes/s):",
+        ).pack(side="left", padx=(20, 5), pady=5)
+
+        self.v_emu_rate = tk.StringVar(value="300")
+        ttk.Spinbox(
+            emulator_frame,
+            from_=1,
+            to=1000000,
+            increment=100,
+            width=9,
+            textvariable=self.v_emu_rate,
+        ).pack(side="left", padx=2, pady=5)
+
         # Proof-of-work results
         pow_frame = ttk.LabelFrame(
             main_frame,
@@ -1011,53 +1204,6 @@ class App:
             command=self.copy_pow,
         )
         self.b_copy_pow.pack(anchor="w", padx=10, pady=(3, 5))
-
-        # Local target controls
-        target_frame = ttk.LabelFrame(
-            main_frame,
-            text="Local 256-Bit Oracle Target (hexadecimal)",
-        )
-        target_frame.pack(fill="x", padx=5, pady=5)
-
-        self.target_label = ttk.Label(
-            target_frame,
-            text="Target (64 hex characters):",
-        )
-        self.target_label.pack(side="left", padx=5, pady=5)
-
-        self.v_custom_target = tk.StringVar(
-            value="[SECURE]"
-        )
-        self.e_custom_target = ttk.Entry(
-            target_frame,
-            width=72,
-            textvariable=self.v_custom_target,
-        )
-        self.e_custom_target.pack(
-            side="left", padx=5, pady=5
-        )
-
-        ttk.Button(
-            target_frame,
-            text="Set Custom",
-            command=self.set_custom_target,
-        ).pack(side="left", padx=2, pady=5)
-
-        ttk.Button(
-            target_frame,
-            text="Randomize Target",
-            command=self.randomize_target,
-        ).pack(side="left", padx=5, pady=5)
-
-        self.v_reveal = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            target_frame,
-            text="Force Reveal Local Target",
-            variable=self.v_reveal,
-            command=lambda: self.ctl.update(
-                force_reveal=self.v_reveal.get()
-            ),
-        ).pack(side="left", padx=15, pady=5)
 
         # Camera and register display
         display_frame = ttk.Frame(main_frame)
@@ -1200,7 +1346,7 @@ class App:
 
         self.ctl["stop"] = False
         self.camera_thread = SimThread(
-            0, self.ctl, self.q, self.engine
+            0, self.ctl, self.q, self.oracle
         )
         self.camera_thread.start()
 
@@ -1208,11 +1354,10 @@ class App:
         self.ctl["stop"] = True
 
     def step_search(self):
-        self.engine.step()
+        self.oracle.step()
 
     def reset_search(self):
-        self.engine.reset(bit_depth=PASSCODE_BITS)
-        self.v_custom_target.set("[SECURE]")
+        self.oracle.reset()
 
     def list_arduino_ports(self):
         try:
@@ -1246,7 +1391,7 @@ class App:
 
         port = self.v_arduino_port.get().strip()
 
-        if not port:
+        if not port and not self.v_emulate.get():
             messagebox.showerror(
                 "Missing Port",
                 "Enter a serial port such as COM3.",
@@ -1254,11 +1399,18 @@ class App:
             return
 
         self.ctl["arduino_stop"] = False
+        try:
+            rate = float(self.v_emu_rate.get())
+        except ValueError:
+            rate = 300.0
+
         self.arduino_thread = ArduinoThread(
             port,
             self.ctl,
             self.q,
-            self.engine,
+            self.oracle,
+            emulate=self.v_emulate.get(),
+            rate=rate,
         )
         self.arduino_thread.start()
 
@@ -1414,47 +1566,14 @@ class App:
             lambda: self.b_copy_pow.config(text="Copy Proof of Work"),
         )
 
-    def set_custom_target(self):
-        text = self.v_custom_target.get().strip()
-
-        if text.startswith("0x") or text.startswith("0X"):
-            text = text[2:]
-
-        try:
-            value = int(text, 16)
-        except ValueError:
-            messagebox.showerror(
-                "Invalid Input",
-                "Enter a 64-character hexadecimal value.",
-            )
-            return
-
-        if 0 <= value <= (1 << PASSCODE_BITS) - 1:
-            self.engine.reset(value, PASSCODE_BITS)
-            messagebox.showinfo(
-                "Target Set",
-                "New 256-bit target configured for bit pooling.",
-            )
-        else:
-            messagebox.showerror(
-                "Invalid Range",
-                "Target must be a 256-bit hexadecimal value.",
-            )
-
-    def randomize_target(self):
-        self.engine.reset(bit_depth=PASSCODE_BITS)
-        self.v_custom_target.set("[SECURE]")
-
     def _update_pool_operator(self, event):
         operator = self.operator_combo.get()
         self.engine.pool_op = operator
-        self.engine.oracle.pool_op = operator
 
     def _update_kernel(self):
         try:
             kernel = int(self.kernel_spin.get())
             self.engine.kernel_size = kernel
-            self.engine.oracle.kernel_size = kernel
         except ValueError:
             pass
 
@@ -1490,7 +1609,7 @@ class App:
                 font=("Consolas", 10, "bold"),
             )
 
-            if hidden and label == "TARGET" and self.engine.oracle._link is not None:
+            if hidden and label == "TARGET" and self.engine.linked:
                 # Connected to the oracle: the target register is aligned with
                 # what the oracle has revealed so far (unrevealed nibbles: '.').
                 shown = self.engine.step_count // 4
@@ -1524,6 +1643,25 @@ class App:
             ),
         )
 
+    def _refresh_registers(self):
+        """Redraws the registers from the engine on every GUI tick, so they
+        update whether or not the camera is running."""
+        engine = self.engine
+
+        self._draw_hex_rows(
+            engine.target_reg,
+            engine.current_guess,
+            engine.pooled_register,
+            False,
+        )
+
+        self.status_label.config(
+            text=(
+                f"Status: {engine.last_status} | "
+                f"Bit Step: {engine.step_count}/{engine.bit_depth}"
+            )
+        )
+
     def _poll(self):
         try:
             for _ in range(100):
@@ -1535,20 +1673,6 @@ class App:
                     self.cam_canvas.itemconfig(
                         self.cam_image_id,
                         image=self.photo,
-                    )
-
-                    self._draw_hex_rows(
-                        data["target"],
-                        data["guess"],
-                        data["pooled"],
-                        self.v_reveal.get(),
-                    )
-
-                    self.status_label.config(
-                        text=(
-                            f"Status: {data['status']} | "
-                            f"Bit Step: {data['steps']}/{data['depth']}"
-                        )
                     )
 
                 elif event[0] == "arduino":
@@ -1576,6 +1700,7 @@ class App:
         except queue.Empty:
             pass
 
+        self._refresh_registers()
         self.window.after(30, self._poll)
 
     def _close(self):
