@@ -1,33 +1,13 @@
 """
-Bit-Pooling Oracle Lock Box Lab
-Python + Arduino SHA-256 proof-of-work miner.
-
-Protocol:
-    PC -> Arduino:  DIFF <0-256>\\n
-    Arduino -> PC:  POW:<nonce>:<64 hex hash>:<padded message>:<padded nonce>
-                        :<padded hash>:<header>\\n
-                    (the only unprompted output)
-
-Pressing "Send Difficulty" sends DIFF to the Arduino, which starts mining
-SHA256(DATA + nonce) straight away and replies with the proof of work.
-
-At the same moment, the camera bit-pooling oracle starts working in the
-background on its own. It does not read anything from the Arduino: it
-searches for the same proof of work itself, then loads the minimally padded
-SHA-256 message block (header + nonce + 0x80 + zeros + 64-bit bit length)
-into the bit-pooling register and reconstructs it bit by bit. The message,
-nonce and hash are decoded purely from the reconstructed bits. The oracle's
-result and the Arduino's result are each stored with their elapsed time and
-compared once both exist.
-
-Install dependencies:
-    pip install pyserial opencv-python numpy
+Bit-Pooling Higher-Lower Search & Circuit Camera Lab
+(Tkinter / OpenCV Framework with Visual Bit Registers, Serial-Hex Receive & Forced Serial Read)
+Adapted from the RP-style optoelectronic decision circuit framework.
 """
 
 import asyncio
-import hashlib
 import queue
-import secrets
+import random
+import re
 import sys
 import threading
 import time
@@ -37,47 +17,168 @@ from tkinter import ttk, messagebox
 import numpy as np
 
 try:
-    import serial
-    import serial.tools.list_ports
-except ImportError:
-    serial = None
-    serial_tools = None
-else:
-    serial_tools = serial.tools
-
-try:
     import cv2
 except ImportError:
     cv2 = None
 
-
-PASSCODE_BITS = 256
-PASSCODE_BYTES = PASSCODE_BITS // 8
-PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
 
 
 # ==============================================================================
-# 256-BIT BIT-POOLING ORACLE
+# SERIAL RECEIVER (serial port -> hex input)
 # ==============================================================================
+START_CMD = b"start\n"   # sent once before reading; change terminator here if needed
 
+# Sizes / padding, matching sha256_challenge.ino
+CHALLENGE_BYTES = 32                    # 256-bit challenge -> 64 hex chars
+NONCE_BYTES = 8                         # 64-bit nonce      -> 16 hex chars
+HASH_BYTES = 32                         # SHA-256 digest    -> 64 hex chars
+BIT_DEPTH = CHALLENGE_BYTES * 8         # 256 bits
+HEX_DIGITS = CHALLENGE_BYTES * 2        # 64
+
+
+def pad_hex(value: int, nbytes: int) -> str:
+    """Fixed-width, zero-padded, UPPERCASE hex with no prefix (as the Arduino sends/expects)."""
+    return f"{value:0{nbytes * 2}X}"
+
+
+class SerialReceiver:
+    """Serial channel. Receives hex; only ever transmits the START command."""
+    def __init__(self):
+        self._port = None
+        self.port_name = None
+        self.baud = 115200
+
+    @staticmethod
+    def list_ports():
+        if serial is None:
+            return []
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+    @property
+    def is_open(self):
+        return self._port is not None
+
+    def open(self, name, baud=115200):
+        self.close()
+        if serial is None:
+            raise RuntimeError("pyserial is not installed. Run: pip install pyserial")
+        self._port = serial.Serial(name, baud, timeout=0)
+        self.port_name = name
+        self.baud = baud
+
+    def close(self):
+        if self._port is not None:
+            try:
+                self._port.close()
+            except Exception:
+                pass
+        self._port = None
+        self.port_name = None
+
+    def send_start(self):
+        """Send the START command so the device begins sending hex."""
+        if self._port is None:
+            return False
+        try:
+            self._port.write(START_CMD)
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def poll(self) -> bytes:
+        """Return any bytes that arrived since the last call."""
+        if self._port is None:
+            return b""
+        try:
+            n = self._port.in_waiting
+            return self._port.read(n) if n else b""
+        except Exception:
+            self.close()
+            return b""
+
+
+# ==============================================================================
+# MESSAGE EXTRACTOR (serial text lines -> fields)
+# ==============================================================================
+class MessageExtractor:
+    """
+    Reassembles newline-terminated serial lines and extracts protocol fields:
+        POW:<64-hex challenge>:<difficulty>
+        SOLUTION:<16-hex nonce>:<64-hex hash>
+        LOCKBOX_READY | DISARMED | REJECTED
+    feed() returns a list of dicts, each with a "kind" key.
+    """
+    POW_RE = re.compile(rf"^POW:([0-9A-Fa-f]{{{HEX_DIGITS}}}):(\d{{1,3}})$")
+    SOL_RE = re.compile(rf"^SOLUTION:([0-9A-Fa-f]{{{NONCE_BYTES * 2}}}):([0-9A-Fa-f]{{{HASH_BYTES * 2}}})$")
+    STATUS = ("LOCKBOX_READY", "DISARMED", "REJECTED")
+    MAX_LINE = 256
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._overflow = False
+
+    def reset(self):
+        self._buf.clear()
+        self._overflow = False
+
+    def feed(self, data: bytes):
+        out = []
+        for b in data:
+            if b == 0x0A:                                   # '\n' ends a message
+                if not self._overflow:
+                    msg = self._parse(bytes(self._buf).decode("ascii", "replace").strip())
+                    if msg is not None:
+                        out.append(msg)
+                self._buf.clear()
+                self._overflow = False
+            elif len(self._buf) < self.MAX_LINE:
+                self._buf.append(b)
+            else:
+                self._overflow = True                       # discard the rest of a runaway line
+        return out
+
+    def _parse(self, line: str):
+        if not line:
+            return None
+        m = self.POW_RE.match(line)
+        if m:
+            difficulty = int(m.group(2))
+            if difficulty > BIT_DEPTH:
+                return dict(kind="BAD", text=line)
+            challenge = bytes.fromhex(m.group(1))
+            return dict(kind="POW", challenge=challenge,
+                        hex=m.group(1).upper(), difficulty=difficulty)
+        m = self.SOL_RE.match(line)
+        if m:
+            return dict(kind="SOLUTION", nonce=bytes.fromhex(m.group(1)),
+                        hash=bytes.fromhex(m.group(2)),
+                        nonce_hex=m.group(1).upper(), hash_hex=m.group(2).upper())
+        if line in self.STATUS:
+            return dict(kind="STATUS", text=line)
+        if line.startswith(("POW:", "SOLUTION:")):
+            return dict(kind="BAD", text=line)              # right prefix, wrong size/format
+        return dict(kind="TEXT", text=line)
+
+
+# ==============================================================================
+# BIT-POOLING HIGHER-LOWER ORACLE CLASS
+# ==============================================================================
 class BitPoolingOracle:
     """
-    Stores a hidden target and answers higher-or-equal queries.
-
-    The search engine reconstructs the target one bit at a time, MSB first.
+    Encapsulates the secret target and uses bit-pooling across successive
+    frames/queries to accumulate bits MSB-first, mimicking the optoelectronic circuit.
     """
-
-    def __init__(self, bit_depth: int = PASSCODE_BITS, target=None):
-        if not isinstance(bit_depth, int) or bit_depth < 1:
-            raise ValueError("bit_depth must be a positive integer.")
-
+    def __init__(self, bit_depth=BIT_DEPTH, target=None):
         self.bit_depth = bit_depth
         self.max_val = (1 << bit_depth) - 1
-
-        if target is None:
-            target = secrets.randbits(bit_depth)
-
-        self._target = int(target) & self.max_val
+        self._target = (int(np.clip(target, 0, self.max_val))
+                        if target is not None else random.randint(0, self.max_val))
 
         self.kernel_size = 4
         self.stride = 2
@@ -88,515 +189,140 @@ class BitPoolingOracle:
         self.pooled_count = 0
         self.is_done = False
 
-    def query_bit(self, trial_val: int) -> int:
-        """Returns 1 if the hidden target is greater than or equal to trial_val."""
+    def reveal(self):
+        return self._target if self.is_done else 0
+
+    def query_bit(self, trial_val):
+        """Is the secret target >= the trial value?"""
         if self.is_done:
             return 0
-
         return 1 if self._target >= trial_val else 0
 
-    def pool_step(self, val: int) -> int:
-        """Applies the selected pooling operator to the current guess."""
+    def pool_step(self, val):
+        """Applies hardware-style bit pooling (kernel, stride, operator) to a value."""
         bits = [(val >> i) & 1 for i in range(self.bit_depth)]
+
         pooled_out = []
-
         for i in range(0, len(bits), self.stride):
-            block = bits[i:i + self.kernel_size]
-
+            block = bits[i: i + self.kernel_size]
             if not block:
                 break
 
             if self.pool_op == "POPCOUNT":
-                result = sum(block) / len(block)
-                output_bit = 1 if result >= self.schmitt_trigger else 0
+                res_bit = 1 if (sum(block) / len(block)) >= self.schmitt_trigger else 0
             elif self.pool_op == "AND":
-                output_bit = 1 if all(b == 1 for b in block) else 0
+                res_bit = 1 if all(b == 1 for b in block) else 0
             elif self.pool_op == "OR":
-                output_bit = 1 if any(b == 1 for b in block) else 0
+                res_bit = 1 if any(b == 1 for b in block) else 0
             elif self.pool_op == "XOR":
-                output_bit = sum(block) % 2
+                res_bit = sum(block) % 2
             elif self.pool_op == "MAJORITY":
-                output_bit = 1 if sum(block) > (len(block) / 2.0) else 0
+                res_bit = 1 if sum(block) > (len(block) / 2.0) else 0
             else:
-                output_bit = block[0]
+                res_bit = block[0]
 
-            pooled_out.append(output_bit)
+            pooled_out.append(res_bit)
 
-        output_value = 0
-        for index, bit in enumerate(pooled_out):
-            output_value |= bit << index
-
-        return output_value
+        out_val = 0
+        for idx, b in enumerate(pooled_out):
+            out_val |= (b << idx)
+        return out_val
 
     @property
-    def target(self) -> int:
-        """The target remains hidden until the full bit depth is reconstructed."""
+    def target(self):
+        """Raises PermissionError if accessed before search completion."""
         if not self.is_done:
-            raise PermissionError(
-                "SECURITY VIOLATION: Oracle target is classified until fully pooled."
-            )
-
+            raise PermissionError("SECURITY VIOLATION: Oracle target is classified until fully pooled!")
         return self._target
 
 
 # ==============================================================================
-# BIT-POOLING SEARCH ENGINE (variable bit depth)
+# BIT-POOLING SEARCH ENGINE
 # ==============================================================================
-
 class BitPoolingSearchEngine:
-    def __init__(self, bit_depth: int = PASSCODE_BITS):
-        if not isinstance(bit_depth, int) or bit_depth < 1:
-            raise ValueError("bit_depth must be a positive integer.")
-
+    def __init__(self, bit_depth=BIT_DEPTH):
         self.bit_depth = bit_depth
         self.max_val = (1 << bit_depth) - 1
 
-        # The camera thread, the GUI and the background oracle all touch the
-        # engine, so reset/step are serialised.
-        self._lock = threading.RLock()
-
-        self.oracle = BitPoolingOracle(self.bit_depth)
-        self.current_guess = 0
-        self.step_count = 0
-        self.history = [0]
-        self.converged = False
-        self.last_status = "INITIALIZED"
-
+        # Hardware & pooling settings (persist across resets)
         self.kernel_size = 4
         self.stride = 2
         self.pool_op = "POPCOUNT"
         self.schmitt_trigger = 0.5
 
-        self.guess_reg = 0
-        self.target_reg = 0
-        self.pooled_register = 0
+        self.oracle = None
+        self.reset()
 
-        self._update_registers()
-
-    def _reset(self, new_target=None, bit_depth=None):
-        if bit_depth is not None:
-            if not isinstance(bit_depth, int) or bit_depth < 1:
-                raise ValueError("bit_depth must be a positive integer.")
-            self.bit_depth = bit_depth
-            self.max_val = (1 << bit_depth) - 1
-
+    def reset(self, new_target=None):
         self.oracle = BitPoolingOracle(self.bit_depth, new_target)
         self.oracle.kernel_size = self.kernel_size
+        self.oracle.stride = self.stride
         self.oracle.pool_op = self.pool_op
         self.oracle.schmitt_trigger = self.schmitt_trigger
 
         self.current_guess = 0
         self.step_count = 0
-        self.history = [0]
+        self.history = [self.current_guess]
         self.converged = False
         self.last_status = "READY"
         self._update_registers()
 
-    def _step(self):
-        """Advances the bit-pooling search by one bit."""
+    def step(self):
+        """Advances the bit-pooling search by evaluating one bit per step."""
         if self.converged or self.step_count >= self.bit_depth:
             return
 
         self.step_count += 1
 
         shift = self.bit_depth - self.step_count
-        trial_value = self.oracle.pooled_bits | (1 << shift)
+        trial_val = self.oracle.pooled_bits | (1 << shift)
 
-        bit = self.oracle.query_bit(trial_value)
-
-        if bit:
-            self.oracle.pooled_bits |= 1 << shift
-
+        bit = self.oracle.query_bit(trial_val)
+        self.oracle.pooled_bits |= (bit << shift)
         self.current_guess = self.oracle.pooled_bits
+
         self.history.append(self.current_guess)
-        self._update_registers()
 
         if self.step_count >= self.bit_depth:
-            self.oracle.is_done = True
-            self.converged = True
-
             if self.current_guess == self.oracle._target:
-                self.last_status = "LOCKED & REVEALED"
+                self.oracle.is_done = True
+                self.converged = True
+                self.last_status = f"LOCKED & REVEALED AT {self.current_guess}"
             else:
-                self.last_status = "RECONSTRUCTION MISMATCH"
+                self.last_status = "POOL MISMATCH"
 
-    def reset(self, new_target=None, bit_depth=None):
-        with self._lock:
-            self._reset(new_target, bit_depth)
-
-    def step(self):
-        """Advances the bit-pooling search by one bit."""
-        with self._lock:
-            self._step()
-
-    def result(self):
-        """(guess, converged, bit_depth) read atomically."""
-        with self._lock:
-            return self.current_guess, self.converged, self.bit_depth
+        self._update_registers()
 
     def _update_registers(self):
         self.guess_reg = self.current_guess
-
         try:
             self.target_reg = self.oracle.target
         except PermissionError:
             self.target_reg = 0
-
         self.pooled_register = self.oracle.pool_step(self.current_guess)
 
 
 # ==============================================================================
-# SHA-256 PROOF OF WORK + MINIMAL PADDING
+# CAMERA SOURCE HANDLING
 # ==============================================================================
-
-POW_DATA = "arduino-sha256"  # must match inputData in sha256_challenge.ino
-MIN_DIFF = 0
-MAX_DIFF = 256
-
-
-def sha256_pad(msg: bytes) -> bytes:
-    """Minimal SHA-256 padding: msg, 0x80, zeros, 64-bit big-endian bit length."""
-    total = ((len(msg) + 9 + 63) // 64) * 64
-    return (
-        msg
-        + b"\x80"
-        + b"\x00" * (total - len(msg) - 9)
-        + (len(msg) * 8).to_bytes(8, "big")
-    )
-
-
-def sha256_unpad(padded: bytes) -> bytes:
-    """Inverse of sha256_pad. Raises ValueError if padding is not minimal/valid."""
-    if len(padded) < 64 or len(padded) % 64:
-        raise ValueError("not a whole number of 64-byte blocks")
-
-    length = int.from_bytes(padded[-8:], "big") // 8
-
-    if length > len(padded) - 9 or sha256_pad(padded[:length]) != padded:
-        raise ValueError("invalid padding")
-
-    return padded[:length]
-
-
-def message_text(padded: bytes) -> str:
-    try:
-        return sha256_unpad(padded).decode("ascii", errors="replace")
-    except ValueError:
-        return "<invalid padding>"
-
-
-class MiningSession:
-    """
-    One difficulty send. Holds what the background oracle found and what the
-    Arduino returned, each with its elapsed time since the difficulty was
-    sent, and publishes a snapshot to the GUI whenever either one arrives.
-    """
-
-    def __init__(self, diff: int, data: str, out):
-        self.diff = diff
-        self.data = data
-        self.out = out
-        self.cancel = threading.Event()
-        self.t0 = time.perf_counter()
-        self._lock = threading.Lock()
-        self.predicted = None
-        self.arduino = None
-
-    def _record(self, nonce: int, hash_int: int, padded: bytes) -> dict:
-        return {
-            "nonce": nonce,
-            "hash": hash_int,
-            "padded": padded,
-            "message": message_text(padded),
-            "elapsed": time.perf_counter() - self.t0,
-        }
-
-    def set_predicted(self, nonce: int, hash_int: int, padded: bytes):
-        if self.cancel.is_set():
-            return
-
-        with self._lock:
-            self.predicted = self._record(nonce, hash_int, padded)
-
-        self.out.put(("pow_update", self.snapshot()))
-
-    def set_arduino(self, nonce: int, hash_int: int, padded: bytes):
-        if self.cancel.is_set():
-            return
-
-        with self._lock:
-            self.arduino = self._record(nonce, hash_int, padded)
-
-        self.out.put(("pow_update", self.snapshot()))
-
-    def snapshot(self) -> dict:
-        with self._lock:
-            predicted = dict(self.predicted) if self.predicted else None
-            arduino = dict(self.arduino) if self.arduino else None
-
-        match = None
-
-        if predicted is not None and arduino is not None:
-            match = (
-                predicted["nonce"] == arduino["nonce"]
-                and predicted["hash"] == arduino["hash"]
-                and predicted["padded"] == arduino["padded"]
-            )
-
-        return {
-            "diff": self.diff,
-            "predicted": predicted,
-            "arduino": arduino,
-            "match": match,
-        }
-
-
-class BackgroundPredictor(threading.Thread):
-    """
-    The camera oracle's background worker. It runs independently of the
-    Arduino link: it searches for the same proof of work (SHA256(DATA + nonce),
-    nonce counting up from 0), loads the minimally padded message block into
-    the bit-pooling engine as the hidden target, lets the engine reconstruct
-    it one bit at a time, then decodes message, nonce and hash from the
-    reconstructed bits alone.
-    """
-
-    def __init__(self, session: MiningSession, engine: BitPoolingSearchEngine):
-        super().__init__(daemon=True)
-        self.session = session
-        self.engine = engine
-
-    def run(self):
-        session = self.session
-        base = hashlib.sha256(session.data.encode("ascii"))
-        limit = 1 << (256 - session.diff)  # leading-zero test: value < limit
-
-        nonce = 0
-        found = None
-
-        while nonce <= 0xFFFFFFFF:
-            if (nonce & 0xFFF) == 0 and session.cancel.is_set():
-                return
-
-            h = base.copy()
-            h.update(str(nonce).encode("ascii"))
-            value = int.from_bytes(h.digest(), "big")
-
-            if value < limit:
-                found = value
-                break
-
-            nonce += 1
-
-        if found is None or session.cancel.is_set():
-            return
-
-        # The oracle's pre-knowledge: the exact message that was hashed, in
-        # its minimal SHA-256 padded form, becomes the hidden target.
-        message = (session.data + str(nonce)).encode("ascii")
-        padded = sha256_pad(message)
-        depth = len(padded) * 8
-
-        self.engine.reset(int.from_bytes(padded, "big"), depth)
-
-        while not session.cancel.is_set() and not self.engine.converged:
-            self.engine.step()
-
-        if session.cancel.is_set():
-            return
-
-        # Decode purely from the reconstructed bits.
-        guess, converged, depth = self.engine.result()
-
-        if not converged:
-            return
-
-        decoded = guess.to_bytes(depth // 8, "big")
-
-        try:
-            msg = sha256_unpad(decoded)
-            nonce_out = int(msg[len(session.data):])
-        except ValueError:
-            return
-
-        hash_out = int.from_bytes(hashlib.sha256(msg).digest(), "big")
-        session.set_predicted(nonce_out, hash_out, decoded)
-
-
-# ==============================================================================
-# ARDUINO MINER LINK
-# ==============================================================================
-
-class ArduinoMiner:
-    """
-    Serial link to the Arduino SHA-256 miner.
-
-        PC -> Arduino: DIFF <bits>\\n
-        Arduino -> PC: POW:<nonce>:<hash>:<padded msg>:<padded nonce>
-                           :<padded hash>:<header>\\n
-
-    Owned by a single thread, so no locking is needed.
-    """
-
-    def __init__(
-        self,
-        port: str,
-        baudrate: int = 115200,
-        timeout: float = 0.2,
-    ):
-        if serial is None:
-            raise RuntimeError(
-                "pyserial is not installed. Run: pip install pyserial"
-            )
-
-        self.ser = serial.Serial(port, baudrate, timeout=timeout)
-
-        # Most boards reset when the port opens; give the sketch time to boot.
-        time.sleep(2.0)
-        self.ser.reset_input_buffer()
-
-    @staticmethod
-    def list_ports():
-        if serial_tools is None:
-            return []
-
-        return [
-            device.device
-            for device in serial_tools.list_ports.comports()
-        ]
-
-    def close(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-
-    def send_diff(self, diff: int):
-        self.ser.write(f"DIFF {int(diff)}\n".encode("ascii"))
-        self.ser.flush()
-
-    def read_pow(self):
-        """
-        Parses POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
-        Returns (nonce, hash_int, padded_message_bytes) or None.
-        The header may contain colons, so it is the unsplit remainder.
-        """
-        raw = self.ser.readline()
-
-        if not raw:
-            return None
-
-        line = raw.decode("ascii", errors="ignore").strip()
-
-        if not line.startswith("POW:"):
-            return None
-
-        parts = line.split(":", 6)
-
-        if len(parts) != 7 or len(parts[2]) != 64:
-            return None
-
-        try:
-            return (
-                int(parts[1]),
-                int(parts[2], 16),
-                bytes.fromhex(parts[3]),
-            )
-        except ValueError:
-            return None
-
-
-class ArduinoThread(threading.Thread):
-    def __init__(self, port, ctl, out, engine):
-        super().__init__(daemon=True)
-        self.port = port
-        self.ctl = ctl
-        self.out = out
-        self.engine = engine
-        self.commands = queue.Queue()
-        self.session = None
-
-    def request_diff(self, diff: int):
-        self.commands.put(diff)
-
-    def _start_session(self, miner: ArduinoMiner, diff: int):
-        if self.session is not None:
-            self.session.cancel.set()
-
-        session = MiningSession(diff, POW_DATA, self.out)
-        self.session = session
-
-        # Arduino and oracle are started together and then run on their own.
-        miner.send_diff(diff)
-        BackgroundPredictor(session, self.engine).start()
-
-        self.out.put(("pow_update", session.snapshot()))
-
-    def run(self):
-        miner = None
-
-        try:
-            miner = ArduinoMiner(self.port)
-            self.out.put((
-                "arduino",
-                "Connected. Set a difficulty and press Send Difficulty.",
-            ))
-
-            while not self.ctl["arduino_stop"]:
-                try:
-                    while True:
-                        self._start_session(miner, self.commands.get_nowait())
-                except queue.Empty:
-                    pass
-
-                result = miner.read_pow()
-
-                if result is not None and self.session is not None:
-                    self.session.set_arduino(*result)
-
-        except Exception as e:
-            self.out.put((
-                "arduino_error",
-                f"{type(e).__name__}: {e}",
-            ))
-
-        finally:
-            if self.session is not None:
-                self.session.cancel.set()
-
-            if miner is not None:
-                miner.close()
-
-            self.out.put(("arduino", "Disconnected."))
-
-
-# ==============================================================================
-# CAMERA SOURCE
-# ==============================================================================
-
 class Source:
     def __init__(self, index: int):
         if cv2 is None:
-            raise RuntimeError(
-                "OpenCV is not installed. Run: pip install opencv-python"
-            )
-
+            raise RuntimeError("OpenCV is not installed. Run: pip install opencv-python")
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(index, backend)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
         if not (cap.isOpened() and cap.read()[0]):
             cap.release()
             raise RuntimeError(f"Cannot open camera {index}.")
-
         self.cap = cap
         self.rgb = None
 
     def read(self):
         ok, bgr = self.cap.read()
-
         if not ok:
             return None
-
         self.rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
@@ -606,17 +332,13 @@ class Source:
 
 def ppm_photo(rgb: np.ndarray) -> tk.PhotoImage:
     h, w, _ = rgb.shape
-    data = (
-        b"P6 %d %d 255\n" % (w, h)
-        + np.ascontiguousarray(rgb, np.uint8).tobytes()
-    )
+    data = b"P6 %d %d 255\n" % (w, h) + np.ascontiguousarray(rgb, np.uint8).tobytes()
     return tk.PhotoImage(data=data, format="PPM")
 
 
 # ==============================================================================
-# CAMERA THREAD
+# BACKGROUND SIMULATION THREAD
 # ==============================================================================
-
 class SimThread(threading.Thread):
     def __init__(self, cam_index, ctl, out, engine):
         super().__init__(daemon=True)
@@ -630,843 +352,572 @@ class SimThread(threading.Thread):
 
     async def _run(self):
         ctl, out, engine = self.ctl, self.out, self.engine
-
         try:
             src = Source(self.cam_index)
         except RuntimeError as e:
             out.put(("error", str(e)))
             out.put(("done", None))
             return
+        out.put(("info", f"USB camera {self.cam_index} opened"))
 
-        out.put(("info", f"USB camera {self.cam_index} opened."))
-        out.put(("camera_started", None))
-
-        previous_time = time.perf_counter()
-        frame_index = 0
-        previous_even = False
-
+        t_prev = time.perf_counter()
+        idx = 0
+        prev_even = False
         try:
             while not ctl["stop"]:
                 gray = await asyncio.to_thread(src.read)
-
                 if gray is None:
-                    out.put((
-                        "info",
-                        "Camera stopped delivering frames.",
-                    ))
+                    out.put(("info", "camera stopped delivering frames"))
                     break
-
                 now = time.perf_counter()
-                dt = min(max(now - previous_time, 1e-3), 0.25)
-                previous_time = now
+                dt = min(max(now - t_prev, 1e-3), 0.25)
+                t_prev = now
 
-                small = cv2.resize(
-                    gray, (128, 96), interpolation=cv2.INTER_AREA
-                )
-                motion_detected = (
-                    frame_index > 5 and np.std(small) > 5.0
-                )
-                motion_value = (
-                    int(np.std(small) * 10)
-                    if motion_detected
-                    else 0
-                )
+                small = cv2.resize(gray, (128, 96), interpolation=cv2.INTER_AREA)
+                motion_detected = idx > 5 and np.std(small) > 5.0
+                x = int(np.std(small) * 10) if motion_detected else 0
 
-                even_now = motion_value > 0 and motion_value % 2 == 0
-                even_state = even_now and previous_even
-                previous_even = even_now
+                # Two sequential even motion triggers advance the bit-pooling step
+                even_now = x > 0 and x % 2 == 0
+                even_state = even_now and prev_even
+                prev_even = even_now
 
-                if (
-                    even_state
-                    and ctl.get("auto_step", True)
-                    and not engine.converged
-                ):
+                if even_state and ctl.get("auto_step", True) and not engine.converged:
                     engine.step()
 
-                rgb = src.rgb
-
-                if rgb is None:
-                    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
-                if rgb.ndim == 2:
-                    rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
-                elif rgb.shape[2] == 4:
-                    rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2RGB)
-
-                preview = cv2.resize(
-                    rgb,
-                    (320, 240),
-                    interpolation=cv2.INTER_AREA,
-                ).copy()
+                rgb = src.rgb if src.rgb is not None else np.stack([gray] * 3, axis=-1)
+                pw, ph = 320, 240
+                h_img, w_img = rgb.shape[:2]
+                preview = rgb[np.arange(ph) * h_img // ph][:, np.arange(pw) * w_img // pw].copy()
 
                 if ctl.get("ir_heatmap", False):
-                    preview[:, :, 0] = np.clip(
-                        preview[:, :, 0].astype(int) + 80,
-                        0,
-                        255,
-                    )
-                    preview[:, :, 2] = np.clip(
-                        preview[:, :, 2].astype(int) - 50,
-                        0,
-                        255,
-                    )
+                    preview[:, :, 0] = np.clip(preview[:, :, 0].astype(int) + 80, 0, 255)
+                    preview[:, :, 2] = np.clip(preview[:, :, 2].astype(int) - 50, 0, 255)
 
-                exposed_target = (
-                    engine.oracle._target
-                    if (
-                        engine.converged
-                        or ctl.get("force_reveal", False)
-                    )
-                    else 0
-                )
+                # Target exposed on convergence, or once a forced serial read loaded it
+                exposed_target = (engine.oracle._target
+                                  if (engine.converged or ctl.get("serial_loaded", False)) else 0)
 
-                out.put((
-                    "frame",
-                    {
-                        "preview": preview,
-                        "idx": frame_index,
-                        "dt": dt,
-                        "target": exposed_target,
-                        "guess": engine.current_guess,
-                        "pooled": engine.pooled_register,
-                        "status": engine.last_status,
-                        "steps": engine.step_count,
-                        "depth": engine.bit_depth,
-                        "history": list(engine.history),
-                        "converged": engine.converged,
-                    },
-                ))
-
-                frame_index += 1
+                out.put(("frame", dict(
+                    preview=preview, idx=idx, dt=dt, target=exposed_target,
+                    guess=engine.current_guess, pooled=engine.pooled_register,
+                    status=engine.last_status, steps=engine.step_count,
+                    history=list(engine.history), converged=engine.converged
+                )))
+                idx += 1
                 await asyncio.sleep(0.03)
-
         finally:
             src.close()
             out.put(("done", None))
 
 
 # ==============================================================================
-# MAIN GUI
+# MAIN GUI APPLICATION
 # ==============================================================================
-
 class App:
     def __init__(self, window):
         self.window = window
-        self.window.title(
-            "Bit-Pooling Oracle Lock Box Lab — Padded Message Decoder"
-        )
-
+        self.window.title("Bit-Pooling Oracle Search Lab — Serial-Hex Input")
         self.q = queue.Queue()
-        self.ctl = {
-            "stop": False,
-            "ir_heatmap": False,
-            "auto_step": True,
-            "force_reveal": False,
-            "arduino_stop": False,
-        }
-
-        self.engine = BitPoolingSearchEngine(
-            bit_depth=PASSCODE_BITS
-        )
-        self.camera_thread = None
-        self.camera_ready = False
-        self.pending_diff = None
-        self.arduino_thread = None
+        self.ctl = dict(stop=False, ir_heatmap=False, auto_step=True, serial_loaded=False)
+        self.engine = BitPoolingSearchEngine(bit_depth=BIT_DEPTH)
+        self.serial = SerialReceiver()
+        self.extractor = MessageExtractor()
+        self.rx_buf = b""          # last extracted challenge (32 bytes)
+        self.rx_difficulty = None  # difficulty from the last POW message
+        self.rx_nonce = b""        # nonce from the last SOLUTION message (8 bytes)
+        self.rx_hash = b""         # hash from the last SOLUTION message (32 bytes)
+        self.rx_status = ""        # last LOCKBOX_READY / DISARMED / REJECTED line
+        self.thread = None
+        self.photo = None
 
         self._build_ui()
+        self._draw_current()
+        self._update_msg_dump()
         self.window.protocol("WM_DELETE_WINDOW", self._close)
         self.window.after(15, self._poll)
 
+    # ---------------------------------------------------------------- UI
     def _build_ui(self):
         main_frame = ttk.Frame(self.window, padding=10)
         main_frame.pack(fill="both", expand=True)
 
-        # Laboratory controls
-        control_frame = ttk.LabelFrame(
-            main_frame, text="Laboratory Controls"
-        )
-        control_frame.pack(fill="x", padx=5, pady=5)
+        ctrl_frame = ttk.LabelFrame(main_frame, text="Laboratory Controls")
+        ctrl_frame.pack(fill="x", padx=5, pady=5)
 
-        ttk.Button(
-            control_frame,
-            text="Start Camera",
-            command=self.start_camera,
-        ).pack(side="left", padx=5, pady=5)
-
-        ttk.Button(
-            control_frame,
-            text="Stop Camera",
-            command=self.stop_camera,
-        ).pack(side="left", padx=5, pady=5)
-
-        ttk.Button(
-            control_frame,
-            text="Step Bit Pool",
-            command=self.step_search,
-        ).pack(side="left", padx=5, pady=5)
-
-        ttk.Button(
-            control_frame,
-            text="Reset Pool",
-            command=self.reset_search,
-        ).pack(side="left", padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Start Lab", command=self.start_lab).pack(side="left", padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Stop Lab", command=self.stop_lab).pack(side="left", padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Step Bit Pool", command=self.step_search).pack(side="left", padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Reset Pool", command=self.reset_search).pack(side="left", padx=5, pady=5)
 
         self.v_ir = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            control_frame,
-            text="IR Thermal Heatmap",
-            variable=self.v_ir,
-            command=lambda: self.ctl.update(
-                ir_heatmap=self.v_ir.get()
-            ),
-        ).pack(side="left", padx=10)
+        ttk.Checkbutton(ctrl_frame, text="IR Thermal Heatmap", variable=self.v_ir,
+                        command=lambda: self.ctl.update(ir_heatmap=self.v_ir.get())).pack(side="left", padx=10)
 
-        # Arduino controls
-        arduino_frame = ttk.LabelFrame(
-            main_frame,
-            text="Arduino Miner — SHA-256 Proof of Work",
-        )
-        arduino_frame.pack(fill="x", padx=5, pady=5)
-
-        ttk.Label(
-            arduino_frame,
-            text="Serial port:",
-        ).pack(side="left", padx=5, pady=5)
-
-        self.v_arduino_port = tk.StringVar(value="COM3")
-        self.e_arduino_port = ttk.Entry(
-            arduino_frame,
-            width=14,
-            textvariable=self.v_arduino_port,
-        )
-        self.e_arduino_port.pack(side="left", padx=2, pady=5)
-
-        ttk.Button(
-            arduino_frame,
-            text="List Ports",
-            command=self.list_arduino_ports,
-        ).pack(side="left", padx=2, pady=5)
-
-        ttk.Button(
-            arduino_frame,
-            text="Connect Arduino",
-            command=self.connect_arduino,
-        ).pack(side="left", padx=10, pady=5)
-
-        ttk.Button(
-            arduino_frame,
-            text="Disconnect",
-            command=self.disconnect_arduino,
-        ).pack(side="left", padx=2, pady=5)
-
-        ttk.Label(
-            arduino_frame,
-            text="Difficulty (bits):",
-        ).pack(side="left", padx=(25, 5), pady=5)
-
-        self.v_diff = tk.StringVar(value="12")
-        ttk.Spinbox(
-            arduino_frame,
-            from_=MIN_DIFF,
-            to=MAX_DIFF,
-            width=5,
-            textvariable=self.v_diff,
-        ).pack(side="left", padx=2, pady=5)
-
-        ttk.Button(
-            arduino_frame,
-            text="Send Difficulty",
-            command=self.send_difficulty,
-        ).pack(side="left", padx=5, pady=5)
-
-        # Proof-of-work results
-        pow_frame = ttk.LabelFrame(
-            main_frame,
-            text="Proof of Work",
-        )
-        pow_frame.pack(fill="x", padx=5, pady=5)
-
-        self.v_link = tk.StringVar(value="Arduino: not connected")
-        self.v_pow_diff = tk.StringVar(value="")
-        self.v_pow_oracle = tk.StringVar(value="ORACLE   -")
-        self.v_pow_oracle_msg = tk.StringVar(value="")
-        self.v_pow_arduino = tk.StringVar(value="ARDUINO  -")
-        self.v_pow_arduino_msg = tk.StringVar(value="")
-        self.v_pow_match = tk.StringVar(value="")
-
-        for var in (
-            self.v_link,
-            self.v_pow_diff,
-            self.v_pow_oracle,
-            self.v_pow_oracle_msg,
-            self.v_pow_arduino,
-            self.v_pow_arduino_msg,
-            self.v_pow_match,
-        ):
-            # Read-only Entry: text can be selected and copied (Ctrl+C).
-            ttk.Entry(
-                pow_frame,
-                textvariable=var,
-                font=("Consolas", 10),
-                state="readonly",
-            ).pack(fill="x", padx=10, pady=1)
-
-        self.b_copy_pow = ttk.Button(
-            pow_frame,
-            text="Copy Proof of Work",
-            command=self.copy_pow,
-        )
-        self.b_copy_pow.pack(anchor="w", padx=10, pady=(3, 5))
-
-        # Local target controls
-        target_frame = ttk.LabelFrame(
-            main_frame,
-            text="Local 256-Bit Oracle Target (hexadecimal)",
-        )
+        # Serial-hex receive frame
+        target_frame = ttk.LabelFrame(main_frame, text="Serial-Hex Input (Receive Only)")
         target_frame.pack(fill="x", padx=5, pady=5)
 
-        self.target_label = ttk.Label(
-            target_frame,
-            text="Target (64 hex characters):",
-        )
-        self.target_label.pack(side="left", padx=5, pady=5)
+        ttk.Label(target_frame, text="Port:").pack(side="left", padx=(5, 2), pady=5)
+        self.port_combo = ttk.Combobox(target_frame, values=SerialReceiver.list_ports(), width=10)
+        self.port_combo.pack(side="left", padx=2, pady=5)
+        ttk.Button(target_frame, text="⟳", width=3, command=self._refresh_ports).pack(side="left", padx=1, pady=5)
 
-        self.v_custom_target = tk.StringVar(
-            value="[SECURE]"
-        )
-        self.e_custom_target = ttk.Entry(
-            target_frame,
-            width=72,
-            textvariable=self.v_custom_target,
-        )
-        self.e_custom_target.pack(
-            side="left", padx=5, pady=5
-        )
+        ttk.Label(target_frame, text="Baud:").pack(side="left", padx=(8, 2), pady=5)
+        self.baud_combo = ttk.Combobox(target_frame, values=[9600, 19200, 38400, 57600, 115200, 230400],
+                                       width=7)
+        self.baud_combo.set("115200")
+        self.baud_combo.pack(side="left", padx=2, pady=5)
 
-        ttk.Button(
-            target_frame,
-            text="Set Custom",
-            command=self.set_custom_target,
-        ).pack(side="left", padx=2, pady=5)
+        self.btn_connect = ttk.Button(target_frame, text="Connect", command=self.toggle_connect)
+        self.btn_connect.pack(side="left", padx=5, pady=5)
 
-        ttk.Button(
-            target_frame,
-            text="Randomize Target",
-            command=self.randomize_target,
-        ).pack(side="left", padx=5, pady=5)
+        ttk.Label(target_frame, text="RX Hex:").pack(side="left", padx=(10, 2), pady=5)
+        self.v_hex = tk.StringVar(value="")
+        self.e_hex = ttk.Entry(target_frame, width=24, textvariable=self.v_hex, state="readonly")
+        self.e_hex.pack(side="left", padx=2, pady=5)
 
-        self.v_reveal = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            target_frame,
-            text="Force Reveal Local Target",
-            variable=self.v_reveal,
-            command=lambda: self.ctl.update(
-                force_reveal=self.v_reveal.get()
-            ),
-        ).pack(side="left", padx=15, pady=5)
+        ttk.Button(target_frame, text="Randomize Target", command=self.randomize_target).pack(side="left", padx=5, pady=5)
 
-        # Camera and register display
+        self.v_force_serial = tk.BooleanVar(value=False)
+        self.chk_force_serial = ttk.Checkbutton(
+            target_frame, text="Force Serial Read", variable=self.v_force_serial,
+            command=self._on_force_serial)
+        self.chk_force_serial.pack(side="left", padx=10, pady=5)
+
+        # Viewport and registers
         display_frame = ttk.Frame(main_frame)
-        display_frame.pack(
-            fill="both", expand=True, padx=5, pady=5
-        )
+        display_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        camera_frame = ttk.LabelFrame(
-            display_frame,
-            text="Optoelectronic Circuit Camera Viewport",
-        )
-        camera_frame.pack(side="left", padx=5, pady=5)
-
-        self.cam_canvas = tk.Canvas(
-            camera_frame,
-            width=320,
-            height=240,
-            bg="black",
-        )
+        cam_frame = ttk.LabelFrame(display_frame, text="Optoelectronic Circuit Camera Viewport")
+        cam_frame.pack(side="left", padx=5, pady=5)
+        self.cam_canvas = tk.Canvas(cam_frame, width=320, height=240, bg="black")
         self.cam_canvas.pack(padx=5, pady=5)
-        self.cam_image_id = self.cam_canvas.create_image(
-            0, 0, anchor="nw"
-        )
+        self.cam_img_id = self.cam_canvas.create_image(0, 0, anchor="nw")
 
         right_panel = ttk.Frame(display_frame)
-        right_panel.pack(
-            side="right",
-            fill="both",
-            expand=True,
-            padx=5,
-            pady=5,
-        )
+        right_panel.pack(side="right", fill="both", expand=True, padx=5, pady=5)
 
-        register_frame = ttk.LabelFrame(
-            right_panel,
-            text="Bit-Pooling Registers",
-        )
-        register_frame.pack(
-            fill="both", expand=True, padx=5, pady=5
-        )
+        reg_frame = ttk.LabelFrame(right_panel, text="Bit-Pooling Hardware Registers")
+        reg_frame.pack(fill="x", padx=5, pady=5)
 
-        self.register_canvas = tk.Canvas(
-            register_frame,
-            width=760,
-            height=300,
-            bg="#121414",
-            highlightthickness=0,
-        )
-        self.register_canvas.pack(
-            padx=5, pady=5
-        )
+        self.reg_canvas = tk.Canvas(reg_frame, width=480, height=140, bg="#121414", highlightthickness=0)
+        self.reg_canvas.pack(padx=5, pady=5)
 
-        self.status_label = ttk.Label(
-            register_frame,
-            text="Status: IDLE",
-            font=("Consolas", 11),
-            foreground="#00e5ff",
-        )
-        self.status_label.pack(
-            anchor="w", padx=10, pady=5
-        )
+        # Selectable / copyable text view of the registers (hex + binary)
+        dump_frame = ttk.LabelFrame(reg_frame, text="Register Dump (select / copy)")
+        dump_frame.pack(fill="x", padx=5, pady=(0, 5))
 
-        # Pooling settings
-        settings_frame = ttk.LabelFrame(
-            right_panel,
-            text="Pooling & Algorithm Settings",
-        )
-        settings_frame.pack(
-            fill="both",
-            expand=True,
-            padx=5,
-            pady=5,
-        )
+        dump_body = ttk.Frame(dump_frame)
+        dump_body.pack(fill="x", padx=5, pady=5)
+        self.txt_dump = tk.Text(dump_body, width=56, height=14, wrap="char",
+                                font=("Consolas", 9), bg="#121414", fg="#d2e0f0",
+                                insertbackground="#d2e0f0", selectbackground="#38445c",
+                                relief="flat", undo=False)
+        dump_scroll = ttk.Scrollbar(dump_body, orient="vertical", command=self.txt_dump.yview)
+        self.txt_dump.configure(yscrollcommand=dump_scroll.set)
+        self.txt_dump.pack(side="left", fill="x", expand=True)
+        dump_scroll.pack(side="right", fill="y")
+        self._dump_text = None
+        self.txt_dump.bind("<Key>", self._dump_key)
+        self.txt_dump.bind("<Button-1>", lambda e: self.txt_dump.focus_set())
 
-        ttk.Label(
-            settings_frame,
-            text="Pooling Operator:",
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=5,
-        )
+        self._menu_target = self.txt_dump
+        self.dump_menu = tk.Menu(self.window, tearoff=0)
+        self.dump_menu.add_command(label="Copy", command=self._copy_selection)
+        self.dump_menu.add_command(label="Select All", command=self._select_all_dump)
+        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.txt_dump.bind(seq, self._dump_popup)
 
-        self.operator_combo = ttk.Combobox(
-            settings_frame,
-            values=[
-                "POPCOUNT",
-                "AND",
-                "OR",
-                "XOR",
-                "MAJORITY",
-            ],
-            state="readonly",
-        )
-        self.operator_combo.set("POPCOUNT")
-        self.operator_combo.grid(
-            row=0, column=1, padx=5, pady=5
-        )
-        self.operator_combo.bind(
-            "<<ComboboxSelected>>",
-            self._update_pool_operator,
-        )
+        dump_btns = ttk.Frame(dump_frame)
+        dump_btns.pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Button(dump_btns, text="Copy Hex", command=lambda: self._copy_registers("hex")).pack(side="left", padx=2)
+        ttk.Button(dump_btns, text="Copy Binary", command=lambda: self._copy_registers("bin")).pack(side="left", padx=2)
+        ttk.Button(dump_btns, text="Copy All", command=lambda: self._copy_registers("all")).pack(side="left", padx=2)
 
-        ttk.Label(
-            settings_frame,
-            text="Kernel Size:",
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=5,
-        )
+        # Protocol message dump: the POW / SOLUTION lines and fields from sha256_challenge.ino
+        msg_frame = ttk.LabelFrame(reg_frame, text="Protocol Messages: Nonce / Message (select / copy)")
+        msg_frame.pack(fill="x", padx=5, pady=(0, 5))
 
-        self.kernel_spin = ttk.Spinbox(
-            settings_frame,
-            from_=2,
-            to=8,
-            increment=2,
-            width=5,
-            command=self._update_kernel,
-        )
+        self.txt_msg = tk.Text(msg_frame, width=58, height=12, wrap="char",
+                               font=("Consolas", 9), bg="#121414", fg="#d2e0f0",
+                               insertbackground="#d2e0f0", selectbackground="#38445c",
+                               relief="flat", undo=False)
+        self.txt_msg.pack(fill="x", padx=5, pady=5)
+        self._msg_text = None
+        self._msg_parts = {}
+        self.txt_msg.bind("<Key>", self._dump_key)
+        self.txt_msg.bind("<Button-1>", lambda e: self.txt_msg.focus_set())
+        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.txt_msg.bind(seq, self._dump_popup)
+
+        msg_btns = ttk.Frame(msg_frame)
+        msg_btns.pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Button(msg_btns, text="Copy POW", command=lambda: self._copy_msg("pow")).pack(side="left", padx=2)
+        ttk.Button(msg_btns, text="Copy Nonce", command=lambda: self._copy_msg("nonce")).pack(side="left", padx=2)
+        ttk.Button(msg_btns, text="Copy SOLUTION", command=lambda: self._copy_msg("solution")).pack(side="left", padx=2)
+        ttk.Button(msg_btns, text="Copy All", command=lambda: self._copy_msg("all")).pack(side="left", padx=2)
+
+        self.lbl_status = ttk.Label(reg_frame, text="Status: IDLE", font=("Consolas", 11), foreground="#00e5ff")
+        self.lbl_status.pack(anchor="w", padx=10, pady=(5, 0))
+        self.lbl_serial = ttk.Label(reg_frame, text="Serial: disconnected | RX: (none)",
+                                    font=("Consolas", 10), foreground="#88a0c0")
+        self.lbl_serial.pack(anchor="w", padx=10, pady=(0, 5))
+
+        set_frame = ttk.LabelFrame(right_panel, text="Pooling & Algorithm Settings")
+        set_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        ttk.Label(set_frame, text="Pooling Operator:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.op_combo = ttk.Combobox(set_frame, values=["POPCOUNT", "AND", "OR", "XOR", "MAJORITY"], state="readonly")
+        self.op_combo.set("POPCOUNT")
+        self.op_combo.grid(row=0, column=1, padx=5, pady=5)
+        self.op_combo.bind("<<ComboboxSelected>>", self._update_pool_op)
+
+        ttk.Label(set_frame, text="Kernel Size:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.kernel_spin = ttk.Spinbox(set_frame, from_=2, to=8, increment=2, width=5, command=self._update_kernel)
         self.kernel_spin.set(4)
-        self.kernel_spin.grid(
-            row=1, column=1, padx=5, pady=5
-        )
+        self.kernel_spin.grid(row=1, column=1, sticky="w", padx=5, pady=5)
 
-    def start_camera(self):
-        if (
-            self.camera_thread is not None
-            and self.camera_thread.is_alive()
-        ):
-            messagebox.showwarning(
-                "Already Running",
-                "The camera lab is already running.",
-            )
+    # ---------------------------------------------------------------- controls
+    def start_lab(self):
+        if self.thread is not None and self.thread.is_alive():
             return
-
         self.ctl["stop"] = False
-        self.camera_thread = SimThread(
-            0, self.ctl, self.q, self.engine
-        )
-        self.camera_thread.start()
+        self.thread = SimThread(0, self.ctl, self.q, self.engine)
+        self.thread.start()
 
-    def stop_camera(self):
+    def stop_lab(self):
         self.ctl["stop"] = True
 
     def step_search(self):
         self.engine.step()
+        self._draw_current()
 
     def reset_search(self):
-        self.engine.reset(bit_depth=PASSCODE_BITS)
-        self.v_custom_target.set("[SECURE]")
+        self._load_target(None)
+        self._clear_rx()
 
-    def list_arduino_ports(self):
+    def randomize_target(self):
+        self._load_target(None)
+        self._clear_rx()
+
+    def _load_target(self, value):
+        self.engine.reset(value)
+        self.ctl["serial_loaded"] = False
+        self._draw_current()
+
+    # ---------------------------------------------------------------- serial hex (RX only)
+    def _refresh_ports(self):
+        self.port_combo["values"] = SerialReceiver.list_ports()
+
+    def toggle_connect(self):
+        if self.serial.is_open:
+            self.serial.close()
+            self.btn_connect.config(text="Connect")
+            self._refresh_serial_label()
+            return
+        name = self.port_combo.get().strip()
+        if not name:
+            messagebox.showerror("Serial Error", "Select a serial port first.")
+            return
         try:
-            ports = ArduinoMiner.list_ports()
+            self.serial.open(name, int(self.baud_combo.get()))
         except Exception as e:
             messagebox.showerror("Serial Error", str(e))
             return
+        self.btn_connect.config(text="Disconnect")
+        self._refresh_serial_label()
 
-        if not ports:
-            messagebox.showwarning(
-                "No Serial Ports",
-                "No serial ports were found.",
-            )
-            return
+    def _clear_rx(self):
+        self.rx_buf = b""
+        self.rx_difficulty = None
+        self.rx_nonce = b""
+        self.rx_hash = b""
+        self.rx_status = ""
+        self.extractor.reset()
+        self.v_hex.set("")
+        self._update_msg_dump()
+        self._refresh_serial_label()
 
-        self.v_arduino_port.set(ports[0])
-        messagebox.showinfo(
-            "Serial Ports", "\n".join(ports)
-        )
-
-    def connect_arduino(self):
-        if (
-            self.arduino_thread is not None
-            and self.arduino_thread.is_alive()
-        ):
-            messagebox.showwarning(
-                "Already Connected",
-                "The lock box is already connected.",
-            )
-            return
-
-        port = self.v_arduino_port.get().strip()
-
-        if not port:
-            messagebox.showerror(
-                "Missing Port",
-                "Enter a serial port such as COM3.",
-            )
-            return
-
-        self.ctl["arduino_stop"] = False
-        self.arduino_thread = ArduinoThread(
-            port,
-            self.ctl,
-            self.q,
-            self.engine,
-        )
-        self.arduino_thread.start()
-
-        if self.camera_ready and self.pending_diff is not None:
-            self.arduino_thread.request_diff(self.pending_diff)
-            self.pending_diff = None
-
-    def disconnect_arduino(self):
-        if self.arduino_thread is not None:
-            self.ctl["arduino_stop"] = True
-
-    def _read_diff(self):
-        try:
-            diff = int(self.v_diff.get())
-        except ValueError:
-            return None
-
-        return diff if MIN_DIFF <= diff <= MAX_DIFF else None
-
-    def _arduino_alive(self):
-        return (
-            self.arduino_thread is not None
-            and self.arduino_thread.is_alive()
-        )
-
-    def send_difficulty(self):
-        if not self._arduino_alive():
-            messagebox.showwarning(
-                "Not Connected",
-                "Connect the Arduino first.",
-            )
-            return
-
-        diff = self._read_diff()
-
-        if diff is None:
-            messagebox.showerror(
-                "Invalid Difficulty",
-                f"Enter a whole number from {MIN_DIFF} to {MAX_DIFF}.",
-            )
-            return
-
-        if not self.camera_ready:
-            # Mining begins once the webcam is running.
-            self.pending_diff = diff
-            self.v_link.set(
-                f"Arduino: difficulty {diff} queued, "
-                "mining starts when the webcam starts."
-            )
-            return
-
-        self.arduino_thread.request_diff(diff)
-
-    def _on_camera_started(self):
-        self.camera_ready = True
-
-        diff = self.pending_diff
-
-        if diff is None:
-            diff = self._read_diff()
-
-        if diff is None:
-            return
-
-        if self._arduino_alive():
-            self.pending_diff = None
-            self.arduino_thread.request_diff(diff)
+    def _on_force_serial(self):
+        if self.v_force_serial.get():
+            if self.serial.send_start():
+                self._refresh_serial_label("TX: start")
+            self._apply_rx()
         else:
-            # Connect Arduino later; mining starts as soon as it is up.
-            self.pending_diff = diff
-            self.v_link.set(
-                f"Webcam running. Difficulty {diff} will start mining "
-                "when the Arduino connects."
-            )
+            self.ctl["serial_loaded"] = False
+            self._draw_current()
 
-    def _show_pow(self, snap):
-        def line(label, item):
-            if item is None:
-                return f"{label}  ..."
-
-            return (
-                f"{label}  nonce {item['nonce']}  "
-                f"hash {item['hash']:064x}  "
-                f"({item['elapsed']:.3f} s)"
-            )
-
-        def msg(item):
-            if item is None:
-                return ""
-
-            n = len(item["padded"])
-            return (
-                f"          message {item['message']!r}  "
-                f"[{n} bytes padded, {n * 8} bits]"
-            )
-
-        self.v_pow_diff.set(f"Difficulty: {snap['diff']} bits")
-        self.v_pow_oracle.set(line("ORACLE  ", snap["predicted"]))
-        self.v_pow_oracle_msg.set(msg(snap["predicted"]))
-        self.v_pow_arduino.set(line("ARDUINO ", snap["arduino"]))
-        self.v_pow_arduino_msg.set(msg(snap["arduino"]))
-
-        if snap["match"] is None:
-            self.v_pow_match.set("")
-        elif snap["match"]:
-            self.v_pow_match.set("MATCH: same nonce, hash and padded message")
-        else:
-            self.v_pow_match.set(
-                "MISMATCH: nonce, hash or padded message differs"
-            )
-
-    def copy_pow(self):
-        lines = [
-            var.get().strip()
-            for var in (
-                self.v_link,
-                self.v_pow_diff,
-                self.v_pow_oracle,
-                self.v_pow_oracle_msg,
-                self.v_pow_arduino,
-                self.v_pow_arduino_msg,
-                self.v_pow_match,
-            )
-            if var.get().strip()
-        ]
-
-        self.window.clipboard_clear()
-        self.window.clipboard_append("\n".join(lines))
-        self.window.update()  # keep the clipboard after the app closes
-
-        self.b_copy_pow.config(text="Copied!")
-        self.window.after(
-            1200,
-            lambda: self.b_copy_pow.config(text="Copy Proof of Work"),
-        )
-
-    def set_custom_target(self):
-        text = self.v_custom_target.get().strip()
-
-        if text.startswith("0x") or text.startswith("0X"):
-            text = text[2:]
-
-        try:
-            value = int(text, 16)
-        except ValueError:
-            messagebox.showerror(
-                "Invalid Input",
-                "Enter a 64-character hexadecimal value.",
-            )
+    def _apply_rx(self):
+        """Load the received hex value as the oracle target and unmask TARGET."""
+        if not self.rx_buf:
             return
+        value = min(int.from_bytes(self.rx_buf, "big"), self.engine.max_val)
+        self.engine.reset(value)
+        self.ctl["serial_loaded"] = True
+        self._refresh_serial_label(f"-> {value}")
+        self._draw_current()
 
-        if 0 <= value <= (1 << PASSCODE_BITS) - 1:
-            self.engine.reset(value, PASSCODE_BITS)
-            messagebox.showinfo(
-                "Target Set",
-                "New 256-bit target configured for bit pooling.",
-            )
+    def _refresh_serial_label(self, note=""):
+        conn = f"{self.serial.port_name} @{self.serial.baud}" if self.serial.is_open else "disconnected"
+        if self.rx_buf:
+            h = self.rx_buf.hex().upper()
+            rx = f"{h[:8]}...{h[-8:]}"
+            if self.rx_difficulty is not None:
+                rx += f" d={self.rx_difficulty}"
         else:
-            messagebox.showerror(
-                "Invalid Range",
-                "Target must be a 256-bit hexadecimal value.",
-            )
+            rx = "(none)"
+        self.lbl_serial.config(text=f"Serial: {conn} | RX: {rx} {note}".rstrip())
 
-    def randomize_target(self):
-        self.engine.reset(bit_depth=PASSCODE_BITS)
-        self.v_custom_target.set("[SECURE]")
-
-    def _update_pool_operator(self, event):
-        operator = self.operator_combo.get()
-        self.engine.pool_op = operator
-        self.engine.oracle.pool_op = operator
+    # ---------------------------------------------------------------- settings
+    def _update_pool_op(self, _event):
+        op = self.op_combo.get()
+        self.engine.pool_op = op
+        self.engine.oracle.pool_op = op
+        self._draw_current()
 
     def _update_kernel(self):
         try:
-            kernel = int(self.kernel_spin.get())
-            self.engine.kernel_size = kernel
-            self.engine.oracle.kernel_size = kernel
+            k = int(self.kernel_spin.get())
         except ValueError:
-            pass
+            return
+        self.engine.kernel_size = k
+        self.engine.oracle.kernel_size = k
+        self._draw_current()
 
-    def _draw_hex_rows(
-        self,
-        target_value,
-        guess_value,
-        pooled_value,
-        revealed,
-    ):
-        self.register_canvas.delete("all")
+    # ---------------------------------------------------------------- drawing
+    def _draw_current(self):
+        e = self.engine
+        e._update_registers()
+        exposed = e.converged or self.ctl.get("serial_loaded", False)
+        self._draw_bit_rows(e.oracle._target if exposed else 0,
+                            e.current_guess, e.pooled_register, exposed)
+        self.lbl_status.config(text=f"Status: {e.last_status} | Bit Step: {e.step_count}/{e.bit_depth}")
 
-        is_exposed = revealed or self.engine.converged
-        active_target = target_value if is_exposed else 0
-        depth = self.engine.bit_depth
-        width = depth // 4
+    def _draw_bit_rows(self, target_val, guess_val, pooled_val, exposed):
+        self._update_dump(target_val, guess_val, pooled_val, exposed)
+        self.reg_canvas.delete("all")
+        bit_depth = self.engine.bit_depth
 
         rows = [
-            ("TARGET", active_target, "#00e676", not is_exposed),
-            ("GUESS ", guess_value, "#ffb300", False),
-            ("POOLED", pooled_value, "#b388ff", False),
+            ("TARGET", target_val if exposed else 0, "#00e676", not exposed),
+            ("GUESS ", guess_val, "#ffb300", False),
+            ("POOLED", pooled_val, "#b388ff", False),
         ]
 
-        y = 20
+        y_offset = 10
+        for label, val, color, hidden in rows:
+            self.reg_canvas.create_text(10, y_offset + 10, text=label, fill="#88a0c0",
+                                        anchor="w", font=("Consolas", 10, "bold"))
+            bx = 90
+            for b in range(bit_depth - 1, -1, -1):
+                bit_state = (val >> b) & 1
+                self.reg_canvas.create_rectangle(
+                    bx, y_offset, bx + 22, y_offset + 22,
+                    fill=color if (bit_state and not hidden) else "#1e2430",
+                    outline="#38445c")
+                txt_val = "?" if hidden else str(bit_state)
+                txt_color = "#000000" if (bit_state and not hidden) else "#708090"
+                self.reg_canvas.create_text(bx + 11, y_offset + 11, text=txt_val,
+                                            fill=txt_color, font=("Consolas", 9, "bold"))
+                bx += 26
 
-        for label, value, colour, hidden in rows:
-            self.register_canvas.create_text(
-                10,
-                y,
-                text=label,
-                fill="#88a0c0",
-                anchor="w",
-                font=("Consolas", 10, "bold"),
-            )
+            num_str = "[HIDDEN]" if hidden else f"[0x{val:03X}]"
+            self.reg_canvas.create_text(bx + 5, y_offset + 11, text=num_str,
+                                        fill="#d2e0f0", anchor="w", font=("Consolas", 9))
+            y_offset += 40
 
-            full = "[HIDDEN]" if hidden else f"{value:0{width}X}"
+    # ---------------------------------------------------------------- register dump (copy / paste)
+    def _register_strings(self, target_val, guess_val, pooled_val, exposed):
+        """Return {name: (hex, bin)} for each register; target is masked until exposed."""
+        bd = self.engine.bit_depth
+        digits = (bd + 3) // 4
+        out = {}
+        for name, val, hidden in (("TARGET", target_val, not exposed),
+                                  ("GUESS", guess_val, False),
+                                  ("POOLED", pooled_val, False)):
+            if hidden:
+                out[name] = ("[HIDDEN]", "[HIDDEN]")
+            else:
+                out[name] = (f"{val:0{digits}X}", f"{val:0{bd}b}")
+        self._last_regs = out
+        return out
 
-            # Wrap long registers (128 hex chars for a 512-bit block).
-            for i in range(0, len(full), 64):
-                self.register_canvas.create_text(
-                    90,
-                    y,
-                    text=full[i:i + 64],
-                    fill=colour,
-                    anchor="w",
-                    font=("Consolas", 10),
-                )
-                y += 18
+    def _update_dump(self, target_val, guess_val, pooled_val, exposed):
+        regs = self._register_strings(target_val, guess_val, pooled_val, exposed)
+        bd = self.engine.bit_depth
+        nbytes = (bd + 7) // 8
+        vals = {"TARGET": target_val, "GUESS": guess_val, "POOLED": pooled_val}
+        lines = []
+        for name, (h, b) in regs.items():
+            lines.append(f"== {name} ({nbytes}B / {bd} bits) ==")
+            lines.append(f"HEX: {h}")
+            if h == "[HIDDEN]":
+                lines.append("BYTES: [HIDDEN]")
+                lines.append("")
+                continue
+            raw = vals[name].to_bytes(nbytes, "big")          # byte 00 = MSB
+            for i in range(0, nbytes, 8):
+                chunk = raw[i:i + 8]
+                lines.append(f"HEX {i:02d}-{i + len(chunk) - 1:02d}: " + " ".join(f"{x:02X}" for x in chunk))
+            for i in range(0, nbytes, 4):
+                chunk = raw[i:i + 4]
+                lines.append(f"BIN {i:02d}-{i + len(chunk) - 1:02d}: " + " ".join(f"{x:08b}" for x in chunk))
+            lines.append("")
+        text = "\n".join(lines).rstrip()
+        if text == self._dump_text:          # unchanged: keep the user's selection
+            return
+        self._dump_text = text
+        self.txt_dump.delete("1.0", "end")
+        self.txt_dump.insert("1.0", text)
 
-            y += 17
+    def _dump_key(self, event):
+        """Read-only: allow copy, select-all and navigation; block everything else."""
+        ctrl = (event.state & 0x4) != 0
+        if ctrl and event.keysym.lower() in ("c", "a", "insert"):
+            if event.keysym.lower() == "a":
+                self._select_all_dump(event.widget)
+                return "break"
+            return None
+        if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
+                            "Prior", "Next", "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return None
+        return "break"
 
-        self.register_canvas.create_text(
-            10,
-            y,
-            anchor="w",
-            fill="#d2e0f0",
-            font=("Consolas", 10),
-            text=(
-                f"{depth}-bit register | "
-                f"{self.engine.step_count}/{depth} reconstruction steps"
-            ),
-        )
+    def _select_all_dump(self, widget=None):
+        widget = widget or self._menu_target
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.focus_set()
 
+    def _dump_popup(self, event):
+        self._menu_target = event.widget
+        event.widget.focus_set()
+        self.dump_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _copy_selection(self):
+        try:
+            text = self._menu_target.get("sel.first", "sel.last")
+        except tk.TclError:
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+
+    def _copy_registers(self, mode):
+        regs = getattr(self, "_last_regs", None)
+        if not regs:
+            return
+        lines = []
+        for name, (h, b) in regs.items():
+            if mode in ("hex", "all"):
+                lines.append(f"{name} HEX: {h}" if mode == "all" else f"{name}: {h}")
+            if mode in ("bin", "all"):
+                lines.append(f"{name} BIN: {b}" if mode == "all" else f"{name}: {b}")
+        self.window.clipboard_clear()
+        self.window.clipboard_append("\n".join(lines))
+        self._refresh_serial_label(f"(copied {mode})")
+
+    # ---------------------------------------------------------------- protocol message dump
+    def _update_msg_dump(self):
+        """Show the messages exactly as the .ino sends/expects them, plus their fields."""
+        none = "[NONE]"
+        chal = self.rx_buf.hex().upper() if self.rx_buf else ""
+        diff = str(self.rx_difficulty) if self.rx_difficulty is not None else ""
+        nonce = self.rx_nonce.hex().upper() if self.rx_nonce else ""
+        hsh = self.rx_hash.hex().upper() if self.rx_hash else ""
+
+        pow_line = f"POW:{chal}:{diff}" if chal else ""
+        sol_line = f"SOLUTION:{nonce}:{hsh}" if (nonce and hsh) else ""
+        self._msg_parts = dict(pow=pow_line, nonce=nonce, solution=sol_line,
+                               challenge=chal, hash=hsh)
+
+        text = "\n".join([
+            "== POW  (Arduino -> PC) ==",
+            f"MESSAGE: {pow_line or none}",
+            f"CHALLENGE ({CHALLENGE_BYTES}B): {chal or none}",
+            f"DIFFICULTY: {diff or none}",
+            "",
+            "== SOLUTION  (PC -> Arduino) ==",
+            f"MESSAGE: {sol_line or none}",
+            f"NONCE ({NONCE_BYTES}B): {nonce or none}",
+            f"HASH ({HASH_BYTES}B): {hsh or none}",
+            "",
+            "== REPLY ==",
+            f"LAST: {self.rx_status or none}",
+        ])
+        if text == self._msg_text:           # unchanged: keep the user's selection
+            return
+        self._msg_text = text
+        self.txt_msg.delete("1.0", "end")
+        self.txt_msg.insert("1.0", text)
+
+    def _copy_msg(self, mode):
+        parts = self._msg_parts
+        if mode == "all":
+            text = self._msg_text or ""
+        else:
+            text = parts.get(mode, "")
+        if not text:
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(text)
+        self._refresh_serial_label(f"(copied {mode})")
+
+    # ---------------------------------------------------------------- polling
     def _poll(self):
+        # Receive serial hex; always shown, only applied while Force Serial Read is on
+        new = self.serial.poll()
+        if new:
+            for msg in self.extractor.feed(new):
+                kind = msg["kind"]
+                if kind == "POW":
+                    self.rx_buf = msg["challenge"]
+                    self.rx_difficulty = msg["difficulty"]
+                    self.v_hex.set(msg["hex"])
+                    self._update_msg_dump()
+                    self._refresh_serial_label()
+                    if self.v_force_serial.get():
+                        self._apply_rx()
+                elif kind == "SOLUTION":
+                    self.rx_nonce = msg["nonce"]
+                    self.rx_hash = msg["hash"]
+                    self._update_msg_dump()
+                    self._refresh_serial_label(f"SOLUTION nonce={msg['nonce_hex']}")
+                elif kind == "STATUS":
+                    self.rx_status = msg["text"]
+                    self._update_msg_dump()
+                    self._refresh_serial_label(f"[{msg['text']}]")
+                elif kind == "BAD":
+                    self._refresh_serial_label(f"[BAD: {msg['text'][:24]}]")
+        elif self.btn_connect.cget("text") == "Disconnect" and not self.serial.is_open:
+            self.btn_connect.config(text="Connect")
+            self._refresh_serial_label("(port lost)")
+
         try:
             for _ in range(100):
-                event = self.q.get_nowait()
-
-                if event[0] == "frame":
-                    data = event[1]
-                    self.photo = ppm_photo(data["preview"])
-                    self.cam_canvas.itemconfig(
-                        self.cam_image_id,
-                        image=self.photo,
-                    )
-
-                    self._draw_hex_rows(
-                        data["target"],
-                        data["guess"],
-                        data["pooled"],
-                        self.v_reveal.get(),
-                    )
-
-                    self.status_label.config(
-                        text=(
-                            f"Status: {data['status']} | "
-                            f"Bit Step: {data['steps']}/{data['depth']}"
-                        )
-                    )
-
-                elif event[0] == "arduino":
-                    self.v_link.set(f"Arduino: {event[1]}")
-
-                elif event[0] == "pow_update":
-                    self._show_pow(event[1])
-
-                elif event[0] == "arduino_error":
-                    messagebox.showerror(
-                        "Arduino Error", event[1]
-                    )
-
-                elif event[0] == "camera_started":
-                    self._on_camera_started()
-
-                elif event[0] == "done":
-                    self.camera_ready = False
-
-                elif event[0] == "error":
-                    messagebox.showerror(
-                        "Camera Error", event[1]
-                    )
-
+                ev = self.q.get_nowait()
+                if ev[0] == "frame":
+                    d = ev[1]
+                    self.photo = ppm_photo(d["preview"])
+                    self.cam_canvas.itemconfig(self.cam_img_id, image=self.photo)
+                    exposed = d["converged"] or self.ctl.get("serial_loaded", False)
+                    self._draw_bit_rows(d["target"], d["guess"], d["pooled"], exposed)
+                    self.lbl_status.config(
+                        text=f"Status: {d['status']} | Bit Step: {d['steps']}/{self.engine.bit_depth}")
+                elif ev[0] == "error":
+                    messagebox.showerror("Camera Error", ev[1])
         except queue.Empty:
             pass
-
         self.window.after(30, self._poll)
 
     def _close(self):
         self.ctl["stop"] = True
-        self.ctl["arduino_stop"] = True
+        self.serial.close()
         self.window.destroy()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
-    root.geometry("1240x780")
+    root.geometry("860x960")
     root.mainloop()
