@@ -1,620 +1,1486 @@
+"""
+Bit-Pooling Oracle Lock Box Lab
+Python + Arduino SHA-256 proof-of-work miner.
+
+Protocol:
+    PC -> Arduino:  DIFF <0-256>\\n
+    Arduino -> PC:  POW:<nonce>:<64 hex hash>:<padded message>:<padded nonce>
+                        :<padded hash>:<header>\\n
+                    (the only unprompted output)
+
+Pressing "Send Difficulty" sends DIFF to the Arduino, which starts mining
+SHA256(DATA + nonce) straight away and replies with the proof of work.
+
+At the same moment, the camera bit-pooling oracle starts working in the
+background on its own. It does not read anything from the Arduino: it
+searches for the same proof of work itself, then loads the minimally padded
+SHA-256 message block (header + nonce + 0x80 + zeros + 64-bit bit length)
+into the bit-pooling register and reconstructs it bit by bit. The message,
+nonce and hash are decoded purely from the reconstructed bits. The oracle's
+result and the Arduino's result are each stored with their elapsed time and
+compared once both exist.
+
+Install dependencies:
+    pip install pyserial opencv-python numpy
+"""
+
+import asyncio
+import hashlib
+import queue
+import secrets
+import sys
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import numpy as np
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
+    serial_tools = None
+else:
+    serial_tools = serial.tools
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+
+PASSCODE_BITS = 256
+PASSCODE_BYTES = PASSCODE_BITS // 8
+PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
+
+
+# ==============================================================================
+# 256-BIT BIT-POOLING ORACLE
+# ==============================================================================
+
+class BitPoolingOracle:
+    """
+    Stores a hidden target and answers higher-or-equal queries.
+
+    The search engine reconstructs the target one bit at a time, MSB first.
+    """
+
+    def __init__(self, bit_depth: int = PASSCODE_BITS, target=None):
+        if not isinstance(bit_depth, int) or bit_depth < 1:
+            raise ValueError("bit_depth must be a positive integer.")
+
+        self.bit_depth = bit_depth
+        self.max_val = (1 << bit_depth) - 1
+
+        if target is None:
+            target = secrets.randbits(bit_depth)
+
+        self._target = int(target) & self.max_val
+
+        self.kernel_size = 4
+        self.stride = 2
+        self.pool_op = "POPCOUNT"
+        self.schmitt_trigger = 0.5
+
+        self.pooled_bits = 0
+        self.pooled_count = 0
+        self.is_done = False
+
+    def query_bit(self, trial_val: int) -> int:
+        """Returns 1 if the hidden target is greater than or equal to trial_val."""
+        if self.is_done:
+            return 0
+
+        return 1 if self._target >= trial_val else 0
+
+    def pool_step(self, val: int) -> int:
+        """Applies the selected pooling operator to the current guess."""
+        bits = [(val >> i) & 1 for i in range(self.bit_depth)]
+        pooled_out = []
+
+        for i in range(0, len(bits), self.stride):
+            block = bits[i:i + self.kernel_size]
+
+            if not block:
+                break
+
+            if self.pool_op == "POPCOUNT":
+                result = sum(block) / len(block)
+                output_bit = 1 if result >= self.schmitt_trigger else 0
+            elif self.pool_op == "AND":
+                output_bit = 1 if all(b == 1 for b in block) else 0
+            elif self.pool_op == "OR":
+                output_bit = 1 if any(b == 1 for b in block) else 0
+            elif self.pool_op == "XOR":
+                output_bit = sum(block) % 2
+            elif self.pool_op == "MAJORITY":
+                output_bit = 1 if sum(block) > (len(block) / 2.0) else 0
+            else:
+                output_bit = block[0]
+
+            pooled_out.append(output_bit)
+
+        output_value = 0
+        for index, bit in enumerate(pooled_out):
+            output_value |= bit << index
+
+        return output_value
+
+    @property
+    def target(self) -> int:
+        """The target remains hidden until the full bit depth is reconstructed."""
+        if not self.is_done:
+            raise PermissionError(
+                "SECURITY VIOLATION: Oracle target is classified until fully pooled."
+            )
+
+        return self._target
+
+
+# ==============================================================================
+# BIT-POOLING SEARCH ENGINE (variable bit depth)
+# ==============================================================================
+
+class BitPoolingSearchEngine:
+    def __init__(self, bit_depth: int = PASSCODE_BITS):
+        if not isinstance(bit_depth, int) or bit_depth < 1:
+            raise ValueError("bit_depth must be a positive integer.")
+
+        self.bit_depth = bit_depth
+        self.max_val = (1 << bit_depth) - 1
+
+        # The camera thread, the GUI and the background oracle all touch the
+        # engine, so reset/step are serialised.
+        self._lock = threading.RLock()
 
-/*
-  SIMPLE SHA256 ARDUINO BOX
-  -------------------------
-  No external libraries.
-  Serial: 115200 baud
-
-  Commands:
-    DIFF 12      sets the difficulty AND starts mining immediately
-    DIFF         prints the current difficulty
-    HEADER       prints HEADER:<the DATA string being hashed>
-    TERMINATOR   (or STOP) aborts mining
-    DATA hello
-    SHA256 hello
-    STATUS
-    RESET
-    HELP
-
-  Mining:
-    SHA256(DATA + nonce), nonce counting up from 0.
-    Checks for DIFF leading zero bits.
-
-  Output while mining:
-    Nothing, until a solution is found, then one line:
-      POW:<nonce>:<64 hex hash>:<padded message>:<padded nonce>:<padded hash>:<header>
-    where <header> is the DATA string that was hashed (the hashed
-    message is <header> followed by the decimal nonce), and each padded
-    field is SHA-256 padding of its own bytes, in hex: the bytes, 0x80,
-    zero bytes, then the 64-bit big-endian bit length, always a whole
-    number of 64-byte blocks:
-      <padded message>  header + decimal nonce
-      <padded nonce>    the decimal nonce text alone
-      <padded hash>     the 32 raw hash bytes
-    <header> is last because it may itself contain colons.
-
-  Note:
-    This is a simple educational SHA256 proof-of-work
-    implementation, not an optimized mining ASIC.
-*/
-
-#include <Arduino.h>
-#include <string.h>
-#include <stdint.h>
-
-// =====================================================
-// CONFIGURATION
-// =====================================================
-
-#define SERIAL_BAUD 115200
-#define MAX_INPUT 160
-
-char inputData[MAX_INPUT] = "arduino-sha256";
-char serialBuffer[200];
-
-uint32_t nonce = 0;
-uint64_t hashes = 0;
-
-uint16_t difficulty = 12;  // 0-256 (does not fit in uint8_t)
-
-bool mining = false;
-bool found = false;
-
-// =====================================================
-// SHA256 CONSTANTS
-// =====================================================
-
-static const uint32_t K[64] = {
-  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,
-  0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,
-  0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,
-  0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,
-  0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,
-  0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,
-  0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,
-  0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,
-  0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-};
-
-// =====================================================
-// SHA256 FUNCTIONS
-// =====================================================
-
-#define ROTR(x,n) (((x) >> (n)) | ((x) << (32-(n))))
-
-uint32_t H[8];
-
-uint8_t block[64];
-
-uint32_t W[64];
-
-void sha256Transform() {
-
-  for (int i = 0; i < 16; i++) {
-    W[i] =
-      ((uint32_t)block[i*4] << 24) |
-      ((uint32_t)block[i*4+1] << 16) |
-      ((uint32_t)block[i*4+2] << 8) |
-      ((uint32_t)block[i*4+3]);
-  }
-
-  for (int i = 16; i < 64; i++) {
+        self.oracle = BitPoolingOracle(self.bit_depth)
+        self.current_guess = 0
+        self.step_count = 0
+        self.history = [0]
+        self.converged = False
+        self.last_status = "INITIALIZED"
+
+        self.kernel_size = 4
+        self.stride = 2
+        self.pool_op = "POPCOUNT"
+        self.schmitt_trigger = 0.5
+
+        self.guess_reg = 0
+        self.target_reg = 0
+        self.pooled_register = 0
+
+        self._update_registers()
+
+    def _reset(self, new_target=None, bit_depth=None):
+        if bit_depth is not None:
+            if not isinstance(bit_depth, int) or bit_depth < 1:
+                raise ValueError("bit_depth must be a positive integer.")
+            self.bit_depth = bit_depth
+            self.max_val = (1 << bit_depth) - 1
 
-    uint32_t s0 =
-      ROTR(W[i-15],7) ^
-      ROTR(W[i-15],18) ^
-      (W[i-15] >> 3);
-
-    uint32_t s1 =
-      ROTR(W[i-2],17) ^
-      ROTR(W[i-2],19) ^
-      (W[i-2] >> 10);
-
-    W[i] = W[i-16] + s0 + W[i-7] + s1;
-  }
-
-  uint32_t a=H[0], b=H[1], c=H[2], d=H[3];
-  uint32_t e=H[4], f=H[5], g=H[6], h=H[7];
+        self.oracle = BitPoolingOracle(self.bit_depth, new_target)
+        self.oracle.kernel_size = self.kernel_size
+        self.oracle.pool_op = self.pool_op
+        self.oracle.schmitt_trigger = self.schmitt_trigger
 
-  for (int i = 0; i < 64; i++) {
-
-    uint32_t S1 =
-      ROTR(e,6) ^ ROTR(e,11) ^ ROTR(e,25);
-
-    uint32_t ch =
-      (e & f) ^ (~e & g);
-
-    uint32_t temp1 =
-      h + S1 + ch + K[i] + W[i];
-
-    uint32_t S0 =
-      ROTR(a,2) ^ ROTR(a,13) ^ ROTR(a,22);
-
-    uint32_t maj =
-      (a & b) ^ (a & c) ^ (b & c);
-
-    uint32_t temp2 = S0 + maj;
-
-    h=g;
-    g=f;
-    f=e;
-    e=d+temp1;
-    d=c;
-    c=b;
-    b=a;
-    a=temp1+temp2;
-  }
-
-  H[0]+=a;
-  H[1]+=b;
-  H[2]+=c;
-  H[3]+=d;
-  H[4]+=e;
-  H[5]+=f;
-  H[6]+=g;
-  H[7]+=h;
-}
-
-// =====================================================
-// SHA256 HASH
-// =====================================================
-
-void sha256(const uint8_t *data, size_t len, uint8_t *output) {
-
-  H[0]=0x6a09e667;
-  H[1]=0xbb67ae85;
-  H[2]=0x3c6ef372;
-  H[3]=0xa54ff53a;
-  H[4]=0x510e527f;
-  H[5]=0x9b05688c;
-  H[6]=0x1f83d9ab;
-  H[7]=0x5be0cd19;
-
-  size_t fullBlocks = len / 64;
-
-  for (size_t b = 0; b < fullBlocks; b++) {
-    memcpy(block, data + b*64, 64);
-    sha256Transform();
-  }
-
-  size_t remaining = len % 64;
-
-  memset(block, 0, 64);
-
-  if (remaining > 0) {
-    memcpy(block, data + fullBlocks*64, remaining);
-  }
-
-  block[remaining] = 0x80;
-
-  if (remaining >= 56) {
-    sha256Transform();
-    memset(block, 0, 64);
-  }
-
-  uint64_t bitLength = (uint64_t)len * 8;
-
-  for (int i = 0; i < 8; i++) {
-    block[63-i] = (uint8_t)(bitLength >> (i*8));
-  }
-
-  sha256Transform();
-
-  for (int i = 0; i < 8; i++) {
-    output[i*4]   = H[i] >> 24;
-    output[i*4+1] = H[i] >> 16;
-    output[i*4+2] = H[i] >> 8;
-    output[i*4+3] = H[i];
-  }
-}
-
-// =====================================================
-// HEX OUTPUT
-// =====================================================
-
-void printHashHex(uint8_t *hash) {
-
-  const char hex[] = "0123456789abcdef";
-
-  for (int i = 0; i < 32; i++) {
-    Serial.print(hex[hash[i] >> 4]);
-    Serial.print(hex[hash[i] & 15]);
-  }
-}
-
-void printHash(uint8_t *hash) {
-
-  printHashHex(hash);
-  Serial.println();
-}
-
-// =====================================================
-// DIFFICULTY CHECK
-// =====================================================
-
-bool checkDifficulty(uint8_t *hash) {
-
-  uint16_t fullBytes = difficulty / 8;
-  uint8_t remainingBits = difficulty % 8;
-
-  for (int i = 0; i < fullBytes; i++) {
-    if (hash[i] != 0) return false;
-  }
-
-  if (remainingBits > 0) {
-
-    uint8_t mask = 0xFF << (8 - remainingBits);
-
-    if ((hash[fullBytes] & mask) != 0) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-// =====================================================
-// HASH INPUT + NONCE
-// =====================================================
-
-uint8_t hashOutput[32];
-
-// Builds <inputData><decimal nonce> and returns its length.
-size_t buildMessage(uint32_t n, char *message, size_t size) {
-
-  snprintf(message, size, "%s%lu",
-    inputData, (unsigned long)n);
-
-  return strlen(message);
-}
-
-void hashNonce(uint32_t n) {
-
-  char message[200];
-
-  size_t len = buildMessage(n, message, sizeof(message));
-
-  sha256(
-    (const uint8_t*)message,
-    len,
-    hashOutput
-  );
-}
-
-// Prints the SHA-256 padded form of a message as hex, streamed byte by
-// byte (no extra buffer): message, 0x80, zeros, 64-bit big-endian bit length.
-void printPaddedHex(const uint8_t *msg, size_t len) {
-
-  const char hex[] = "0123456789abcdef";
-
-  size_t total = ((len + 9 + 63) / 64) * 64;
-  uint64_t bitLength = (uint64_t)len * 8;
-
-  for (size_t i = 0; i < total; i++) {
-
-    uint8_t b;
-
-    if (i < len)             b = msg[i];
-    else if (i == len)       b = 0x80;
-    else if (i >= total - 8) b = (uint8_t)(bitLength >> ((total - 1 - i) * 8));
-    else                     b = 0;
-
-    Serial.print(hex[b >> 4]);
-    Serial.print(hex[b & 15]);
-  }
-}
-
-// =====================================================
-// MINING
-// =====================================================
-
-void startMining() {
-
-  // Always restart from nonce 0 so a given DATA + DIFF always
-  // produces the same proof of work.
-  nonce = 0;
-  hashes = 0;
-
-  found = false;
-  mining = true;
-}
-
-void stopMining() {
-
-  if (mining) {
-    mining = false;
-
-    Serial.println(F("[TERMINATED]"));
-    Serial.print(F("NONCE: "));
-    Serial.println(nonce);
-    Serial.print(F("HASHES: "));
-    Serial.println((unsigned long)hashes);
-  } else {
-    Serial.println(F("[IDLE]"));
-  }
-}
-
-void miningStep() {
-
-  if (!mining) return;
-
-  // Check for serial commands before each hash.
-  if (Serial.available()) return;
-
-  hashNonce(nonce);
-
-  hashes++;
-
-  if (checkDifficulty(hashOutput)) {
-
-    mining = false;
-    found = true;
-
-    char message[200];
-    size_t len = buildMessage(nonce, message, sizeof(message));
-
-    char nonceText[12];
-    snprintf(nonceText, sizeof(nonceText), "%lu", (unsigned long)nonce);
-
-    Serial.print(F("POW:"));
-    Serial.print(nonce);
-    Serial.print(':');
-    printHashHex(hashOutput);
-    Serial.print(':');
-    printPaddedHex((const uint8_t*)message, len);
-    Serial.print(':');
-    printPaddedHex((const uint8_t*)nonceText, strlen(nonceText));
-    Serial.print(':');
-    printPaddedHex(hashOutput, 32);
-    Serial.print(':');
-    Serial.println(inputData);
-
-    return;
-  }
-
-  nonce++;
-
-  if (nonce == 0) {
-    mining = false;
-    Serial.println(F("[NONCE SPACE EXHAUSTED]"));
-  }
-}
-
-// =====================================================
-// COMMAND HANDLER
-// =====================================================
-
-void executeCommand(char *command) {
-
-  while (*command == ' ') command++;
-
-  if (strlen(command) == 0) return;
-
-  if (
-    strcmp(command, "TERMINATOR") == 0 ||
-    strcmp(command, "STOP") == 0
-  ) {
-    stopMining();
-    return;
-  }
-
-  if (strncmp(command, "DIFF", 4) == 0) {
-
-    if (command[4] == ' ' || command[4] == '\0') {
-
-      if (command[4] == ' ') {
-
-        const char *arg = command + 5;
-        while (*arg == ' ') arg++;
-
-        if (*arg < '0' || *arg > '9') {
-          Serial.println(F("[ERROR] Difficulty must be 0-256"));
-          return;
+        self.current_guess = 0
+        self.step_count = 0
+        self.history = [0]
+        self.converged = False
+        self.last_status = "READY"
+        self._update_registers()
+
+    def _step(self):
+        """Advances the bit-pooling search by one bit."""
+        if self.converged or self.step_count >= self.bit_depth:
+            return
+
+        self.step_count += 1
+
+        shift = self.bit_depth - self.step_count
+        trial_value = self.oracle.pooled_bits | (1 << shift)
+
+        bit = self.oracle.query_bit(trial_value)
+
+        if bit:
+            self.oracle.pooled_bits |= 1 << shift
+
+        self.current_guess = self.oracle.pooled_bits
+        self.history.append(self.current_guess)
+        self._update_registers()
+
+        if self.step_count >= self.bit_depth:
+            self.oracle.is_done = True
+            self.converged = True
+
+            if self.current_guess == self.oracle._target:
+                self.last_status = "LOCKED & REVEALED"
+            else:
+                self.last_status = "RECONSTRUCTION MISMATCH"
+
+    def reset(self, new_target=None, bit_depth=None):
+        with self._lock:
+            self._reset(new_target, bit_depth)
+
+    def step(self):
+        """Advances the bit-pooling search by one bit."""
+        with self._lock:
+            self._step()
+
+    def result(self):
+        """(guess, converged, bit_depth) read atomically."""
+        with self._lock:
+            return self.current_guess, self.converged, self.bit_depth
+
+    def _update_registers(self):
+        self.guess_reg = self.current_guess
+
+        try:
+            self.target_reg = self.oracle.target
+        except PermissionError:
+            self.target_reg = 0
+
+        self.pooled_register = self.oracle.pool_step(self.current_guess)
+
+
+# ==============================================================================
+# SHA-256 PROOF OF WORK + MINIMAL PADDING
+# ==============================================================================
+
+POW_DATA = "arduino-sha256"  # must match inputData in sha256_challenge.ino
+MIN_DIFF = 0
+MAX_DIFF = 256
+
+
+def sha256_pad(msg: bytes) -> bytes:
+    """Minimal SHA-256 padding: msg, 0x80, zeros, 64-bit big-endian bit length."""
+    total = ((len(msg) + 9 + 63) // 64) * 64
+    return (
+        msg
+        + b"\x80"
+        + b"\x00" * (total - len(msg) - 9)
+        + (len(msg) * 8).to_bytes(8, "big")
+    )
+
+
+def sha256_unpad(padded: bytes) -> bytes:
+    """Inverse of sha256_pad. Raises ValueError if padding is not minimal/valid."""
+    if len(padded) < 64 or len(padded) % 64:
+        raise ValueError("not a whole number of 64-byte blocks")
+
+    length = int.from_bytes(padded[-8:], "big") // 8
+
+    if length > len(padded) - 9 or sha256_pad(padded[:length]) != padded:
+        raise ValueError("invalid padding")
+
+    return padded[:length]
+
+
+def message_text(padded: bytes) -> str:
+    try:
+        return sha256_unpad(padded).decode("ascii", errors="replace")
+    except ValueError:
+        return "<invalid padding>"
+
+
+class MiningSession:
+    """
+    One difficulty send. Holds what the background oracle found and what the
+    Arduino returned, each with its elapsed time since the difficulty was
+    sent, and publishes a snapshot to the GUI whenever either one arrives.
+    """
+
+    def __init__(self, diff: int, data: str, out):
+        self.diff = diff
+        self.data = data
+        self.out = out
+        self.cancel = threading.Event()
+        self.t0 = time.perf_counter()
+        self._lock = threading.Lock()
+        self.predicted = None
+        self.arduino = None
+
+    def _record(
+        self, nonce: int, hash_int: int, padded: bytes, elapsed=None
+    ) -> dict:
+        return {
+            "nonce": nonce,
+            "hash": hash_int,
+            "padded": padded,
+            "message": message_text(padded),
+            "elapsed": (
+                time.perf_counter() - self.t0
+                if elapsed is None
+                else elapsed
+            ),
         }
 
-        int d = atoi(arg);
+    def set_predicted(
+        self, nonce: int, hash_int: int, padded: bytes, elapsed=None
+    ):
+        if self.cancel.is_set():
+            return
 
-        if (d < 0 || d > 256) {
-          Serial.println(F("[ERROR] Difficulty must be 0-256"));
-          return;
+        with self._lock:
+            self.predicted = self._record(nonce, hash_int, padded, elapsed)
+
+        self.out.put(("pow_update", self.snapshot()))
+
+    def set_arduino(self, nonce: int, hash_int: int, padded: bytes):
+        if self.cancel.is_set():
+            return
+
+        with self._lock:
+            self.arduino = self._record(nonce, hash_int, padded)
+
+        self.out.put(("pow_update", self.snapshot()))
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            predicted = dict(self.predicted) if self.predicted else None
+            arduino = dict(self.arduino) if self.arduino else None
+
+        match = None
+
+        if predicted is not None and arduino is not None:
+            match = (
+                predicted["nonce"] == arduino["nonce"]
+                and predicted["hash"] == arduino["hash"]
+                and predicted["padded"] == arduino["padded"]
+            )
+
+        return {
+            "diff": self.diff,
+            "predicted": predicted,
+            "arduino": arduino,
+            "match": match,
         }
 
-        difficulty = (uint16_t)d;
 
-        // Receiving the difficulty is the start signal.
-        startMining();
+class BackgroundPredictor(threading.Thread):
+    """
+    The camera oracle's background worker. It runs independently of the
+    Arduino link: it searches for the same proof of work (SHA256(DATA + nonce),
+    nonce counting up from 0), loads the minimally padded message block into
+    the bit-pooling engine as the hidden target, lets the engine reconstruct
+    it one bit at a time, then decodes message, nonce and hash from the
+    reconstructed bits alone.
+    """
 
-      } else {
+    def __init__(self, session: MiningSession, engine: BitPoolingSearchEngine):
+        super().__init__(daemon=True)
+        self.session = session
+        self.engine = engine
 
-        Serial.print(F("DIFFICULTY: "));
-        Serial.println(difficulty);
-      }
+    def run(self):
+        session = self.session
+        base = hashlib.sha256(session.data.encode("ascii"))
+        limit = 1 << (256 - session.diff)  # leading-zero test: value < limit
 
-      return;
-    }
-  }
+        nonce = 0
+        found = None
 
-  if (strcmp(command, "HEADER") == 0) {
-    Serial.print(F("HEADER:"));
-    Serial.println(inputData);
-    return;
-  }
+        while nonce <= 0xFFFFFFFF:
+            if (nonce & 0xFFF) == 0 and session.cancel.is_set():
+                return
 
-  if (strncmp(command, "DATA ", 5) == 0) {
+            h = base.copy()
+            h.update(str(nonce).encode("ascii"))
+            value = int.from_bytes(h.digest(), "big")
 
-    if (mining) {
-      Serial.println(F("[ERROR] Stop mining first"));
-      return;
-    }
+            if value < limit:
+                found = value
+                break
 
-    strncpy(inputData, command + 5, MAX_INPUT - 1);
-    inputData[MAX_INPUT - 1] = '\0';
+            nonce += 1
 
-    nonce = 0;
+        if found is None or session.cancel.is_set():
+            return
 
-    Serial.print(F("[DATA SET] "));
-    Serial.println(inputData);
+        # The oracle's pre-knowledge: the exact message that was hashed, in
+        # its minimal SHA-256 padded form, becomes the hidden target.
+        message = (session.data + str(nonce)).encode("ascii")
+        padded = sha256_pad(message)
+        depth = len(padded) * 8
 
-    return;
-  }
+        # The oracle exists as soon as the proof of work is found, so it is
+        # displayed immediately, with the time it was made. The bit-by-bit
+        # reconstruction below then confirms it from the decoded bits.
+        t_found = time.perf_counter() - session.t0
+        session.set_predicted(nonce, found, padded, t_found)
 
-  if (strncmp(command, "SHA256 ", 7) == 0) {
+        self.engine.reset(int.from_bytes(padded, "big"), depth)
 
-    uint8_t result[32];
+        while not session.cancel.is_set() and not self.engine.converged:
+            self.engine.step()
 
-    sha256(
-      (const uint8_t*)(command + 7),
-      strlen(command + 7),
-      result
-    );
+        if session.cancel.is_set():
+            return
 
-    printHash(result);
+        # Decode purely from the reconstructed bits.
+        guess, converged, depth = self.engine.result()
 
-    return;
-  }
+        if not converged:
+            return
 
-  if (strcmp(command, "STATUS") == 0) {
+        decoded = guess.to_bytes(depth // 8, "big")
 
-    Serial.println(F("------ STATUS ------"));
+        try:
+            msg = sha256_unpad(decoded)
+            nonce_out = int(msg[len(session.data):])
+        except ValueError:
+            return
 
-    Serial.print(F("MINING: "));
-    Serial.println(mining ? F("YES") : F("NO"));
+        hash_out = int.from_bytes(hashlib.sha256(msg).digest(), "big")
+        session.set_predicted(nonce_out, hash_out, decoded, t_found)
 
-    Serial.print(F("DATA: "));
-    Serial.println(inputData);
 
-    Serial.print(F("NONCE: "));
-    Serial.println(nonce);
+# ==============================================================================
+# ARDUINO MINER LINK
+# ==============================================================================
 
-    Serial.print(F("HASHES: "));
-    Serial.println((unsigned long)hashes);
+class ArduinoMiner:
+    """
+    Serial link to the Arduino SHA-256 miner.
 
-    Serial.print(F("DIFF: "));
-    Serial.println(difficulty);
+        PC -> Arduino: DIFF <bits>\\n
+        Arduino -> PC: POW:<nonce>:<hash>:<padded msg>:<padded nonce>
+                           :<padded hash>:<header>\\n
 
-    Serial.println(F("--------------------"));
+    Owned by a single thread, so no locking is needed.
+    """
 
-    return;
-  }
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 115200,
+        timeout: float = 0.2,
+    ):
+        if serial is None:
+            raise RuntimeError(
+                "pyserial is not installed. Run: pip install pyserial"
+            )
 
-  if (strcmp(command, "RESET") == 0) {
+        self.ser = serial.Serial(port, baudrate, timeout=timeout)
 
-    mining = false;
-    found = false;
-    nonce = 0;
-    hashes = 0;
+        # Most boards reset when the port opens; give the sketch time to boot.
+        time.sleep(2.0)
+        self.ser.reset_input_buffer()
 
-    Serial.println(F("[RESET COMPLETE]"));
+    @staticmethod
+    def list_ports():
+        if serial_tools is None:
+            return []
 
-    return;
-  }
+        return [
+            device.device
+            for device in serial_tools.list_ports.comports()
+        ]
 
-  if (strcmp(command, "HELP") == 0) {
+    def close(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
 
-    Serial.println(F("COMMANDS:"));
-    Serial.println(F("TERMINATOR"));
-    Serial.println(F("STOP"));
-    Serial.println(F("DIFF"));
-    Serial.println(F("DIFF 12   (sets difficulty and starts mining)"));
-    Serial.println(F("HEADER"));
-    Serial.println(F("DATA hello"));
-    Serial.println(F("SHA256 hello"));
-    Serial.println(F("STATUS"));
-    Serial.println(F("RESET"));
-    Serial.println(F("HELP"));
+    def send_diff(self, diff: int):
+        self.ser.write(f"DIFF {int(diff)}\n".encode("ascii"))
+        self.ser.flush()
 
-    return;
-  }
+    def read_pow(self):
+        """
+        Parses POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
+        Returns (nonce, hash_int, padded_message_bytes) or None.
+        The header may contain colons, so it is the unsplit remainder.
+        """
+        raw = self.ser.readline()
 
-  Serial.println(F("[UNKNOWN COMMAND]"));
-}
+        if not raw:
+            return None
 
-// =====================================================
-// SERIAL INPUT
-// =====================================================
+        line = raw.decode("ascii", errors="ignore").strip()
 
-void readSerial() {
+        if not line.startswith("POW:"):
+            return None
 
-  static uint16_t index = 0;
+        parts = line.split(":", 6)
 
-  while (Serial.available()) {
+        if len(parts) != 7 or len(parts[2]) != 64:
+            return None
 
-    char c = Serial.read();
+        try:
+            return (
+                int(parts[1]),
+                int(parts[2], 16),
+                bytes.fromhex(parts[3]),
+            )
+        except ValueError:
+            return None
 
-    if (c == '\r') continue;
 
-    if (c == '\n') {
+class ArduinoThread(threading.Thread):
+    def __init__(self, port, ctl, out, engine):
+        super().__init__(daemon=True)
+        self.port = port
+        self.ctl = ctl
+        self.out = out
+        self.engine = engine
+        self.commands = queue.Queue()
+        self.session = None
 
-      serialBuffer[index] = '\0';
+    def request_diff(self, diff: int):
+        self.commands.put(diff)
 
-      // Convert command to uppercase only for
-      // command matching, preserving DATA text.
-      char command[200];
+    def _start_session(self, miner: ArduinoMiner, diff: int):
+        if self.session is not None:
+            self.session.cancel.set()
 
-      strncpy(command, serialBuffer, sizeof(command)-1);
-      command[sizeof(command)-1] = '\0';
+        session = MiningSession(diff, POW_DATA, self.out)
+        self.session = session
 
-      for (int i = 0; command[i]; i++) {
-        if (command[i] >= 'a' && command[i] <= 'z') {
-          command[i] -= 32;
+        # Arduino and oracle are started together and then run on their own.
+        miner.send_diff(diff)
+        BackgroundPredictor(session, self.engine).start()
+
+        self.out.put(("pow_update", session.snapshot()))
+
+    def run(self):
+        miner = None
+
+        try:
+            miner = ArduinoMiner(self.port)
+            self.out.put((
+                "arduino",
+                "Connected. Set a difficulty and press Send Difficulty.",
+            ))
+
+            while not self.ctl["arduino_stop"]:
+                try:
+                    while True:
+                        self._start_session(miner, self.commands.get_nowait())
+                except queue.Empty:
+                    pass
+
+                result = miner.read_pow()
+
+                if result is not None and self.session is not None:
+                    self.session.set_arduino(*result)
+
+        except Exception as e:
+            self.out.put((
+                "arduino_error",
+                f"{type(e).__name__}: {e}",
+            ))
+
+        finally:
+            if self.session is not None:
+                self.session.cancel.set()
+
+            if miner is not None:
+                miner.close()
+
+            self.out.put(("arduino", "Disconnected."))
+
+
+# ==============================================================================
+# CAMERA SOURCE
+# ==============================================================================
+
+class Source:
+    def __init__(self, index: int):
+        if cv2 is None:
+            raise RuntimeError(
+                "OpenCV is not installed. Run: pip install opencv-python"
+            )
+
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(index, backend)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        if not (cap.isOpened() and cap.read()[0]):
+            cap.release()
+            raise RuntimeError(f"Cannot open camera {index}.")
+
+        self.cap = cap
+        self.rgb = None
+
+    def read(self):
+        ok, bgr = self.cap.read()
+
+        if not ok:
+            return None
+
+        self.rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    def close(self):
+        self.cap.release()
+
+
+def ppm_photo(rgb: np.ndarray) -> tk.PhotoImage:
+    h, w, _ = rgb.shape
+    data = (
+        b"P6 %d %d 255\n" % (w, h)
+        + np.ascontiguousarray(rgb, np.uint8).tobytes()
+    )
+    return tk.PhotoImage(data=data, format="PPM")
+
+
+# ==============================================================================
+# CAMERA THREAD
+# ==============================================================================
+
+class SimThread(threading.Thread):
+    def __init__(self, cam_index, ctl, out, engine):
+        super().__init__(daemon=True)
+        self.cam_index = cam_index
+        self.ctl = ctl
+        self.out = out
+        self.engine = engine
+
+    def run(self):
+        asyncio.run(self._run())
+
+    async def _run(self):
+        ctl, out, engine = self.ctl, self.out, self.engine
+
+        try:
+            src = Source(self.cam_index)
+        except RuntimeError as e:
+            out.put(("error", str(e)))
+            out.put(("done", None))
+            return
+
+        out.put(("info", f"USB camera {self.cam_index} opened."))
+        out.put(("camera_started", None))
+
+        previous_time = time.perf_counter()
+        frame_index = 0
+        previous_even = False
+
+        try:
+            while not ctl["stop"]:
+                gray = await asyncio.to_thread(src.read)
+
+                if gray is None:
+                    out.put((
+                        "info",
+                        "Camera stopped delivering frames.",
+                    ))
+                    break
+
+                now = time.perf_counter()
+                dt = min(max(now - previous_time, 1e-3), 0.25)
+                previous_time = now
+
+                small = cv2.resize(
+                    gray, (128, 96), interpolation=cv2.INTER_AREA
+                )
+                motion_detected = (
+                    frame_index > 5 and np.std(small) > 5.0
+                )
+                motion_value = (
+                    int(np.std(small) * 10)
+                    if motion_detected
+                    else 0
+                )
+
+                even_now = motion_value > 0 and motion_value % 2 == 0
+                even_state = even_now and previous_even
+                previous_even = even_now
+
+                if (
+                    even_state
+                    and ctl.get("auto_step", True)
+                    and not engine.converged
+                ):
+                    engine.step()
+
+                rgb = src.rgb
+
+                if rgb is None:
+                    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+                if rgb.ndim == 2:
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+                elif rgb.shape[2] == 4:
+                    rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2RGB)
+
+                preview = cv2.resize(
+                    rgb,
+                    (320, 240),
+                    interpolation=cv2.INTER_AREA,
+                ).copy()
+
+                if ctl.get("ir_heatmap", False):
+                    preview[:, :, 0] = np.clip(
+                        preview[:, :, 0].astype(int) + 80,
+                        0,
+                        255,
+                    )
+                    preview[:, :, 2] = np.clip(
+                        preview[:, :, 2].astype(int) - 50,
+                        0,
+                        255,
+                    )
+
+                exposed_target = (
+                    engine.oracle._target
+                    if (
+                        engine.converged
+                        or ctl.get("force_reveal", False)
+                    )
+                    else 0
+                )
+
+                out.put((
+                    "frame",
+                    {
+                        "preview": preview,
+                        "idx": frame_index,
+                        "dt": dt,
+                        "target": exposed_target,
+                        "guess": engine.current_guess,
+                        "pooled": engine.pooled_register,
+                        "status": engine.last_status,
+                        "steps": engine.step_count,
+                        "depth": engine.bit_depth,
+                        "history": list(engine.history),
+                        "converged": engine.converged,
+                    },
+                ))
+
+                frame_index += 1
+                await asyncio.sleep(0.03)
+
+        finally:
+            src.close()
+            out.put(("done", None))
+
+
+# ==============================================================================
+# MAIN GUI
+# ==============================================================================
+
+class App:
+    def __init__(self, window):
+        self.window = window
+        self.window.title(
+            "Bit-Pooling Oracle Lock Box Lab — Padded Message Decoder"
+        )
+
+        self.q = queue.Queue()
+        self.ctl = {
+            "stop": False,
+            "ir_heatmap": False,
+            "auto_step": True,
+            "force_reveal": False,
+            "arduino_stop": False,
         }
-      }
 
-      // DATA and SHA256 payloads are case-sensitive.
-      if (strncmp(serialBuffer, "DATA ", 5) == 0) {
-        executeCommand(serialBuffer);
-      }
-      else if (strncmp(serialBuffer, "SHA256 ", 7) == 0) {
-        executeCommand(serialBuffer);
-      }
-      else {
-        executeCommand(command);
-      }
+        self.engine = BitPoolingSearchEngine(
+            bit_depth=PASSCODE_BITS
+        )
+        self.camera_thread = None
+        self.camera_ready = False
+        self.pending_diff = None
+        self.arduino_thread = None
 
-      index = 0;
+        self._build_ui()
+        self.window.protocol("WM_DELETE_WINDOW", self._close)
+        self.window.after(15, self._poll)
 
-      continue;
-    }
+    def _build_ui(self):
+        main_frame = ttk.Frame(self.window, padding=10)
+        main_frame.pack(fill="both", expand=True)
 
-    if (index < sizeof(serialBuffer)-1) {
-      serialBuffer[index++] = c;
-    } else {
-      index = 0;
-      Serial.println(F("[ERROR] Command too long"));
-    }
-  }
-}
+        # Laboratory controls
+        control_frame = ttk.LabelFrame(
+            main_frame, text="Laboratory Controls"
+        )
+        control_frame.pack(fill="x", padx=5, pady=5)
 
-// =====================================================
-// SETUP
-// =====================================================
+        ttk.Button(
+            control_frame,
+            text="Start Camera",
+            command=self.start_camera,
+        ).pack(side="left", padx=5, pady=5)
 
-void setup() {
+        ttk.Button(
+            control_frame,
+            text="Stop Camera",
+            command=self.stop_camera,
+        ).pack(side="left", padx=5, pady=5)
 
-  Serial.begin(SERIAL_BAUD);
+        ttk.Button(
+            control_frame,
+            text="Step Bit Pool",
+            command=self.step_search,
+        ).pack(side="left", padx=5, pady=5)
 
-  while (!Serial && millis() < 3000) {}
+        ttk.Button(
+            control_frame,
+            text="Reset Pool",
+            command=self.reset_search,
+        ).pack(side="left", padx=5, pady=5)
 
-  // Silent boot: nothing is printed until a proof of work is found.
-  // Mining starts when a "DIFF <bits>" command arrives.
-}
+        self.v_ir = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            control_frame,
+            text="IR Thermal Heatmap",
+            variable=self.v_ir,
+            command=lambda: self.ctl.update(
+                ir_heatmap=self.v_ir.get()
+            ),
+        ).pack(side="left", padx=10)
 
-// =====================================================
-// MAIN LOOP
-// =====================================================
+        # Arduino controls
+        arduino_frame = ttk.LabelFrame(
+            main_frame,
+            text="Arduino Miner — SHA-256 Proof of Work",
+        )
+        arduino_frame.pack(fill="x", padx=5, pady=5)
 
-void loop() {
+        ttk.Label(
+            arduino_frame,
+            text="Serial port:",
+        ).pack(side="left", padx=5, pady=5)
 
-  readSerial();
+        self.v_arduino_port = tk.StringVar(value="COM3")
+        self.e_arduino_port = ttk.Entry(
+            arduino_frame,
+            width=14,
+            textvariable=self.v_arduino_port,
+        )
+        self.e_arduino_port.pack(side="left", padx=2, pady=5)
 
-  if (mining) {
-    miningStep();
-  }
-}
+        ttk.Button(
+            arduino_frame,
+            text="List Ports",
+            command=self.list_arduino_ports,
+        ).pack(side="left", padx=2, pady=5)
+
+        ttk.Button(
+            arduino_frame,
+            text="Connect Arduino",
+            command=self.connect_arduino,
+        ).pack(side="left", padx=10, pady=5)
+
+        ttk.Button(
+            arduino_frame,
+            text="Disconnect",
+            command=self.disconnect_arduino,
+        ).pack(side="left", padx=2, pady=5)
+
+        ttk.Label(
+            arduino_frame,
+            text="Difficulty (bits):",
+        ).pack(side="left", padx=(25, 5), pady=5)
+
+        self.v_diff = tk.StringVar(value="12")
+        ttk.Spinbox(
+            arduino_frame,
+            from_=MIN_DIFF,
+            to=MAX_DIFF,
+            width=5,
+            textvariable=self.v_diff,
+        ).pack(side="left", padx=2, pady=5)
+
+        ttk.Button(
+            arduino_frame,
+            text="Send Difficulty",
+            command=self.send_difficulty,
+        ).pack(side="left", padx=5, pady=5)
+
+        # Proof-of-work results
+        pow_frame = ttk.LabelFrame(
+            main_frame,
+            text="Proof of Work",
+        )
+        pow_frame.pack(fill="x", padx=5, pady=5)
+
+        self.v_link = tk.StringVar(value="Arduino: not connected")
+        self.v_pow_diff = tk.StringVar(value="")
+        self.v_pow_oracle = tk.StringVar(value="ORACLE   -")
+        self.v_pow_oracle_msg = tk.StringVar(value="")
+        self.v_pow_arduino = tk.StringVar(value="ARDUINO  -")
+        self.v_pow_arduino_msg = tk.StringVar(value="")
+        self.v_pow_match = tk.StringVar(value="")
+
+        for var in (
+            self.v_link,
+            self.v_pow_diff,
+            self.v_pow_oracle,
+            self.v_pow_oracle_msg,
+            self.v_pow_arduino,
+            self.v_pow_arduino_msg,
+            self.v_pow_match,
+        ):
+            # Read-only Entry: text can be selected and copied (Ctrl+C).
+            ttk.Entry(
+                pow_frame,
+                textvariable=var,
+                font=("Consolas", 10),
+                state="readonly",
+            ).pack(fill="x", padx=10, pady=1)
+
+        self.b_copy_pow = ttk.Button(
+            pow_frame,
+            text="Copy Proof of Work",
+            command=self.copy_pow,
+        )
+        self.b_copy_pow.pack(anchor="w", padx=10, pady=(3, 5))
+
+        # Local target controls
+        target_frame = ttk.LabelFrame(
+            main_frame,
+            text="Local 256-Bit Oracle Target (hexadecimal)",
+        )
+        target_frame.pack(fill="x", padx=5, pady=5)
+
+        self.target_label = ttk.Label(
+            target_frame,
+            text="Target (64 hex characters):",
+        )
+        self.target_label.pack(side="left", padx=5, pady=5)
+
+        self.v_custom_target = tk.StringVar(
+            value="[SECURE]"
+        )
+        self.e_custom_target = ttk.Entry(
+            target_frame,
+            width=72,
+            textvariable=self.v_custom_target,
+        )
+        self.e_custom_target.pack(
+            side="left", padx=5, pady=5
+        )
+
+        ttk.Button(
+            target_frame,
+            text="Set Custom",
+            command=self.set_custom_target,
+        ).pack(side="left", padx=2, pady=5)
+
+        ttk.Button(
+            target_frame,
+            text="Randomize Target",
+            command=self.randomize_target,
+        ).pack(side="left", padx=5, pady=5)
+
+        self.v_reveal = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            target_frame,
+            text="Force Reveal Local Target",
+            variable=self.v_reveal,
+            command=lambda: self.ctl.update(
+                force_reveal=self.v_reveal.get()
+            ),
+        ).pack(side="left", padx=15, pady=5)
+
+        # Camera and register display
+        display_frame = ttk.Frame(main_frame)
+        display_frame.pack(
+            fill="both", expand=True, padx=5, pady=5
+        )
+
+        camera_frame = ttk.LabelFrame(
+            display_frame,
+            text="Optoelectronic Circuit Camera Viewport",
+        )
+        camera_frame.pack(side="left", padx=5, pady=5)
+
+        self.cam_canvas = tk.Canvas(
+            camera_frame,
+            width=320,
+            height=240,
+            bg="black",
+        )
+        self.cam_canvas.pack(padx=5, pady=5)
+        self.cam_image_id = self.cam_canvas.create_image(
+            0, 0, anchor="nw"
+        )
+
+        right_panel = ttk.Frame(display_frame)
+        right_panel.pack(
+            side="right",
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5,
+        )
+
+        register_frame = ttk.LabelFrame(
+            right_panel,
+            text="Bit-Pooling Registers",
+        )
+        register_frame.pack(
+            fill="both", expand=True, padx=5, pady=5
+        )
+
+        self.register_canvas = tk.Canvas(
+            register_frame,
+            width=760,
+            height=300,
+            bg="#121414",
+            highlightthickness=0,
+        )
+        self.register_canvas.pack(
+            padx=5, pady=5
+        )
+
+        self.status_label = ttk.Label(
+            register_frame,
+            text="Status: IDLE",
+            font=("Consolas", 11),
+            foreground="#00e5ff",
+        )
+        self.status_label.pack(
+            anchor="w", padx=10, pady=5
+        )
+
+        # Pooling settings
+        settings_frame = ttk.LabelFrame(
+            right_panel,
+            text="Pooling & Algorithm Settings",
+        )
+        settings_frame.pack(
+            fill="both",
+            expand=True,
+            padx=5,
+            pady=5,
+        )
+
+        ttk.Label(
+            settings_frame,
+            text="Pooling Operator:",
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=5,
+        )
+
+        self.operator_combo = ttk.Combobox(
+            settings_frame,
+            values=[
+                "POPCOUNT",
+                "AND",
+                "OR",
+                "XOR",
+                "MAJORITY",
+            ],
+            state="readonly",
+        )
+        self.operator_combo.set("POPCOUNT")
+        self.operator_combo.grid(
+            row=0, column=1, padx=5, pady=5
+        )
+        self.operator_combo.bind(
+            "<<ComboboxSelected>>",
+            self._update_pool_operator,
+        )
+
+        ttk.Label(
+            settings_frame,
+            text="Kernel Size:",
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=5,
+            pady=5,
+        )
+
+        self.kernel_spin = ttk.Spinbox(
+            settings_frame,
+            from_=2,
+            to=8,
+            increment=2,
+            width=5,
+            command=self._update_kernel,
+        )
+        self.kernel_spin.set(4)
+        self.kernel_spin.grid(
+            row=1, column=1, padx=5, pady=5
+        )
+
+    def start_camera(self):
+        if (
+            self.camera_thread is not None
+            and self.camera_thread.is_alive()
+        ):
+            messagebox.showwarning(
+                "Already Running",
+                "The camera lab is already running.",
+            )
+            return
+
+        self.ctl["stop"] = False
+        self.camera_thread = SimThread(
+            0, self.ctl, self.q, self.engine
+        )
+        self.camera_thread.start()
+
+    def stop_camera(self):
+        self.ctl["stop"] = True
+
+    def step_search(self):
+        self.engine.step()
+
+    def reset_search(self):
+        self.engine.reset(bit_depth=PASSCODE_BITS)
+        self.v_custom_target.set("[SECURE]")
+
+    def list_arduino_ports(self):
+        try:
+            ports = ArduinoMiner.list_ports()
+        except Exception as e:
+            messagebox.showerror("Serial Error", str(e))
+            return
+
+        if not ports:
+            messagebox.showwarning(
+                "No Serial Ports",
+                "No serial ports were found.",
+            )
+            return
+
+        self.v_arduino_port.set(ports[0])
+        messagebox.showinfo(
+            "Serial Ports", "\n".join(ports)
+        )
+
+    def connect_arduino(self):
+        if (
+            self.arduino_thread is not None
+            and self.arduino_thread.is_alive()
+        ):
+            messagebox.showwarning(
+                "Already Connected",
+                "The lock box is already connected.",
+            )
+            return
+
+        port = self.v_arduino_port.get().strip()
+
+        if not port:
+            messagebox.showerror(
+                "Missing Port",
+                "Enter a serial port such as COM3.",
+            )
+            return
+
+        self.ctl["arduino_stop"] = False
+        self.arduino_thread = ArduinoThread(
+            port,
+            self.ctl,
+            self.q,
+            self.engine,
+        )
+        self.arduino_thread.start()
+
+        if self.camera_ready and self.pending_diff is not None:
+            self.arduino_thread.request_diff(self.pending_diff)
+            self.pending_diff = None
+
+    def disconnect_arduino(self):
+        if self.arduino_thread is not None:
+            self.ctl["arduino_stop"] = True
+
+    def _read_diff(self):
+        try:
+            diff = int(self.v_diff.get())
+        except ValueError:
+            return None
+
+        return diff if MIN_DIFF <= diff <= MAX_DIFF else None
+
+    def _arduino_alive(self):
+        return (
+            self.arduino_thread is not None
+            and self.arduino_thread.is_alive()
+        )
+
+    def send_difficulty(self):
+        if not self._arduino_alive():
+            messagebox.showwarning(
+                "Not Connected",
+                "Connect the Arduino first.",
+            )
+            return
+
+        diff = self._read_diff()
+
+        if diff is None:
+            messagebox.showerror(
+                "Invalid Difficulty",
+                f"Enter a whole number from {MIN_DIFF} to {MAX_DIFF}.",
+            )
+            return
+
+        if not self.camera_ready:
+            # Mining begins once the webcam is running.
+            self.pending_diff = diff
+            self.v_link.set(
+                f"Arduino: difficulty {diff} queued, "
+                "mining starts when the webcam starts."
+            )
+            return
+
+        self.arduino_thread.request_diff(diff)
+
+    def _on_camera_started(self):
+        self.camera_ready = True
+
+        diff = self.pending_diff
+
+        if diff is None:
+            diff = self._read_diff()
+
+        if diff is None:
+            return
+
+        if self._arduino_alive():
+            self.pending_diff = None
+            self.arduino_thread.request_diff(diff)
+        else:
+            # Connect Arduino later; mining starts as soon as it is up.
+            self.pending_diff = diff
+            self.v_link.set(
+                f"Webcam running. Difficulty {diff} will start mining "
+                "when the Arduino connects."
+            )
+
+    def _show_pow(self, snap):
+        def line(label, item):
+            if item is None:
+                return f"{label}  ..."
+
+            return (
+                f"{label}  nonce {item['nonce']}  "
+                f"hash {item['hash']:064x}  "
+                f"({item['elapsed']:.3f} s)"
+            )
+
+        def msg(item):
+            if item is None:
+                return ""
+
+            n = len(item["padded"])
+            return (
+                f"          message {item['message']!r}  "
+                f"[{n} bytes padded, {n * 8} bits]"
+            )
+
+        self.v_pow_diff.set(f"Difficulty: {snap['diff']} bits")
+        self.v_pow_oracle.set(line("ORACLE  ", snap["predicted"]))
+        self.v_pow_oracle_msg.set(msg(snap["predicted"]))
+        self.v_pow_arduino.set(line("ARDUINO ", snap["arduino"]))
+        self.v_pow_arduino_msg.set(msg(snap["arduino"]))
+
+        if snap["match"] is None:
+            self.v_pow_match.set("")
+        elif snap["match"]:
+            self.v_pow_match.set("MATCH: same nonce, hash and padded message")
+        else:
+            self.v_pow_match.set(
+                "MISMATCH: nonce, hash or padded message differs"
+            )
+
+    def copy_pow(self):
+        lines = [
+            var.get().strip()
+            for var in (
+                self.v_link,
+                self.v_pow_diff,
+                self.v_pow_oracle,
+                self.v_pow_oracle_msg,
+                self.v_pow_arduino,
+                self.v_pow_arduino_msg,
+                self.v_pow_match,
+            )
+            if var.get().strip()
+        ]
+
+        self.window.clipboard_clear()
+        self.window.clipboard_append("\n".join(lines))
+        self.window.update()  # keep the clipboard after the app closes
+
+        self.b_copy_pow.config(text="Copied!")
+        self.window.after(
+            1200,
+            lambda: self.b_copy_pow.config(text="Copy Proof of Work"),
+        )
+
+    def set_custom_target(self):
+        text = self.v_custom_target.get().strip()
+
+        if text.startswith("0x") or text.startswith("0X"):
+            text = text[2:]
+
+        try:
+            value = int(text, 16)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Input",
+                "Enter a 64-character hexadecimal value.",
+            )
+            return
+
+        if 0 <= value <= (1 << PASSCODE_BITS) - 1:
+            self.engine.reset(value, PASSCODE_BITS)
+            messagebox.showinfo(
+                "Target Set",
+                "New 256-bit target configured for bit pooling.",
+            )
+        else:
+            messagebox.showerror(
+                "Invalid Range",
+                "Target must be a 256-bit hexadecimal value.",
+            )
+
+    def randomize_target(self):
+        self.engine.reset(bit_depth=PASSCODE_BITS)
+        self.v_custom_target.set("[SECURE]")
+
+    def _update_pool_operator(self, event):
+        operator = self.operator_combo.get()
+        self.engine.pool_op = operator
+        self.engine.oracle.pool_op = operator
+
+    def _update_kernel(self):
+        try:
+            kernel = int(self.kernel_spin.get())
+            self.engine.kernel_size = kernel
+            self.engine.oracle.kernel_size = kernel
+        except ValueError:
+            pass
+
+    def _draw_hex_rows(
+        self,
+        target_value,
+        guess_value,
+        pooled_value,
+        revealed,
+    ):
+        self.register_canvas.delete("all")
+
+        is_exposed = revealed or self.engine.converged
+        active_target = target_value if is_exposed else 0
+        depth = self.engine.bit_depth
+        width = depth // 4
+
+        rows = [
+            ("TARGET", active_target, "#00e676", not is_exposed),
+            ("GUESS ", guess_value, "#ffb300", False),
+            ("POOLED", pooled_value, "#b388ff", False),
+        ]
+
+        y = 20
+
+        for label, value, colour, hidden in rows:
+            self.register_canvas.create_text(
+                10,
+                y,
+                text=label,
+                fill="#88a0c0",
+                anchor="w",
+                font=("Consolas", 10, "bold"),
+            )
+
+            full = "[HIDDEN]" if hidden else f"{value:0{width}X}"
+
+            # Wrap long registers (128 hex chars for a 512-bit block).
+            for i in range(0, len(full), 64):
+                self.register_canvas.create_text(
+                    90,
+                    y,
+                    text=full[i:i + 64],
+                    fill=colour,
+                    anchor="w",
+                    font=("Consolas", 10),
+                )
+                y += 18
+
+            y += 17
+
+        self.register_canvas.create_text(
+            10,
+            y,
+            anchor="w",
+            fill="#d2e0f0",
+            font=("Consolas", 10),
+            text=(
+                f"{depth}-bit register | "
+                f"{self.engine.step_count}/{depth} reconstruction steps"
+            ),
+        )
+
+    def _poll(self):
+        try:
+            for _ in range(100):
+                event = self.q.get_nowait()
+
+                if event[0] == "frame":
+                    data = event[1]
+                    self.photo = ppm_photo(data["preview"])
+                    self.cam_canvas.itemconfig(
+                        self.cam_image_id,
+                        image=self.photo,
+                    )
+
+                    self._draw_hex_rows(
+                        data["target"],
+                        data["guess"],
+                        data["pooled"],
+                        self.v_reveal.get(),
+                    )
+
+                    self.status_label.config(
+                        text=(
+                            f"Status: {data['status']} | "
+                            f"Bit Step: {data['steps']}/{data['depth']}"
+                        )
+                    )
+
+                elif event[0] == "arduino":
+                    self.v_link.set(f"Arduino: {event[1]}")
+
+                elif event[0] == "pow_update":
+                    self._show_pow(event[1])
+
+                elif event[0] == "arduino_error":
+                    messagebox.showerror(
+                        "Arduino Error", event[1]
+                    )
+
+                elif event[0] == "camera_started":
+                    self._on_camera_started()
+
+                elif event[0] == "done":
+                    self.camera_ready = False
+
+                elif event[0] == "error":
+                    messagebox.showerror(
+                        "Camera Error", event[1]
+                    )
+
+        except queue.Empty:
+            pass
+
+        self.window.after(30, self._poll)
+
+    def _close(self):
+        self.ctl["stop"] = True
+        self.ctl["arduino_stop"] = True
+        self.window.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = App(root)
+    root.geometry("1240x780")
+    root.mainloop()
