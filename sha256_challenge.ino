@@ -77,7 +77,15 @@ class BitPoolingOracle:
         if target is None:
             target = secrets.randbits(bit_depth)
 
-        self._target = int(target) & self.max_val
+        # A target that exposes value() is a live connection: nothing is
+        # generated or stored here, every answer is read through the link.
+        self._link = None
+        self._fixed = 0
+
+        if callable(getattr(target, "value", None)):
+            self._link = target
+        else:
+            self._fixed = int(target) & self.max_val
 
         self.kernel_size = 4
         self.stride = 2
@@ -87,6 +95,13 @@ class BitPoolingOracle:
         self.pooled_bits = 0
         self.pooled_count = 0
         self.is_done = False
+
+    @property
+    def _target(self) -> int:
+        if self._link is not None:
+            return self._link.value() & self.max_val
+
+        return self._fixed
 
     def query_bit(self, trial_val: int) -> int:
         """Returns 1 if the hidden target is greater than or equal to trial_val."""
@@ -285,6 +300,61 @@ def message_text(padded: bytes) -> str:
         return "<invalid padding>"
 
 
+class PowLink:
+    """
+    The oracle's ethereal connection to the mining result. The oracle does not
+    generate or hold a target: the target is whatever the proof of work for
+    this session resolves to (the minimally padded SHA256(DATA + nonce)
+    message), and it is read through this link when the oracle is queried.
+    Nothing is read from the Arduino.
+    """
+
+    def __init__(self, data: str, diff: int, cancel: threading.Event):
+        self._data = data
+        self._diff = diff
+        self._cancel = cancel
+        self._lock = threading.Lock()
+        self._padded = None
+        self._depth = None
+
+    def _resolve(self) -> bool:
+        with self._lock:
+            if self._padded is not None:
+                return True
+
+            base = hashlib.sha256(self._data.encode("ascii"))
+            limit = 1 << (256 - self._diff)  # leading-zero test: value < limit
+
+            nonce = 0
+
+            while nonce <= 0xFFFFFFFF:
+                if (nonce & 0xFFF) == 0 and self._cancel.is_set():
+                    return False
+
+                h = base.copy()
+                h.update(str(nonce).encode("ascii"))
+
+                if int.from_bytes(h.digest(), "big") < limit:
+                    padded = sha256_pad((self._data + str(nonce)).encode("ascii"))
+                    self._padded = int.from_bytes(padded, "big")
+                    self._depth = len(padded) * 8
+                    return True
+
+                nonce += 1
+
+            return False
+
+    def depth(self):
+        """Bit depth of the connected target, or None if cancelled."""
+        return self._depth if self._resolve() else None
+
+    def value(self) -> int:
+        if not self._resolve():
+            raise PermissionError("Oracle link closed before the target resolved.")
+
+        return self._padded
+
+
 class MiningSession:
     """
     One difficulty send. Holds what the background oracle found and what the
@@ -309,6 +379,7 @@ class MiningSession:
             "nonce": nonce,
             "hash": hash_int,
             "padded": padded,
+            "target": padded.hex(),
             "message": message_text(padded),
             "elapsed": (
                 time.perf_counter() - self.t0
@@ -328,6 +399,33 @@ class MiningSession:
 
         self.out.put(("pow_update", self.snapshot()))
 
+    def set_live(self, guess: int, steps: int, depth: int):
+        """Real-time oracle view: whatever the bit pooler has revealed so far."""
+        if self.cancel.is_set():
+            return
+
+        raw = guess.to_bytes(depth // 8, "big")[: steps // 8]
+        body = raw.split(b"\x80")[0]
+        text = body.decode("ascii", errors="replace")
+        nonce_text = text[len(self.data):] if text.startswith(self.data) else ""
+
+        with self._lock:
+            self.predicted = {
+                "live": True,
+                "steps": steps,
+                "depth": depth,
+                "nonce": nonce_text,
+                "hash": None,
+                "padded": raw,
+                "target": f"{guess:0{depth // 4}x}"[: steps // 4].ljust(
+                    depth // 4, "."
+                ),
+                "message": text,
+                "elapsed": time.perf_counter() - self.t0,
+            }
+
+        self.out.put(("pow_update", self.snapshot()))
+
     def set_arduino(self, nonce: int, hash_int: int, padded: bytes):
         if self.cancel.is_set():
             return
@@ -344,7 +442,11 @@ class MiningSession:
 
         match = None
 
-        if predicted is not None and arduino is not None:
+        if (
+            predicted is not None
+            and not predicted.get("live")
+            and arduino is not None
+        ):
             match = (
                 predicted["nonce"] == arduino["nonce"]
                 and predicted["hash"] == arduino["hash"]
@@ -362,11 +464,11 @@ class MiningSession:
 class BackgroundPredictor(threading.Thread):
     """
     The camera oracle's background worker. It runs independently of the
-    Arduino link: it searches for the same proof of work (SHA256(DATA + nonce),
-    nonce counting up from 0), loads the minimally padded message block into
-    the bit-pooling engine as the hidden target, lets the engine reconstruct
-    it one bit at a time, then decodes message, nonce and hash from the
-    reconstructed bits alone.
+    Arduino link: its target is not generated or stored, it is connected to
+    the mining result (SHA256(DATA + nonce), nonce counting up from 0) through
+    a PowLink, so the minimally padded message block only exists as the
+    oracle's answers. The engine reconstructs it one bit at a time, then
+    message, nonce and hash are decoded from the reconstructed bits alone.
     """
 
     def __init__(self, session: MiningSession, engine: BitPoolingSearchEngine):
@@ -376,45 +478,21 @@ class BackgroundPredictor(threading.Thread):
 
     def run(self):
         session = self.session
-        base = hashlib.sha256(session.data.encode("ascii"))
-        limit = 1 << (256 - session.diff)  # leading-zero test: value < limit
 
-        nonce = 0
-        found = None
+        # The oracle is connected to the mining result; it does not generate
+        # or store a target of its own.
+        link = PowLink(session.data, session.diff, session.cancel)
+        depth = link.depth()
 
-        while nonce <= 0xFFFFFFFF:
-            if (nonce & 0xFFF) == 0 and session.cancel.is_set():
-                return
-
-            h = base.copy()
-            h.update(str(nonce).encode("ascii"))
-            value = int.from_bytes(h.digest(), "big")
-
-            if value < limit:
-                found = value
-                break
-
-            nonce += 1
-
-        if found is None or session.cancel.is_set():
+        if depth is None or session.cancel.is_set():
             return
 
-        # The oracle's pre-knowledge: the exact message that was hashed, in
-        # its minimal SHA-256 padded form, becomes the hidden target.
-        message = (session.data + str(nonce)).encode("ascii")
-        padded = sha256_pad(message)
-        depth = len(padded) * 8
-
-        # The oracle exists as soon as the proof of work is found, so it is
-        # displayed immediately, with the time it was made. The bit-by-bit
-        # reconstruction below then confirms it from the decoded bits.
-        t_found = time.perf_counter() - session.t0
-        session.set_predicted(nonce, found, padded, t_found)
-
-        self.engine.reset(int.from_bytes(padded, "big"), depth)
+        self.engine.reset(link, depth)
 
         while not session.cancel.is_set() and not self.engine.converged:
             self.engine.step()
+            live_guess, _, live_depth = self.engine.result()
+            session.set_live(live_guess, self.engine.step_count, live_depth)
 
         if session.cancel.is_set():
             return
@@ -434,7 +512,7 @@ class BackgroundPredictor(threading.Thread):
             return
 
         hash_out = int.from_bytes(hashlib.sha256(msg).digest(), "big")
-        session.set_predicted(nonce_out, hash_out, decoded, t_found)
+        session.set_predicted(nonce_out, hash_out, decoded)
 
 
 # ==============================================================================
@@ -904,6 +982,7 @@ class App:
         self.v_pow_diff = tk.StringVar(value="")
         self.v_pow_oracle = tk.StringVar(value="ORACLE   -")
         self.v_pow_oracle_msg = tk.StringVar(value="")
+        self.v_pow_oracle_target = tk.StringVar(value="")
         self.v_pow_arduino = tk.StringVar(value="ARDUINO  -")
         self.v_pow_arduino_msg = tk.StringVar(value="")
         self.v_pow_match = tk.StringVar(value="")
@@ -913,6 +992,7 @@ class App:
             self.v_pow_diff,
             self.v_pow_oracle,
             self.v_pow_oracle_msg,
+            self.v_pow_oracle_target,
             self.v_pow_arduino,
             self.v_pow_arduino_msg,
             self.v_pow_match,
@@ -1259,6 +1339,13 @@ class App:
             if item is None:
                 return f"{label}  ..."
 
+            if item.get("live"):
+                return (
+                    f"{label}  nonce {item['nonce'] or '...'}  "
+                    f"hash ...  ({item['elapsed']:.3f} s)  "
+                    f"pooling {item['steps']}/{item['depth']}"
+                )
+
             return (
                 f"{label}  nonce {item['nonce']}  "
                 f"hash {item['hash']:064x}  "
@@ -1269,6 +1356,12 @@ class App:
             if item is None:
                 return ""
 
+            if item.get("live"):
+                return (
+                    f"          message {item['message']!r}  "
+                    f"[{item['steps']}/{item['depth']} bits pooled]"
+                )
+
             n = len(item["padded"])
             return (
                 f"          message {item['message']!r}  "
@@ -1278,6 +1371,11 @@ class App:
         self.v_pow_diff.set(f"Difficulty: {snap['diff']} bits")
         self.v_pow_oracle.set(line("ORACLE  ", snap["predicted"]))
         self.v_pow_oracle_msg.set(msg(snap["predicted"]))
+        self.v_pow_oracle_target.set(
+            ""
+            if snap["predicted"] is None
+            else "          target  " + snap["predicted"]["target"]
+        )
         self.v_pow_arduino.set(line("ARDUINO ", snap["arduino"]))
         self.v_pow_arduino_msg.set(msg(snap["arduino"]))
 
@@ -1298,6 +1396,7 @@ class App:
                 self.v_pow_diff,
                 self.v_pow_oracle,
                 self.v_pow_oracle_msg,
+                self.v_pow_oracle_target,
                 self.v_pow_arduino,
                 self.v_pow_arduino_msg,
                 self.v_pow_match,
@@ -1391,7 +1490,13 @@ class App:
                 font=("Consolas", 10, "bold"),
             )
 
-            full = "[HIDDEN]" if hidden else f"{value:0{width}X}"
+            if hidden and label == "TARGET" and self.engine.oracle._link is not None:
+                # Connected to the oracle: the target register is aligned with
+                # what the oracle has revealed so far (unrevealed nibbles: '.').
+                shown = self.engine.step_count // 4
+                full = f"{guess_value:0{width}X}"[:shown].ljust(width, ".")
+            else:
+                full = "[HIDDEN]" if hidden else f"{value:0{width}X}"
 
             # Wrap long registers (128 hex chars for a 512-bit block).
             for i in range(0, len(full), 64):
