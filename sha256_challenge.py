@@ -5,6 +5,7 @@ Adapted from the RP-style optoelectronic decision circuit framework.
 """
 
 import asyncio
+import hashlib
 import queue
 import random
 import re
@@ -513,8 +514,10 @@ class App:
 
         ttk.Label(target_frame, text="RX Hex:").pack(side="left", padx=(10, 2), pady=5)
         self.v_hex = tk.StringVar(value="")
-        self.e_hex = ttk.Entry(target_frame, width=24, textvariable=self.v_hex, state="readonly")
+        self.e_hex = ttk.Entry(target_frame, width=24, textvariable=self.v_hex)
         self.e_hex.pack(side="left", padx=2, pady=5)
+        ttk.Button(target_frame, text="Convert", command=self.convert_rx).pack(side="left", padx=2, pady=5)
+        ttk.Button(target_frame, text="Copy", command=self.copy_conv).pack(side="left", padx=2, pady=5)
 
         ttk.Button(target_frame, text="Randomize Target", command=self.randomize_target).pack(side="left", padx=5, pady=5)
 
@@ -529,15 +532,6 @@ class App:
         self.diff_spin.set(8)
         self.diff_spin.pack(side="left", padx=2, pady=5)
         ttk.Button(target_frame, text="Send diff n", command=self.send_diff).pack(side="left", padx=5, pady=5)
-
-        # Convert row: POW:<nonce>:<hash>:<padded msg>:<padded nonce>:<padded hash>:<header>
-        conv_frame = ttk.LabelFrame(main_frame, text="Convert")
-        conv_frame.pack(fill="x", padx=5, pady=5)
-        ttk.Button(conv_frame, text="Convert", command=self.convert_rx).pack(side="left", padx=5, pady=5)
-        self.v_conv = tk.StringVar(value="")
-        ttk.Entry(conv_frame, textvariable=self.v_conv, state="readonly").pack(
-            side="left", fill="x", expand=True, padx=2, pady=5)
-        ttk.Button(conv_frame, text="Copy", command=self.copy_conv).pack(side="left", padx=5, pady=5)
 
         # Viewport and registers
         display_frame = ttk.Frame(main_frame)
@@ -660,7 +654,6 @@ class App:
         self.rx_hash = b""
         self.extractor.reset()
         self.v_hex.set("")
-        self.v_conv.set("")
         self._refresh_serial_label()
 
     def _on_force_serial(self):
@@ -692,24 +685,32 @@ class App:
             self._refresh_serial_label("(send failed)")
 
     def convert_rx(self):
-        """Convert the last received challenge + SOLUTION into the long POW line."""
-        if not self.rx_buf:
-            messagebox.showerror("Convert", "No POW challenge received yet.")
+        """Convert the hex in the RX Hex box into the long POW line, in place."""
+        text = re.sub(r"\s+", "", self.v_hex.get())
+        if text.upper().startswith("POW:"):
+            messagebox.showinfo("Convert", "RX Hex is already converted.")
             return
-        if not (self.rx_nonce and self.rx_hash):
-            messagebox.showerror("Convert", "No SOLUTION (nonce/hash) received yet.")
+        if not re.fullmatch(rf"[0-9A-Fa-f]{{{HEX_DIGITS}}}", text):
+            messagebox.showerror("Convert", f"Expected {HEX_DIGITS} hex characters in RX Hex.")
             return
-        line = convert_pow(self.rx_buf, self.rx_nonce, self.rx_hash)
-        self.v_conv.set(line)
-        self._refresh_serial_label("(converted)")
+        challenge = bytes.fromhex(text)
+        if self.rx_nonce and self.rx_hash and challenge == self.rx_buf:
+            nonce, digest = self.rx_nonce, self.rx_hash       # use the device's SOLUTION
+            note = "(converted)"
+        else:                                                  # hex alone: nonce 0, hash computed
+            nonce = bytes(NONCE_BYTES)
+            digest = hashlib.sha256(challenge + nonce).digest()
+            note = "(converted: nonce=0, hash computed)"
+        self.v_hex.set(convert_pow(challenge, nonce, digest))
+        self._refresh_serial_label(note)
 
     def copy_conv(self):
-        text = self.v_conv.get()
+        text = self.v_hex.get()
         if not text:
             return
         self.window.clipboard_clear()
         self.window.clipboard_append(text)
-        self._refresh_serial_label("(copied converted line)")
+        self._refresh_serial_label("(copied RX Hex)")
 
     def _apply_rx(self):
         """Load the received hex value as the oracle target and unmask TARGET."""
@@ -913,5 +914,5 @@ class App:
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
-    root.geometry("1160x720")
+    root.geometry("860x600")
     root.mainloop()
