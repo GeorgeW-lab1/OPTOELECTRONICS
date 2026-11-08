@@ -382,28 +382,28 @@ class App:
         self.lbl_status.config(text=f"{register} register copied ({len(binary)} bits)")
 
 
-def copy_all_registers(self):
-    if not (self.engine.converged or self.ctl["force_reveal"]):
-        target = "[HIDDEN]"
-    else:
-        target = format(
-            self.engine.oracle._target,
-            f"0{self.engine.bit_depth}b"
+    def copy_all_registers(self):
+        if not (self.engine.converged or self.ctl["force_reveal"]):
+            target = "[HIDDEN]"
+        else:
+            target = format(
+                self.engine.oracle._target,
+                f"0{self.engine.bit_depth}b"
+            )
+
+        depth = self.engine.bit_depth
+
+        data = (
+            f"TARGET: {target}\n"
+            f"GUESS: {format(self.engine.guess_reg, f'0{depth}b')}\n"
+            f"POOLED: {format(self.engine.pooled_register, f'0{depth}b')}"
         )
 
-    depth = self.engine.bit_depth
+        self.window.clipboard_clear()
+        self.window.clipboard_append(data)
+        self.window.update()
 
-    data = (
-        f"TARGET: {target}\n"
-        f"GUESS: {format(self.engine.guess_reg, f'0{depth}b')}\n"
-        f"POOLED: {format(self.engine.pooled_register, f'0{depth}b')}"
-    )
-
-    self.window.clipboard_clear()
-    self.window.clipboard_append(data)
-    self.window.update()
-
-    self.lbl_status.config(text="All registers copied to clipboard")
+        self.lbl_status.config(text="All registers copied to clipboard")
 
     def set_serial_target(self, value):
         self.engine.reset(value)
