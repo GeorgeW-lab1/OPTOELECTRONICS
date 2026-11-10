@@ -263,10 +263,161 @@ def compare_btc_prices(oracle_price, key_injector=None):
             )
 
 
+# Hardware scancodes (PS/2 set 1 for Windows, evdev codes for Linux).
+SCANCODES_WIN = {"w": 0x11, "s": 0x1F}
+EVDEV_CODES = {"w": 17, "s": 31}
+
+
+class ScancodeBackend:
+    """
+    Sends raw scancodes so games that ignore virtual-key
+    events still see the keypress.
+
+    Windows: SendInput with KEYEVENTF_SCANCODE (no extra install).
+    Linux:   uinput via evdev (pip install evdev; needs write
+             access to /dev/uinput, e.g. run with sudo).
+    Other:   falls back to pynput virtual keys.
+    """
+
+    def __init__(self):
+        import sys
+
+        self.mode = None
+
+        if sys.platform.startswith("win"):
+            self._init_windows()
+            self.mode = "windows"
+
+        elif sys.platform.startswith("linux"):
+            try:
+                self._init_linux()
+                self.mode = "linux"
+            except Exception as error:
+                print(
+                    f"[keys] uinput unavailable ({error}); "
+                    f"falling back to pynput (no scancodes)"
+                )
+
+        if self.mode is None:
+            from pynput.keyboard import Controller
+
+            self._pynput = Controller()
+            self.mode = "pynput"
+
+        print(f"[keys] backend: {self.mode}")
+
+    def _init_windows(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        ulong_p = ctypes.POINTER(ctypes.c_ulong)
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ulong_p),
+            ]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ulong_p),
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", wintypes.DWORD),
+                ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD),
+            ]
+
+        class _INPUTUNION(ctypes.Union):
+            _fields_ = [
+                ("ki", KEYBDINPUT),
+                ("mi", MOUSEINPUT),
+                ("hi", HARDWAREINPUT),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", wintypes.DWORD),
+                ("u", _INPUTUNION),
+            ]
+
+        self._KEYBDINPUT = KEYBDINPUT
+        self._INPUTUNION = _INPUTUNION
+        self._INPUT = INPUT
+
+    def _win_send(self, scan, up):
+        ctypes = self._ctypes
+        KEYEVENTF_SCANCODE = 0x0008
+        KEYEVENTF_KEYUP = 0x0002
+
+        flags = KEYEVENTF_SCANCODE | (
+            KEYEVENTF_KEYUP if up else 0
+        )
+        extra = ctypes.c_ulong(0)
+        ki = self._KEYBDINPUT(
+            0,  # wVk must be 0 when using scancodes
+            scan,
+            flags,
+            0,
+            ctypes.pointer(extra),
+        )
+        event = self._INPUT(
+            type=1,  # INPUT_KEYBOARD
+            u=self._INPUTUNION(ki=ki),
+        )
+        ctypes.windll.user32.SendInput(
+            1,
+            ctypes.byref(event),
+            ctypes.sizeof(event),
+        )
+
+    def _init_linux(self):
+        from evdev import UInput, ecodes
+
+        self._ecodes = ecodes
+        self._uinput = UInput(
+            {ecodes.EV_KEY: list(EVDEV_CODES.values())},
+            name="price-predictor-kbd",
+        )
+
+    def press(self, key):
+        if self.mode == "windows":
+            self._win_send(SCANCODES_WIN[key], up=False)
+        elif self.mode == "linux":
+            self._uinput.write(
+                self._ecodes.EV_KEY, EVDEV_CODES[key], 1
+            )
+            self._uinput.syn()
+        else:
+            self._pynput.press(key)
+
+    def release(self, key):
+        if self.mode == "windows":
+            self._win_send(SCANCODES_WIN[key], up=True)
+        elif self.mode == "linux":
+            self._uinput.write(
+                self._ecodes.EV_KEY, EVDEV_CODES[key], 0
+            )
+            self._uinput.syn()
+        else:
+            self._pynput.release(key)
+
+
 class KeyInjector:
     """
-    Injects W (price rose) or S (price fell) into
-    whichever window currently has focus.
+    Injects W (price rose) or S (price fell) as hardware
+    scancodes into whichever window currently has focus.
     """
 
     def __init__(self, enabled=True, hold=0.05, threshold=0.0):
@@ -277,9 +428,7 @@ class KeyInjector:
         self.last_key = None
 
         if enabled:
-            from pynput.keyboard import Controller
-
-            self.controller = Controller()
+            self.controller = ScancodeBackend()
 
     def signal(self, last_price, fresh_price):
         """
@@ -709,7 +858,7 @@ def main():
     parser.add_argument(
         "--price-window",
         type=int,
-        default=3,
+        default=12,
     )
 
     parser.add_argument(
