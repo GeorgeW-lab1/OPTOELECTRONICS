@@ -18,8 +18,8 @@ python optoelectronic_sim-5.py --cam 1 --price --price-poll 2
 python optoelectronic_sim-5.py --price --no-keys   (disable key injection)
 
 Key injection (requires: pip install pynput):
-Fresh price above the last downloaded price -> taps Shift+W
-Fresh price below the last downloaded price -> taps Shift+S
+Next oracle price above the last oracle price -> taps Shift+W
+Next oracle price below the last oracle price -> taps Shift+S
 """
 
 import argparse
@@ -206,7 +206,22 @@ def compare_btc_prices(oracle_price, key_injector=None):
     with the price the oracle just used.
 
     Nothing is saved or updated.
+
+    Key injection fires first, from the delta between the
+    previous oracle price and this oracle price.
     """
+    if key_injector is not None:
+        key = key_injector.on_oracle_price(oracle_price)
+
+        if key:
+            print(
+                f"KEY INJECTED:     SHIFT+{key.upper()} "
+                f"({'UP' if key == 'w' else 'DOWN'}"
+                f"{', repeated: identical' if key_injector.last_delta == 0 else ''}"
+                f", oracle delta "
+                f"{key_injector.last_delta:+.8f})"
+            )
+
     fresh_btc_price = live_btc_price()
 
     difference = (
@@ -248,19 +263,6 @@ def compare_btc_prices(oracle_price, key_injector=None):
     )
     print(f"Result:           {result}")
 
-    # Key injection from the raw delta vs the last downloaded price.
-    if key_injector is not None:
-        key = key_injector.signal(
-            oracle_price,
-            fresh_btc_price,
-        )
-
-        if key:
-            print(
-                f"KEY INJECTED:     SHIFT+{key.upper()} "
-                f"({'UP' if key == 'w' else 'DOWN'}"
-                f"{', repeated: identical' if difference == 0 else ''})"
-            )
 
 
 # Hardware scancodes (PS/2 set 1 for Windows, evdev codes for Linux).
@@ -435,14 +437,32 @@ class KeyInjector:
         self.threshold = threshold
         self.controller = None
         self.last_key = None
+        self.prev_oracle_price = None
+        self.last_delta = 0.0
 
         if enabled:
             self.controller = ScancodeBackend()
 
+    def on_oracle_price(self, price):
+        """
+        Called once per oracle sample. Compares it with the
+        previous oracle sample; the first sample has nothing
+        to compare against, so it sends no key.
+        """
+        previous = self.prev_oracle_price
+        self.prev_oracle_price = price
+
+        if previous is None:
+            return None
+
+        self.last_delta = price - previous
+
+        return self.signal(previous, price)
+
     def signal(self, last_price, fresh_price):
         """
-        Delta from the last price downloaded.
-        Fresh above last -> W, fresh below last -> S.
+        Delta between two prices.
+        Higher -> W, lower -> S.
         Identical -> repeats the key of the last real move.
         Returns the key sent ('w', 's') or None.
         """
