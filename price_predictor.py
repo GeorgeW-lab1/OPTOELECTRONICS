@@ -198,6 +198,13 @@ def live_btc_price():
     return float(data["price"])
 
 
+def print_key_line(key, note):
+    print(
+        f"KEY INJECTED:     SHIFT+{key.upper()} "
+        f"({'UP' if key == 'w' else 'DOWN'}, {note})"
+    )
+
+
 def compare_btc_prices(oracle_price, key_injector=None):
     """
     Called immediately after the oracle finishes.
@@ -207,19 +214,22 @@ def compare_btc_prices(oracle_price, key_injector=None):
 
     Nothing is saved or updated.
 
-    Key injection fires first, from the delta between the
-    previous oracle price and this oracle price.
+    Key injection: the delta between the previous oracle
+    price and this oracle price decides Shift+W / Shift+S.
+    If the two oracle prices are identical, the fresh price
+    (which can still differ) breaks the tie, below.
     """
-    if key_injector is not None:
-        key = key_injector.on_oracle_price(oracle_price)
+    oracle_delta = None
 
-        if key:
-            print(
-                f"KEY INJECTED:     SHIFT+{key.upper()} "
-                f"({'UP' if key == 'w' else 'DOWN'}"
-                f"{', repeated: identical' if key_injector.last_delta == 0 else ''}"
-                f", oracle delta "
-                f"{key_injector.last_delta:+.8f})"
+    if key_injector is not None:
+        oracle_delta = key_injector.on_oracle_price(
+            oracle_price
+        )
+
+        if key_injector.sent_key:
+            print_key_line(
+                key_injector.sent_key,
+                f"oracle delta {oracle_delta:+.8f}",
             )
 
     fresh_btc_price = live_btc_price()
@@ -262,6 +272,24 @@ def compare_btc_prices(oracle_price, key_injector=None):
         f"{percent_difference:.8f}%"
     )
     print(f"Result:           {result}")
+
+    # Oracle prices were identical: fresh price breaks the tie.
+    if (
+        key_injector is not None
+        and oracle_delta == 0
+    ):
+        key = key_injector.signal(
+            oracle_price,
+            fresh_btc_price,
+        )
+
+        if key:
+            if difference == 0:
+                note = "identical again, repeated last direction"
+            else:
+                note = f"fresh price delta {difference:+.8f}"
+
+            print_key_line(key, note)
 
 
 
@@ -439,6 +467,7 @@ class KeyInjector:
         self.last_key = None
         self.prev_oracle_price = None
         self.last_delta = 0.0
+        self.sent_key = None
 
         if enabled:
             self.controller = ScancodeBackend()
@@ -446,18 +475,28 @@ class KeyInjector:
     def on_oracle_price(self, price):
         """
         Called once per oracle sample. Compares it with the
-        previous oracle sample; the first sample has nothing
-        to compare against, so it sends no key.
+        previous oracle sample and returns the delta
+        (None on the first sample).
+
+        A non-zero delta sends its key immediately. A zero
+        delta sends nothing here: the caller breaks the tie
+        with the fresh price, because identical oracle prices
+        can still have a different live price.
         """
         previous = self.prev_oracle_price
         self.prev_oracle_price = price
+        self.sent_key = None
 
         if previous is None:
             return None
 
-        self.last_delta = price - previous
+        delta = price - previous
+        self.last_delta = delta
 
-        return self.signal(previous, price)
+        if delta != 0:
+            self.sent_key = self.signal(previous, price)
+
+        return delta
 
     def signal(self, last_price, fresh_price):
         """
