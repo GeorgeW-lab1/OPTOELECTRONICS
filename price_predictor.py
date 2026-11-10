@@ -15,6 +15,11 @@ python optoelectronic_sim-5.py --price
 python optoelectronic_sim-5.py --price --price-poll 2
 python optoelectronic_sim-5.py --synthetic --headless --price --runs 5
 python optoelectronic_sim-5.py --cam 1 --price --price-poll 2
+python optoelectronic_sim-5.py --price --no-keys   (disable key injection)
+
+Key injection (requires: pip install pynput):
+Fresh price above the last downloaded price -> taps W
+Fresh price below the last downloaded price -> taps S
 """
 
 import argparse
@@ -193,7 +198,7 @@ def live_btc_price():
     return float(data["price"])
 
 
-def compare_btc_prices(oracle_price):
+def compare_btc_prices(oracle_price, key_injector=None):
     """
     Called immediately after the oracle finishes.
 
@@ -242,6 +247,76 @@ def compare_btc_prices(oracle_price):
         f"{percent_difference:.8f}%"
     )
     print(f"Result:           {result}")
+
+    # Key injection from the raw delta vs the last downloaded price.
+    if key_injector is not None:
+        key = key_injector.signal(
+            oracle_price,
+            fresh_btc_price,
+        )
+
+        if key:
+            print(
+                f"KEY INJECTED:     {key.upper()} "
+                f"({'UP' if key == 'w' else 'DOWN'}"
+                f"{', repeated: identical' if difference == 0 else ''})"
+            )
+
+
+class KeyInjector:
+    """
+    Injects W (price rose) or S (price fell) into
+    whichever window currently has focus.
+    """
+
+    def __init__(self, enabled=True, hold=0.05, threshold=0.0):
+        self.enabled = enabled
+        self.hold = hold
+        self.threshold = threshold
+        self.controller = None
+        self.last_key = None
+
+        if enabled:
+            from pynput.keyboard import Controller
+
+            self.controller = Controller()
+
+    def signal(self, last_price, fresh_price):
+        """
+        Delta from the last price downloaded.
+        Fresh above last -> W, fresh below last -> S.
+        Identical -> repeats the key of the last real move.
+        Returns the key sent ('w', 's') or None.
+        """
+        if not self.enabled:
+            return None
+
+        difference = fresh_price - last_price
+
+        if last_price != 0:
+            change = difference / last_price * 100
+        else:
+            change = 0.0
+
+        if difference > 0 and change > self.threshold:
+            key = "w"
+        elif difference < 0 and change < -self.threshold:
+            key = "s"
+        elif difference == 0 and self.last_key:
+            # Identical price: keep the direction of the last
+            # real move instead of going silent.
+            key = self.last_key
+        else:
+            return None
+
+        if difference != 0:
+            self.last_key = key
+
+        self.controller.press(key)
+        time.sleep(self.hold)
+        self.controller.release(key)
+
+        return key
 
 
 class PriceOracle:
@@ -634,7 +709,25 @@ def main():
     parser.add_argument(
         "--price-window",
         type=int,
-        default=12,
+        default=3,
+    )
+
+    parser.add_argument(
+        "--no-keys",
+        action="store_true",
+        help="disable W/S key injection",
+    )
+    parser.add_argument(
+        "--key-hold",
+        type=float,
+        default=0.05,
+        help="seconds each key is held down",
+    )
+    parser.add_argument(
+        "--key-threshold",
+        type=float,
+        default=0.0,
+        help="min predicted move in percent before a key fires",
     )
 
     args = parser.parse_args()
@@ -677,6 +770,12 @@ def main():
     select_bits = []
     completed_words = 0
 
+    key_injector = KeyInjector(
+        enabled=not args.no_keys,
+        hold=args.key_hold,
+        threshold=args.key_threshold,
+    )
+
     oracle = PriceOracle(
         simulated=(
             args.price_sim
@@ -684,7 +783,10 @@ def main():
         ),
         poll=args.price_poll,
         window=args.price_window,
-        on_oracle_done=compare_btc_prices,
+        on_oracle_done=lambda price: compare_btc_prices(
+            price,
+            key_injector,
+        ),
     )
 
     last_time = time.time()
