@@ -1,11 +1,18 @@
 """
 Bit-Pooling Oracle Lock Box Lab
-Python + Arduino 256-bit challenge-response system.
+Python + Arduino 256-bit commandless serial oracle.
 
-Protocol:
-    Arduino -> PC:  CHALLENGE:<64 hexadecimal characters>\\n
-    PC -> Arduino:  GUESS:<64 hexadecimal characters>\\n
-    Arduino -> PC:  DISARMED\\n or REJECTED\\n
+Protocol (no command words, just bare lines, one verdict-free channel):
+    Arduino -> PC:  <64 hexadecimal characters>\\n     (challenge)
+    PC -> Arduino:  <64 hexadecimal characters>\\n     (oracle's answer)
+
+There is no separate DISARMED/REJECTED reply. A correct answer disarms the
+box, and the Arduino signals that by simply issuing a fresh challenge
+straight away. If no new challenge arrives within VERDICT_WINDOW_S after
+the answer is sent, the answer was rejected. The Arduino's normal five
+second challenge timer stays well outside that window.
+
+Any non-hex line the Arduino prints (banners, debug text) is ignored.
 
 The Arduino generates a new 256-bit random challenge every five seconds.
 The Python bit-pooling oracle reconstructs that challenge and returns it.
@@ -45,6 +52,7 @@ except ImportError:
 PASSCODE_BITS = 256
 PASSCODE_BYTES = PASSCODE_BITS // 8
 PASSCODE_HEX_CHARS = PASSCODE_BYTES * 2
+VERDICT_WINDOW_S = 1.0  # must stay well below the 5 s challenge timer
 
 
 # ==============================================================================
@@ -259,10 +267,10 @@ class ArduinoLockBox:
     """
     Serial link to an Arduino 256-bit lock box.
 
-    Expected protocol:
-        Arduino -> PC: CHALLENGE:<64 hex characters>\\n
-        PC -> Arduino: GUESS:<64 hex characters>\\n
-        Arduino -> PC: DISARMED\\n or REJECTED\\n
+    Commandless protocol (bare lines, no prefixes, no verdict line):
+        Arduino -> PC: <64 hex characters>\\n   (challenge)
+        PC -> Arduino: <64 hex characters>\\n   (guess)
+        Disarmed = a fresh challenge arrives right after the guess.
     """
 
     def __init__(
@@ -294,9 +302,21 @@ class ArduinoLockBox:
             if self.ser and self.ser.is_open:
                 self.ser.close()
 
+    @staticmethod
+    def _parse_hex_line(line: str):
+        """Returns the int value if line is exactly 64 hex chars, else None."""
+        if len(line) != PASSCODE_HEX_CHARS:
+            return None
+
+        if not all(c in "0123456789abcdefABCDEF" for c in line):
+            return None
+
+        return int(line, 16)
+
     def read_challenge(self):
         """
-        Reads one 256-bit CHALLENGE line.
+        Reads one bare 256-bit challenge line (64 hex characters).
+        Lines of any other shape are ignored.
 
         Returns:
             int: challenge value, or None if no complete line arrived.
@@ -309,35 +329,52 @@ class ArduinoLockBox:
                     return None
 
                 line = raw.decode("ascii", errors="ignore").strip()
+                value = self._parse_hex_line(line)
 
-                if not line.startswith("CHALLENGE:"):
-                    continue
+                if value is not None:
+                    return value
 
-                hex_text = line.split(":", 1)[1].strip()
+    def send_guess(self, guess: int):
+        """
+        Sends the bare 256-bit guess, then simply listens for a challenge.
 
-                if (
-                    len(hex_text) != PASSCODE_HEX_CHARS
-                    or not all(c in "0123456789abcdefABCDEF" for c in hex_text)
-                ):
-                    continue
-
-                return int(hex_text, 16)
-
-    def send_guess(self, guess: int) -> str:
-        """Sends the 256-bit oracle guess and reads the Arduino response."""
+        Returns:
+            (response, next_challenge)
+            response is "DISARMED" if a fresh challenge arrived within
+            VERDICT_WINDOW_S, otherwise "REJECTED". next_challenge is that
+            fresh challenge (int) or None.
+        """
         hex_guess = f"{int(guess) & ((1 << PASSCODE_BITS) - 1):064X}"
-        message = f"GUESS:{hex_guess}\n"
+        message = f"{hex_guess}\n"
 
         with self._lock:
             self.ser.reset_input_buffer()
             self.ser.write(message.encode("ascii"))
             self.ser.flush()
 
-            response = self.ser.readline().decode(
-                "ascii", errors="ignore"
-            ).strip()
+            deadline = time.monotonic() + VERDICT_WINDOW_S
+            old_timeout = self.ser.timeout
 
-        return response.upper()
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+
+                    if remaining <= 0:
+                        return "REJECTED", None
+
+                    self.ser.timeout = remaining
+                    raw = self.ser.readline()
+
+                    if not raw:
+                        return "REJECTED", None
+
+                    line = raw.decode("ascii", errors="ignore").strip()
+                    value = self._parse_hex_line(line)
+
+                    if value is not None:
+                        return "DISARMED", value
+            finally:
+                self.ser.timeout = old_timeout
 
 
 def handle_arduino_challenge(
@@ -347,8 +384,8 @@ def handle_arduino_challenge(
     delay_s: float = 0.0,
 ):
     """
-    Receives one 256-bit Arduino challenge, reconstructs it with the oracle,
-    and sends the result back for validation.
+    Receives one bare 256-bit Arduino challenge, reconstructs it with the
+    oracle, and sends the bare result back for validation.
     """
     engine.reset(challenge)
 
@@ -359,13 +396,14 @@ def handle_arduino_challenge(
         engine.step()
 
     guess = engine.current_guess
-    response = lock_box.send_guess(guess)
+    response, next_challenge = lock_box.send_guess(guess)
 
     return {
         "challenge": challenge,
         "guess": guess,
         "response": response,
         "disarmed": response == "DISARMED",
+        "next_challenge": next_challenge,
     }
 
 
@@ -385,8 +423,11 @@ class ArduinoThread(threading.Thread):
             lock_box = ArduinoLockBox(self.port)
             self.out.put(("arduino", "Connected to 256-bit lock box."))
 
+            challenge = None
+
             while not self.ctl["stop"]:
-                challenge = lock_box.read_challenge()
+                if challenge is None:
+                    challenge = lock_box.read_challenge()
 
                 if challenge is None:
                     continue
@@ -399,6 +440,10 @@ class ArduinoThread(threading.Thread):
                 )
 
                 self.out.put(("arduino_result", result))
+
+                # A fresh challenge received while waiting for the verdict is
+                # the next one to solve; otherwise read a new one.
+                challenge = result["next_challenge"]
 
         except Exception as e:
             self.out.put((
@@ -556,12 +601,7 @@ class SimThread(threading.Thread):
                     )
 
                 exposed_target = (
-                    engine.oracle._target
-                    if (
-                        engine.converged
-                        or ctl.get("force_reveal", False)
-                    )
-                    else 0
+                    engine.oracle._target if engine.converged else 0
                 )
 
                 out.put((
@@ -606,7 +646,6 @@ class App:
             "stop": False,
             "ir_heatmap": False,
             "auto_step": True,
-            "force_reveal": False,
             "safe_delay": self.safe_delay,
         }
 
@@ -667,7 +706,7 @@ class App:
         # Arduino controls
         arduino_frame = ttk.LabelFrame(
             main_frame,
-            text="Arduino Lock Box — 256-Bit Challenge Response",
+            text="Arduino Lock Box — 256-Bit Commandless Serial Oracle",
         )
         arduino_frame.pack(fill="x", padx=5, pady=5)
 
@@ -738,53 +777,6 @@ class App:
             ),
             foreground="#88a0c0",
         ).pack(side="left", padx=10)
-
-        # Local target controls
-        target_frame = ttk.LabelFrame(
-            main_frame,
-            text="Local 256-Bit Oracle Target (hexadecimal)",
-        )
-        target_frame.pack(fill="x", padx=5, pady=5)
-
-        self.target_label = ttk.Label(
-            target_frame,
-            text="Target (64 hex characters):",
-        )
-        self.target_label.pack(side="left", padx=5, pady=5)
-
-        self.v_custom_target = tk.StringVar(
-            value="[SECURE]"
-        )
-        self.e_custom_target = ttk.Entry(
-            target_frame,
-            width=72,
-            textvariable=self.v_custom_target,
-        )
-        self.e_custom_target.pack(
-            side="left", padx=5, pady=5
-        )
-
-        ttk.Button(
-            target_frame,
-            text="Set Custom",
-            command=self.set_custom_target,
-        ).pack(side="left", padx=2, pady=5)
-
-        ttk.Button(
-            target_frame,
-            text="Randomize Target",
-            command=self.randomize_target,
-        ).pack(side="left", padx=5, pady=5)
-
-        self.v_reveal = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            target_frame,
-            text="Force Reveal Local Target",
-            variable=self.v_reveal,
-            command=lambda: self.ctl.update(
-                force_reveal=self.v_reveal.get()
-            ),
-        ).pack(side="left", padx=15, pady=5)
 
         # Camera and register display
         display_frame = ttk.Frame(main_frame)
@@ -939,7 +931,6 @@ class App:
 
     def reset_search(self):
         self.engine.reset()
-        self.v_custom_target.set("[SECURE]")
 
     def apply_delay(self):
         delay = self.safe_delay.set(self.v_delay.get())
@@ -1003,37 +994,6 @@ class App:
         if self.arduino_thread is not None:
             self.ctl["stop"] = True
 
-    def set_custom_target(self):
-        text = self.v_custom_target.get().strip()
-
-        if text.startswith("0x") or text.startswith("0X"):
-            text = text[2:]
-
-        try:
-            value = int(text, 16)
-        except ValueError:
-            messagebox.showerror(
-                "Invalid Input",
-                "Enter a 64-character hexadecimal value.",
-            )
-            return
-
-        if 0 <= value <= self.engine.max_val:
-            self.engine.reset(value)
-            messagebox.showinfo(
-                "Target Set",
-                "New 256-bit target configured for bit pooling.",
-            )
-        else:
-            messagebox.showerror(
-                "Invalid Range",
-                "Target must be a 256-bit hexadecimal value.",
-            )
-
-    def randomize_target(self):
-        self.engine.reset()
-        self.v_custom_target.set("[SECURE]")
-
     def _update_pool_operator(self, event):
         operator = self.operator_combo.get()
         self.engine.pool_op = operator
@@ -1052,11 +1012,10 @@ class App:
         target_value,
         guess_value,
         pooled_value,
-        revealed,
     ):
         self.register_canvas.delete("all")
 
-        is_exposed = revealed or self.engine.converged
+        is_exposed = self.engine.converged
         active_target = target_value if is_exposed else 0
 
         rows = [
@@ -1133,7 +1092,6 @@ class App:
                         data["target"],
                         data["guess"],
                         data["pooled"],
-                        self.v_reveal.get(),
                     )
 
                     delay = self.safe_delay.get()
