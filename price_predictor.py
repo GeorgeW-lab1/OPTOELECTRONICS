@@ -858,7 +858,7 @@ def main():
     parser.add_argument(
         "--price-window",
         type=int,
-        default=12,
+        default=3,
     )
 
     parser.add_argument(
