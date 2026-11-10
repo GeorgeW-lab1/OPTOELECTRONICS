@@ -18,8 +18,8 @@ python optoelectronic_sim-5.py --cam 1 --price --price-poll 2
 python optoelectronic_sim-5.py --price --no-keys   (disable key injection)
 
 Key injection (requires: pip install pynput):
-Fresh price above the last downloaded price -> taps W
-Fresh price below the last downloaded price -> taps S
+Fresh price above the last downloaded price -> taps Shift+W
+Fresh price below the last downloaded price -> taps Shift+S
 """
 
 import argparse
@@ -257,15 +257,15 @@ def compare_btc_prices(oracle_price, key_injector=None):
 
         if key:
             print(
-                f"KEY INJECTED:     {key.upper()} "
+                f"KEY INJECTED:     SHIFT+{key.upper()} "
                 f"({'UP' if key == 'w' else 'DOWN'}"
                 f"{', repeated: identical' if difference == 0 else ''})"
             )
 
 
 # Hardware scancodes (PS/2 set 1 for Windows, evdev codes for Linux).
-SCANCODES_WIN = {"w": 0x11, "s": 0x1F}
-EVDEV_CODES = {"w": 17, "s": 31}
+SCANCODES_WIN = {"w": 0x11, "s": 0x1F, "shift": 0x2A}
+EVDEV_CODES = {"w": 17, "s": 31, "shift": 42}
 
 
 class ScancodeBackend:
@@ -391,6 +391,15 @@ class ScancodeBackend:
             name="price-predictor-kbd",
         )
 
+    @staticmethod
+    def _pynput_key(key):
+        if key == "shift":
+            from pynput.keyboard import Key
+
+            return Key.shift
+
+        return key
+
     def press(self, key):
         if self.mode == "windows":
             self._win_send(SCANCODES_WIN[key], up=False)
@@ -400,7 +409,7 @@ class ScancodeBackend:
             )
             self._uinput.syn()
         else:
-            self._pynput.press(key)
+            self._pynput.press(self._pynput_key(key))
 
     def release(self, key):
         if self.mode == "windows":
@@ -411,13 +420,13 @@ class ScancodeBackend:
             )
             self._uinput.syn()
         else:
-            self._pynput.release(key)
+            self._pynput.release(self._pynput_key(key))
 
 
 class KeyInjector:
     """
-    Injects W (price rose) or S (price fell) as hardware
-    scancodes into whichever window currently has focus.
+    Injects Shift+W (price rose) or Shift+S (price fell) as
+    hardware scancodes into whichever window has focus.
     """
 
     def __init__(self, enabled=True, hold=0.05, threshold=0.0):
@@ -461,9 +470,14 @@ class KeyInjector:
         if difference != 0:
             self.last_key = key
 
+        # Shift + W / Shift + S
+        self.controller.press("shift")
+        time.sleep(0.01)
         self.controller.press(key)
         time.sleep(self.hold)
         self.controller.release(key)
+        time.sleep(0.01)
+        self.controller.release("shift")
 
         return key
 
@@ -858,7 +872,7 @@ def main():
     parser.add_argument(
         "--price-window",
         type=int,
-        default=3,
+        default=12,
     )
 
     parser.add_argument(
