@@ -20,6 +20,20 @@ python optoelectronic_sim-5.py --price --no-keys   (disable key injection)
 Key injection (requires: pip install pynput):
 Next oracle price above the last oracle price -> taps Shift+W
 Next oracle price below the last oracle price -> taps Shift+S
+
+Adaptive photonic decision (see the "matrix bias" diagram):
+A classical OR gate over detectors (A,B) is biased: 25% zeros /
+75% ones. AdaptivePhotonicDecision treats the 4-row truth table
+as a tunable matrix [0, w, w, 1]. Measured output statistics are
+fed back to adjust w (the "phase shift") until P(1) -> 0.5.
+It is a diagnostic only; it does not choose keys.
+Use --classical to freeze w=1 (plain OR) and compare.
+
+Keys are decided ONLY by consecutive oracle prices (oracle v
+oracle). The fresh price is printed for comparison but never
+injects a key. If the oracle price is identical to the last
+oracle price, the balanced photonic bit picks the key
+(1 -> Shift+W, 0 -> Shift+S). Use --no-tiebreak for no key.
 """
 
 import argparse
@@ -183,6 +197,133 @@ class DFlipFlop74HC74:
 def hi(voltage):
     return voltage > VCC / 2
 
+
+def photon_uniform(roi_a, roi_b, frame_no):
+    """
+    Uniform [0,1) sample from detector shot noise: the LSBs of
+    32 pixels spread over both ROIs, whitened with a murmur-style
+    finalizer mixed with the frame counter (so a frozen camera
+    still yields a stream).
+    """
+    bits = np.concatenate(
+        [
+            roi_a.ravel()[::997][:16],
+            roi_b.ravel()[::991][:16],
+        ]
+    ) & 1
+
+    word = 0
+    for bit in bits:
+        word = (word << 1) | int(bit)
+
+    mask = 0xFFFFFFFF
+    word ^= (frame_no * 2246822519) & mask
+    word ^= word >> 16
+    word = (word * 2246822519) & mask
+    word ^= word >> 13
+    word = (word * 3266489917) & mask
+    word ^= word >> 16
+
+    return word / 2**32
+
+
+class AdaptivePhotonicDecision:
+    """
+    Feedback-tuned decision matrix.
+
+    Rows (A,B) -> P(output = 1):
+        (0,0) -> 0      (0,1) -> w
+        (1,0) -> w      (1,1) -> 1
+    w = 1 is the classical OR matrix (P(1) = 0.75 for fair inputs).
+    w = 0 is AND (P(1) = 0.25). The controller integrates the error
+    between the measured P(1) and the target and nudges w, like
+    phase shifters adapting from detector feedback, so the output
+    settles at the balanced 50/50 target.
+    """
+
+    ROWS = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+    def __init__(
+        self,
+        target=0.5,
+        gain=0.01,
+        alpha=0.05,
+        adaptive=True,
+    ):
+        self.target = target
+        self.gain = gain
+        self.alpha = alpha
+        self.adaptive = adaptive
+
+        self.w = 1.0            # start as the classical OR matrix
+        self.p_or = 0.75        # measured P(OR = 1)
+        self.p_dec = 0.75       # measured P(decision = 1)
+        self.last_bit = 0
+        self.n = 0
+        self.ones = 0
+        self.or_ones = 0
+        self.row_counts = {row: 0 for row in self.ROWS}
+
+    def step(self, a, b, u):
+        a = int(a)
+        b = int(b)
+        self.row_counts[(a, b)] += 1
+
+        or_bit = a | b
+        self.p_or += self.alpha * (or_bit - self.p_or)
+        self.or_ones += or_bit
+
+        if a and b:
+            p_one = 1.0
+        elif a or b:
+            p_one = self.w
+        else:
+            p_one = 0.0
+
+        bit = 1 if u < p_one else 0
+        self.p_dec += self.alpha * (bit - self.p_dec)
+
+        if self.adaptive:
+            self.w = min(
+                1.0,
+                max(
+                    0.0,
+                    self.w
+                    + self.gain * (self.target - self.p_dec),
+                ),
+            )
+
+        self.last_bit = bit
+        self.ones += bit
+        self.n += 1
+        return bit
+
+    def tiebreak(self):
+        return self.last_bit
+
+    def status(self):
+        return (
+            f"P(OR)={self.p_or:.2f} "
+            f"P(DEC)={self.p_dec:.2f} "
+            f"w={self.w:.2f}"
+        )
+
+    def summary(self):
+        if self.n == 0:
+            return "photonic: no samples"
+
+        total = self.n
+        rows = " ".join(
+            f"{a}{b}:{100 * c / total:.0f}%"
+            for (a, b), c in self.row_counts.items()
+        )
+        return (
+            f"photonic summary: n={total} "
+            f"classical OR P(1)={self.or_ones / total:.3f} | "
+            f"adaptive P(1)={self.ones / total:.3f} "
+            f"(final w={self.w:.3f}) | rows {rows}"
+        )
+
 def live_btc_price():
     url = (
         "https://api.binance.com/api/v3/ticker/price"
@@ -214,10 +355,9 @@ def compare_btc_prices(oracle_price, key_injector=None):
 
     Nothing is saved or updated.
 
-    Key injection: the delta between the previous oracle
+    Key injection: only the delta between the previous oracle
     price and this oracle price decides Shift+W / Shift+S.
-    If the two oracle prices are identical, the fresh price
-    (which can still differ) breaks the tie, below.
+    If they are identical, the photonic bit decides.
     """
     oracle_delta = None
 
@@ -229,7 +369,7 @@ def compare_btc_prices(oracle_price, key_injector=None):
         if key_injector.sent_key:
             print_key_line(
                 key_injector.sent_key,
-                f"oracle delta {oracle_delta:+.8f}",
+                key_injector.sent_note,
             )
 
     fresh_btc_price = live_btc_price()
@@ -272,24 +412,6 @@ def compare_btc_prices(oracle_price, key_injector=None):
         f"{percent_difference:.8f}%"
     )
     print(f"Result:           {result}")
-
-    # Oracle prices were identical: fresh price breaks the tie.
-    if (
-        key_injector is not None
-        and oracle_delta == 0
-    ):
-        key = key_injector.signal(
-            oracle_price,
-            fresh_btc_price,
-        )
-
-        if key:
-            if difference == 0:
-                note = "identical again, repeated last direction"
-            else:
-                note = f"fresh price delta {difference:+.8f}"
-
-            print_key_line(key, note)
 
 
 
@@ -459,7 +581,15 @@ class KeyInjector:
     hardware scancodes into whichever window has focus.
     """
 
-    def __init__(self, enabled=True, hold=0.05, threshold=0.0):
+    def __init__(
+        self,
+        enabled=True,
+        hold=0.05,
+        threshold=0.0,
+        tiebreak=None,
+    ):
+        self.tiebreak = tiebreak
+        self.sent_note = None
         self.enabled = enabled
         self.hold = hold
         self.threshold = threshold
@@ -479,13 +609,13 @@ class KeyInjector:
         (None on the first sample).
 
         A non-zero delta sends its key immediately. A zero
-        delta sends nothing here: the caller breaks the tie
-        with the fresh price, because identical oracle prices
-        can still have a different live price.
+        delta (oracle identical to last oracle) uses the
+        photonic bit, if one is wired in.
         """
         previous = self.prev_oracle_price
         self.prev_oracle_price = price
         self.sent_key = None
+        self.sent_note = None
 
         if previous is None:
             return None
@@ -495,14 +625,23 @@ class KeyInjector:
 
         if delta != 0:
             self.sent_key = self.signal(previous, price)
+            self.sent_note = f"oracle delta {delta:+.8f}"
+
+        elif self.tiebreak is not None and self.enabled:
+            key = "w" if self.tiebreak() else "s"
+            self.press_combo(key)
+            self.sent_key = key
+            self.sent_note = (
+                "oracle identical to last oracle, "
+                "photonic 50/50 bit"
+            )
 
         return delta
 
     def signal(self, last_price, fresh_price):
         """
-        Delta between two prices.
-        Higher -> W, lower -> S.
-        Identical -> repeats the key of the last real move.
+        Delta between two oracle prices.
+        Higher -> W, lower -> S, identical -> None.
         Returns the key sent ('w', 's') or None.
         """
         if not self.enabled:
@@ -519,16 +658,16 @@ class KeyInjector:
             key = "w"
         elif difference < 0 and change < -self.threshold:
             key = "s"
-        elif difference == 0 and self.last_key:
-            # Identical price: keep the direction of the last
-            # real move instead of going silent.
-            key = self.last_key
         else:
             return None
 
-        if difference != 0:
-            self.last_key = key
+        self.last_key = key
 
+        self.press_combo(key)
+
+        return key
+
+    def press_combo(self, key):
         # Shift + W / Shift + S
         self.controller.press("shift")
         time.sleep(0.01)
@@ -537,8 +676,6 @@ class KeyInjector:
         self.controller.release(key)
         time.sleep(0.01)
         self.controller.release("shift")
-
-        return key
 
 
 class PriceOracle:
@@ -805,6 +942,7 @@ def draw(
         "Y",
         "D",
         "SELECT",
+        "DEC",
     ]
 
     panel_width = max(width, 480)
@@ -926,14 +1064,24 @@ def main():
     parser.add_argument(
         "--price-poll",
         type=float,
-        default=5.0,
+        default=17.0,
     )
     parser.add_argument(
         "--price-window",
         type=int,
-        default=12,
+        default=3,
     )
 
+    parser.add_argument(
+        "--classical",
+        action="store_true",
+        help="freeze the decision matrix at plain OR (biased 75%%)",
+    )
+    parser.add_argument(
+        "--no-tiebreak",
+        action="store_true",
+        help="send no key when oracle price equals last oracle price",
+    )
     parser.add_argument(
         "--no-keys",
         action="store_true",
@@ -948,7 +1096,7 @@ def main():
     parser.add_argument(
         "--key-threshold",
         type=float,
-        default=0.0,
+        default=0.01,
         help="min predicted move in percent before a key fires",
     )
 
@@ -992,10 +1140,21 @@ def main():
     select_bits = []
     completed_words = 0
 
+    adaptive = AdaptivePhotonicDecision(
+        adaptive=not args.classical,
+    )
+    frame_no = 0
+    decision = 0
+
     key_injector = KeyInjector(
         enabled=not args.no_keys,
         hold=args.key_hold,
         threshold=args.key_threshold,
+        tiebreak=(
+            None
+            if args.no_tiebreak
+            else adaptive.tiebreak
+        ),
     )
 
     oracle = PriceOracle(
@@ -1087,6 +1246,13 @@ def main():
             or_gate = a or b
             and_gate = a and b
 
+            frame_no += 1
+            decision = adaptive.step(
+                a,
+                b,
+                photon_uniform(roi_a, roi_b, frame_no),
+            )
+
             y = bool(latch.bit(slot))
             d = y or (
                 and_gate and args.leak
@@ -1101,6 +1267,7 @@ def main():
                     "Y",
                     "D",
                     "SELECT",
+                    "DEC",
                 ],
                 [
                     a,
@@ -1110,6 +1277,7 @@ def main():
                     y,
                     d,
                     flip_flop.q,
+                    decision,
                 ],
             ):
                 traces[name].append(
@@ -1152,6 +1320,8 @@ def main():
                         f"{isolated_number:0{hex_width}X} "
                         f"-> {result}"
                     )
+
+                    print(f"PHOTONIC: {adaptive.status()}")
 
                     completed_words += 1
                     slot = 0
@@ -1206,6 +1376,8 @@ def main():
                 f"AND={int(and_gate)} "
                 f"Y={int(y)} D={int(d)} "
                 f"Q={flip_flop.q}",
+                f"photonic {adaptive.status()} "
+                f"DEC={decision}",
                 f"slot {slot}/{nbits} "
                 f"SELECT bits={selected} "
                 f"hex={selected_hex}",
@@ -1244,6 +1416,7 @@ def main():
                 select_bits = []
 
     finally:
+        print(adaptive.summary())
         oracle.stop()
         camera.release()
 
