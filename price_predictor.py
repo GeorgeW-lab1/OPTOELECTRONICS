@@ -17,7 +17,10 @@ python optoelectronic_sim-5.py --synthetic --headless --price --runs 5
 python optoelectronic_sim-5.py --cam 1 --price --price-poll 2
 python optoelectronic_sim-5.py --price --no-keys   (disable key injection)
 python optoelectronic_sim-5.py --price --fetch-delay 5
-    (inject key after oracle, wait 5 s more, then fetch fresh price)
+    (inject key after oracle, wait 5 s more, then fetch fresh price;
+     each key is a binary-option contract with a 10 s expiry
+     (2 x fetch delay, or --expiry); opposite keys are blocked
+     until it expires, and the fresh price settles it WIN/LOSS)
 
 Key injection (requires: pip install pynput):
 Next oracle price above the last oracle price -> taps Shift+W
@@ -379,6 +382,12 @@ def compare_btc_prices(
                 key_injector.sent_note,
             )
 
+        if key_injector.blocked_note:
+            print(
+                f"KEY BLOCKED:      "
+                f"{key_injector.blocked_note}"
+            )
+
     if fetch_delay > 0:
         print(
             f"Waiting {fetch_delay:g}s before fetching "
@@ -426,6 +435,16 @@ def compare_btc_prices(
         f"{percent_difference:.8f}%"
     )
     print(f"Result:           {result}")
+
+    if key_injector is not None and key_injector.sent_key:
+        print(
+            "Contract:         "
+            + key_injector.settle(
+                key_injector.sent_key,
+                oracle_price,
+                fresh_btc_price,
+            )
+        )
 
 
 
@@ -601,8 +620,16 @@ class KeyInjector:
         hold=0.05,
         threshold=0.0,
         tiebreak=None,
+        lock_window=0.0,
     ):
+        self.wins = 0
+        self.losses = 0
+        self.pushes = 0
         self.tiebreak = tiebreak
+        self.lock_window = lock_window
+        self.last_sent_key = None
+        self.last_sent_time = None
+        self.blocked_note = None
         self.sent_note = None
         self.enabled = enabled
         self.hold = hold
@@ -630,6 +657,7 @@ class KeyInjector:
         self.prev_oracle_price = price
         self.sent_key = None
         self.sent_note = None
+        self.blocked_note = None
 
         if previous is None:
             return None
@@ -643,8 +671,9 @@ class KeyInjector:
 
         elif self.tiebreak is not None and self.enabled:
             key = "w" if self.tiebreak() else "s"
-            self.press_combo(key)
-            self.sent_key = key
+            self.sent_key = (
+                key if self.press_combo(key) else None
+            )
             self.sent_note = (
                 "oracle identical to last oracle, "
                 "photonic 50/50 bit"
@@ -675,13 +704,67 @@ class KeyInjector:
         else:
             return None
 
+        if not self.press_combo(key):
+            return None
+
         self.last_key = key
-
-        self.press_combo(key)
-
         return key
 
+    def settle(self, key, entry_price, settle_price):
+        """
+        Settles the contract opened by this cycle's key.
+        W wins if the settle price is above entry, S if below.
+        Equal prices are a push.
+        """
+        delta = settle_price - entry_price
+
+        if delta == 0:
+            self.pushes += 1
+            outcome = "PUSH"
+        elif (key == "w") == (delta > 0):
+            self.wins += 1
+            outcome = "WIN"
+        else:
+            self.losses += 1
+            outcome = "LOSS"
+
+        return (
+            f"{outcome} (SHIFT+{key.upper()}, entry "
+            f"{entry_price:.2f} -> settle {settle_price:.2f}) "
+            f"[W{self.wins} L{self.losses} P{self.pushes}]"
+        )
+
     def press_combo(self, key):
+        """
+        Taps Shift+key. Returns True if sent, False if blocked.
+
+        Binary-options rule: each key opens a contract that runs
+        for lock_window seconds (the expiry). While it is open,
+        an opposite key is blocked, so W and S never conflict.
+        Same-direction keys are allowed.
+        """
+        now = time.monotonic()
+
+        if (
+            self.lock_window > 0
+            and self.last_sent_key is not None
+            and key != self.last_sent_key
+            and now - self.last_sent_time < self.lock_window
+        ):
+            remaining = (
+                self.lock_window - (now - self.last_sent_time)
+            )
+            self.blocked_note = (
+                f"SHIFT+{key.upper()} suppressed: conflicts with "
+                f"SHIFT+{self.last_sent_key.upper()} contract "
+                f"still open (expiry {self.lock_window:g}s, "
+                f"{remaining:.1f}s left)"
+            )
+            return False
+
+        self.last_sent_key = key
+        self.last_sent_time = now
+
         # Shift + W / Shift + S
         self.controller.press("shift")
         time.sleep(0.01)
@@ -690,6 +773,7 @@ class KeyInjector:
         self.controller.release(key)
         time.sleep(0.01)
         self.controller.release("shift")
+        return True
 
 
 class PriceOracle:
@@ -1060,7 +1144,7 @@ def main():
     )
     parser.add_argument(
         "--leak",
-        action="store_true", default=True,
+        action="store_true",
     )
     parser.add_argument(
         "--runs",
@@ -1094,9 +1178,16 @@ def main():
     parser.add_argument(
         "--fetch-delay",
         type=float,
-        default=0.2,
+        default=3.0,
         help="extra seconds to wait after the key is injected "
         "before fetching the fresh BTC price",
+    )
+    parser.add_argument(
+        "--expiry",
+        type=float,
+        default=3,
+        help="seconds a key's contract stays open; opposite keys "
+        "are blocked until then (default: 2 x --fetch-delay)",
     )
     parser.add_argument(
         "--no-tiebreak",
@@ -1175,6 +1266,11 @@ def main():
             None
             if args.no_tiebreak
             else adaptive.tiebreak
+        ),
+        lock_window=(
+            args.expiry
+            if args.expiry is not None
+            else 2.0 * args.fetch_delay
         ),
     )
 
