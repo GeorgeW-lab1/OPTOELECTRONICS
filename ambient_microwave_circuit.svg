@@ -1,0 +1,195 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 730" width="1200" height="730" font-family="Helvetica, Arial, sans-serif" xmlns:c2pa="http://c2pa.org/manifest">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#444"/>
+    </marker>
+    <marker id="arR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#c0543a"/>
+    </marker>
+    <style>
+      .box{fill:#f4f1e8;stroke:#8a8677;stroke-width:1.2}
+      .rf{fill:#fbe8e2;stroke:#c0543a;stroke-width:1.2}
+      .pw{fill:#e6f0e4;stroke:#5a8a52;stroke-width:1.2}
+      .t{font-size:12px;fill:#222;text-anchor:middle;font-weight:bold}
+      .s{font-size:10px;fill:#555;text-anchor:middle}
+      .l{font-size:11px;fill:#333}
+      .w{stroke:#444;stroke-width:1.5;fill:none}
+      .rfw{stroke:#c0543a;stroke-width:1.3;fill:none;stroke-dasharray:5 3}
+      .dash{fill:none;stroke:#999;stroke-width:1;stroke-dasharray:5 4}
+    </style>
+  </defs>
+
+  <rect width="1200" height="730" fill="#ffffff"/>
+  <text x="30" y="26" font-size="15" fill="#333">Ambient-microwave version: rectenna front end, parallel drivers A and B, IF/THEN link, OR/AND gating, time code Y, flip-flop</text>
+
+  <!-- RF bench -->
+  <rect x="30" y="45" width="380" height="170" rx="8" class="dash"/>
+  <text x="402" y="60" class="l" text-anchor="end" fill="#777">RF front end</text>
+  <rect x="110" y="60" width="220" height="30" rx="4" class="rf"/>
+  <text x="220" y="79" class="t" style="font-size:11px">Ambient RF: Wi-Fi 2.4 GHz / cellular</text>
+  <path d="M220 90 V122" class="rfw" marker-end="url(#arR)"/>
+  <line x1="150" y1="126" x2="290" y2="126" stroke="#444" stroke-width="3"/>
+  <text x="300" y="130" class="l">Reflector / ground plane</text>
+  <path d="M170 129 L112 153" class="rfw" marker-end="url(#arR)"/>
+  <path d="M270 129 L328 153" class="rfw" marker-end="url(#arR)"/>
+  <text x="220" y="152" class="s">Δ field</text>
+  <rect x="50" y="155" width="120" height="40" rx="4" class="rf"/>
+  <text x="110" y="173" class="t">Rectenna B</text>
+  <text x="110" y="187" class="s">Schottky doubler</text>
+  <rect x="270" y="155" width="120" height="40" rx="4" class="rf"/>
+  <text x="330" y="173" class="t">Rectenna A</text>
+  <text x="330" y="187" class="s">Schottky doubler</text>
+
+  <!-- rectenna to drivers -->
+  <path d="M110 195 V250" class="w" marker-end="url(#ar)"/>
+  <path d="M330 195 V250" class="w" marker-end="url(#ar)"/>
+
+  <!-- Drivers -->
+  <rect x="50" y="250" width="120" height="45" rx="4" class="box"/>
+  <text x="110" y="269" class="t">Driver B</text>
+  <text x="110" y="284" class="s">deterministic, thr. set by x</text>
+  <rect x="270" y="250" width="120" height="45" rx="4" class="box"/>
+  <text x="330" y="269" class="t">Driver A</text>
+  <text x="330" y="284" class="s">randomized, RF noise</text>
+
+  <!-- x bus -->
+  <text x="22" y="334" font-size="13" font-weight="bold" fill="#222">x</text>
+  <line x1="40" y1="330" x2="330" y2="330" class="w"/>
+  <circle cx="50" cy="330" r="3" fill="#444"/>
+  <circle cx="110" cy="330" r="3" fill="#444"/>
+  <circle cx="330" cy="330" r="3" fill="#444"/>
+  <path d="M110 330 V295" class="w" marker-end="url(#ar)"/>
+  <path d="M330 330 V295" class="w" marker-end="url(#ar)"/>
+  <text x="22" y="350" class="s" text-anchor="start">problem instance</text>
+
+  <!-- Driver B output to C (with hop over x bus) -->
+  <path d="M170 262 H215 V322 a8 8 0 0 1 0 16 V490" class="w"/>
+  <circle cx="215" cy="490" r="3" fill="#444"/>
+
+  <!-- IF/THEN link -->
+  <rect x="170" y="420" width="270" height="188" rx="8" fill="none" stroke="#5b57c7" stroke-width="1" stroke-dasharray="5 4"/>
+  <text x="440" y="414" class="l" text-anchor="end" fill="#5b57c7" style="fill:#5b57c7">IF/THEN link</text>
+  <!-- capacitor C -->
+  <line x1="215" y1="490" x2="215" y2="520" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="203" y1="520" x2="227" y2="520" stroke="#5b57c7" stroke-width="2"/>
+  <line x1="203" y1="528" x2="227" y2="528" stroke="#5b57c7" stroke-width="2"/>
+  <line x1="215" y1="528" x2="215" y2="545" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="205" y1="545" x2="225" y2="545" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="208" y1="549" x2="222" y2="549" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="211" y1="553" x2="219" y2="553" stroke="#5b57c7" stroke-width="1.5"/>
+  <text x="232" y="528" class="l" style="fill:#5b57c7">C</text>
+  <!-- NPN -->
+  <line x1="215" y1="490" x2="305" y2="490" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="305" y1="474" x2="305" y2="506" stroke="#5b57c7" stroke-width="2.5"/>
+  <line x1="305" y1="483" x2="335" y2="465" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="335" y1="465" x2="335" y2="442" stroke="#5b57c7" stroke-width="1.5"/>
+  <line x1="322" y1="440" x2="348" y2="440" stroke="#5b57c7" stroke-width="2"/>
+  <text x="355" y="444" class="l" style="fill:#5b57c7">V_store (harvested)</text>
+  <line x1="305" y1="497" x2="335" y2="515" stroke="#5b57c7" stroke-width="1.5" marker-end="url(#ar)"/>
+  <text x="345" y="494" class="l" style="fill:#5b57c7">NPN</text>
+  <!-- emitter output with pull-down -->
+  <path d="M335 515 H420 V372" class="w"/>
+  <circle cx="380" cy="515" r="3" fill="#444"/>
+  <path d="M380 515 V530 L386 534 L374 542 L386 550 L374 558 L380 562 V575" class="w"/>
+  <line x1="370" y1="575" x2="390" y2="575" class="w"/>
+  <line x1="373" y1="579" x2="387" y2="579" class="w"/>
+  <line x1="376" y1="583" x2="384" y2="583" class="w"/>
+  <text x="392" y="552" class="s" text-anchor="start">R pull-down</text>
+  <text x="426" y="470" class="l" font-weight="bold">B</text>
+  <text x="305" y="601" class="s" style="fill:#5b57c7">IF V(C) &gt; 0.7 V  THEN B = HIGH</text>
+
+  <!-- A net -->
+  <path d="M390 272 H450 V432" class="w"/>
+  <circle cx="450" cy="312" r="3" fill="#444"/>
+  <circle cx="450" cy="432" r="3" fill="#444"/>
+  <text x="412" y="266" class="l" font-weight="bold">A</text>
+  <path d="M450 312 H500" class="w" marker-end="url(#ar)"/>
+  <path d="M450 432 H500" class="w" marker-end="url(#ar)"/>
+
+  <!-- B net (hop over A) -->
+  <path d="M420 372 H442 a8 8 0 0 1 16 0 H475" class="w"/>
+  <circle cx="475" cy="372" r="3" fill="#444"/>
+  <path d="M475 372 V332 H500" class="w" marker-end="url(#ar)"/>
+  <path d="M475 372 V412 H500" class="w" marker-end="url(#ar)"/>
+
+  <!-- Gates -->
+  <rect x="500" y="300" width="70" height="45" rx="4" class="box"/>
+  <text x="535" y="327" class="t">OR</text>
+  <text x="535" y="339" class="s" style="font-size:9px">74AUP1G32</text>
+  <rect x="500" y="400" width="70" height="45" rx="4" class="box"/>
+  <text x="535" y="427" class="t">AND</text>
+  <text x="535" y="439" class="s" style="font-size:9px">74AUP1G08</text>
+
+  <!-- merge -->
+  <path d="M570 322 H600 V422 H570" class="w"/>
+  <circle cx="600" cy="372" r="3" fill="#444"/>
+  <path d="M600 372 H640" class="w" marker-end="url(#ar)"/>
+  <rect x="640" y="345" width="105" height="55" rx="4" class="box"/>
+  <text x="692" y="368" class="t">Merge node</text>
+  <text x="692" y="383" class="s">diode-OR, Y forces HIGH</text>
+
+  <!-- Y and isolated number -->
+  <rect x="630" y="195" width="125" height="32" rx="4" class="box"/>
+  <text x="692" y="215" class="t" style="font-size:11px">Isolated number N</text>
+  <path d="M692 227 V250" class="w" marker-end="url(#ar)"/>
+  <rect x="630" y="250" width="125" height="58" rx="4" class="box"/>
+  <text x="692" y="272" class="t">Y: time code</text>
+  <text x="692" y="287" class="s">latch loaded from N</text>
+  <text x="692" y="299" class="s">forces HIGH</text>
+  <path d="M692 308 V345" class="w" marker-end="url(#ar)"/>
+
+  <!-- merge to D -->
+  <path d="M745 372 H790 V170 H840" class="w" marker-end="url(#ar)"/>
+
+  <!-- Flip-flop -->
+  <rect x="840" y="140" width="120" height="120" rx="4" class="box"/>
+  <text x="900" y="188" class="t">74AUP1G74</text>
+  <text x="900" y="204" class="s">D flip-flop</text>
+  <text x="848" y="174" class="l">D</text>
+  <text x="952" y="174" class="l" text-anchor="end">Q</text>
+  <text x="952" y="238" class="l" text-anchor="end"><tspan text-decoration="overline">Q</tspan></text>
+  <path d="M890 260 L900 250 L910 260" class="w"/>
+  <text x="900" y="244" class="s">CLK</text>
+  <path d="M960 170 H1040" class="w"/>
+  <text x="975" y="163" class="t" style="text-anchor:start">SELECT</text>
+  <path d="M960 234 H1010" class="w"/>
+  <text x="1016" y="238" class="l">observe</text>
+
+  <!-- Clock -->
+  <rect x="850" y="300" width="100" height="45" rx="4" class="box"/>
+  <text x="900" y="319" class="t">Clock / timer</text>
+  <text x="900" y="334" class="s">10 Hz Schmitt RC</text>
+  <path d="M900 300 V261" class="w" marker-end="url(#ar)"/>
+
+  <!-- SELECT to hex pool -->
+  <path d="M1040 170 V590" class="w" marker-end="url(#ar)"/>
+  <text x="1048" y="400" class="s" text-anchor="start">SELECT bit</text>
+  <text x="1048" y="413" class="s" text-anchor="start">(4 cells in parallel)</text>
+
+  <!-- Hex pooling -->
+  <rect x="860" y="590" width="320" height="100" rx="6" class="box"/>
+  <text x="1020" y="612" class="t">Hex pooling and reconstruction</text>
+  <text x="1020" y="632" class="s" style="font-size:11px">SELECT[3:0] from 4 cells → quad latch → 1 hex digit</text>
+  <text x="1020" y="650" class="s" style="font-size:11px">Repeat in groups of 4 for longer numbers</text>
+  <text x="1020" y="672" class="t" style="font-size:11px;fill:#a33">Pass if pooled SELECT = isolated number N</text>
+
+  <!-- Power path -->
+  <text x="40" y="630" class="l" font-weight="bold" style="fill:#3d6a36">Power path (feeds every block above)</text>
+  <rect x="40" y="640" width="150" height="50" rx="4" class="pw"/>
+  <text x="115" y="662" class="t" style="font-size:11px">Rectenna DC out</text>
+  <text x="115" y="677" class="s">~0.1 to 10 µW indoors</text>
+  <path d="M190 665 H230" class="w" marker-end="url(#ar)"/>
+  <rect x="230" y="640" width="150" height="50" rx="4" class="pw"/>
+  <text x="305" y="662" class="t" style="font-size:11px">Storage capacitor</text>
+  <text x="305" y="677" class="s">47 to 100 µF</text>
+  <path d="M380 665 H420" class="w" marker-end="url(#ar)"/>
+  <rect x="420" y="640" width="150" height="50" rx="4" class="pw"/>
+  <text x="495" y="662" class="t" style="font-size:11px">BQ25570 harvester</text>
+  <text x="495" y="677" class="s">330 mV cold start</text>
+  <path d="M570 665 H610" class="w" marker-end="url(#ar)"/>
+  <rect x="610" y="640" width="150" height="50" rx="4" class="pw"/>
+  <text x="685" y="662" class="t" style="font-size:11px">1.8 V rail</text>
+  <text x="685" y="677" class="s">AUP logic + comparators</text>
+
+  <text x="30" y="718" class="s" text-anchor="start">Duty-cycle the clock if harvested power is marginal. Comparators: TLV3691 or TLV7011. Schottky: SMS7630 or HSMS-2850.</text>
+<metadata><c2pa:manifest>AAAWgmp1bWIAAAAeanVtZGMycGEAEQAQgAAAqgA4m3EDYzJwYQAAABZcanVtYgAAAEdqdW1kYzJtYQARABCAAACqADibcQN1cm46YzJwYTozNmQzMmVjMi1lZjI2LTRmYjctYjUxNC03MGYxMGY0NGFiNWMAAAADl2p1bWIAAAApanVtZGMyYXMAEQAQgAAAqgA4m3EDYzJwYS5hc3NlcnRpb25zAAAAALxqdW1iAAAARGp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuaW5ncmVkaWVudC52MwAAAAAYYzJzaFMLczN2/oKnR5TiBpGos+oAAABwY2JvcqNpZGM6Zm9ybWF0bWltYWdlL3N2Zyt4bWxqaW5zdGFuY2VJRHgseG1wOmlpZDo0MDU3ODIwMC02M2Q0LTRkNDItYTZhYS05OGIwMjE1MTVjMTVscmVsYXRpb25zaGlwaHBhcmVudE9mAAAB4mp1bWIAAABBanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5hY3Rpb25zLnYyAAAAABhjMnNoK3DspzjnzDcq0zf1m5IbTQAAAZljYm9yomdhY3Rpb25zgqJmYWN0aW9ua2MycGEub3BlbmVkanBhcmFtZXRlcnOha2luZ3JlZGllbnRzgaJjdXJseC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFggkaH6qsj6MtJ4hziXayY/3R/taaqxghFGgTMA6tzQmzqkZmFjdGlvbngdY29tLmFudGhyb3BpYy5jbGF1ZGUucHJvdmlkZWRqcGFyYW1ldGVyc6F4H2NvbS5hbnRocm9waWMub3JpZ2luLWNvbmZpZGVuY2VndW5rbm93bmtkZXNjcmlwdGlvbnhmQ2xhdWRlIHByb3ZpZGVkIHRoaXMgZmlsZSBhdCB0aGUgcmVxdWVzdCBvZiBhIHVzZXIgYW5kIG1heSBoYXZlIGNyZWF0ZWQgb3IgbW9kaWZpZWQgdGhlIGZpbGUgY29udGVudHMubXNvZnR3YXJlQWdlbnShZG5hbWVmQ2xhdWRlcmFsbEFjdGlvbnNJbmNsdWRlZPUAAADIanVtYgAAAEBqdW1kY2JvcgARABCAAACqADibcRNjMnBhLmhhc2guZGF0YQAAAAAYYzJzaEW/KK5vgqhDFh9dUWMppvgAAACAY2JvcqVjYWxnZnNoYTI1NmNwYWRMAAAAAAAAAAAAAAAAZGhhc2hYIOtICMaqwi9oUqS2dVd013DUs0RywZFsDz5EakPsbwV9ZG5hbWVuanVtYmYgbWFuaWZlc3RqZXhjbHVzaW9uc4GiZXN0YXJ0GSqZZmxlbmd0aBkeBAAAAj5qdW1iAAAAJ2p1bWRjMmNsABEAEIAAAKoAOJtxA2MycGEuY2xhaW0udjIAAAACD2Nib3KlY2FsZ2ZzaGEyNTZpc2lnbmF0dXJleE1zZWxmI2p1bWJmPS9jMnBhL3VybjpjMnBhOjM2ZDMyZWMyLWVmMjYtNGZiNy1iNTE0LTcwZjEwZjQ0YWI1Yy9jMnBhLnNpZ25hdHVyZWppbnN0YW5jZUlEeCx4bXA6aWlkOmY1Y2ZiNjNmLTljNzctNDVlNi04YmRlLWYwYjcxYmFlMGVhOXJjcmVhdGVkX2Fzc2VydGlvbnODomN1cmx4LXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaW5ncmVkaWVudC52M2RoYXNoWCCRofqqyPoy0niHOJdrJj/dH+1pqrGCEUaBMwDq3NCbOqJjdXJseCpzZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmFjdGlvbnMudjJkaGFzaFgg5lhKkI2kr+tRkoQSDiAswHmdUARo0irpWu07W82eNXOiY3VybHgpc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5oYXNoLmRhdGFkaGFzaFggD2i0+/jraeZQr7P5KpCUj3IfVGVPjW3q/wc9hGkPCV50Y2xhaW1fZ2VuZXJhdG9yX2luZm+jZG5hbWVvQW50aHJvcGljIEZpbGVzZ3ZlcnNpb25lMS4wLjBrc3BlY1ZlcnNpb25lMi40LjAAABA4anVtYgAAAChqdW1kYzJjcwARABCAAACqADibcQNjMnBhLnNpZ25hdHVyZQAAABAIY2JvctKEWQISogEmGCFZAgowggIGMIIBjaADAgECAhRA5aAK7sI50L64g/oGQgU9Z1UTADAKBggqhkjOPQQDAzBJMRcwFQYDVQQKEw5BbnRocm9waWMsIFBCQzEuMCwGA1UEAxMlQW50aHJvcGljIENvbnRlbnQgQ3JlZGVudGlhbHMgUm9vdCBDQTAeFw0yNjA4MDcxODQzNTZaFw0yODA4MDYxOTQzNTZaMEQxFzAVBgNVBAoTDkFudGhyb3BpYywgUEJDMSkwJwYDVQQDEyBBbnRocm9waWMgQ2xhdWRlIENvbnRlbnQgU2lnbmluZzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJh6CmvLUBgFFNU0vUKlOVtE6djd17L5SuwX0LemFisBM3dkd/3cyjxFA3Qo5S46fX0/ihY0VZ7mfb9KF703t5OjWDBWMA4GA1UdDwEB/wQEAwIHgDAVBgNVHSUEDjAMBgorBgEEAYPoXgIBMAwGA1UdEwEB/wQCMAAwHwYDVR0jBBgwFoAUzlHiBIFOZFsj+OPEz5o+nMHXXMIwCgYIKoZIzj0EAwMDZwAwZAIwMXMdFJ4BetLLVY7ORuE9noqbbAZOZn/aArXyTwFAZfKrPzxF2vPoJNf1+UCdg1XGAjBwX1zd9WGqYkqmL5SFqw1QySjr1zJfpJM9+1rdDwSPLMOPOjKuiXjoU/pUUeG9RwmhY3BhZFkNngAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPZYQIetcN4EdWAzRocCJ7gengaF2wAlXjafQKin+ohmK9RadyGCd998PFb7dW/A4tS0p2RUcBrsKR5I7zug8C2r9xo=</c2pa:manifest></metadata></svg>
