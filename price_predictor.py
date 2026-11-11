@@ -16,6 +16,8 @@ python optoelectronic_sim-5.py --price --price-poll 2
 python optoelectronic_sim-5.py --synthetic --headless --price --runs 5
 python optoelectronic_sim-5.py --cam 1 --price --price-poll 2
 python optoelectronic_sim-5.py --price --no-keys   (disable key injection)
+python optoelectronic_sim-5.py --price --fetch-delay 5
+    (inject key after oracle, wait 5 s more, then fetch fresh price)
 
 Key injection (requires: pip install pynput):
 Next oracle price above the last oracle price -> taps Shift+W
@@ -346,11 +348,16 @@ def print_key_line(key, note):
     )
 
 
-def compare_btc_prices(oracle_price, key_injector=None):
+def compare_btc_prices(
+    oracle_price,
+    key_injector=None,
+    fetch_delay=0.0,
+):
     """
     Called immediately after the oracle finishes.
 
-    Fetches a second live BTC price and compares it
+    Order: inject the key right away, then wait fetch_delay
+    seconds, then fetch a second live BTC price and compare it
     with the price the oracle just used.
 
     Nothing is saved or updated.
@@ -371,6 +378,13 @@ def compare_btc_prices(oracle_price, key_injector=None):
                 key_injector.sent_key,
                 key_injector.sent_note,
             )
+
+    if fetch_delay > 0:
+        print(
+            f"Waiting {fetch_delay:g}s before fetching "
+            f"fresh BTC price..."
+        )
+        time.sleep(fetch_delay)
 
     fresh_btc_price = live_btc_price()
 
@@ -1064,7 +1078,7 @@ def main():
     parser.add_argument(
         "--price-poll",
         type=float,
-        default=17.0,
+        default=0.1,
     )
     parser.add_argument(
         "--price-window",
@@ -1076,6 +1090,13 @@ def main():
         "--classical",
         action="store_true",
         help="freeze the decision matrix at plain OR (biased 75%%)",
+    )
+    parser.add_argument(
+        "--fetch-delay",
+        type=float,
+        default=3.0,
+        help="extra seconds to wait after the key is injected "
+        "before fetching the fresh BTC price",
     )
     parser.add_argument(
         "--no-tiebreak",
@@ -1167,6 +1188,7 @@ def main():
         on_oracle_done=lambda price: compare_btc_prices(
             price,
             key_injector,
+            args.fetch_delay,
         ),
     )
 
