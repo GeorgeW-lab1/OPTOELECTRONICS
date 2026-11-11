@@ -1144,7 +1144,7 @@ def main():
     )
     parser.add_argument(
         "--leak",
-        action="store_true",
+        action="store_true", default-True,
     )
     parser.add_argument(
         "--runs",
