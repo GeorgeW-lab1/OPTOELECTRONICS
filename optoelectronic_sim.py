@@ -179,7 +179,7 @@ def main():
                     help="hidden isolated number, hex (default: random, never shown)")
     ap.add_argument("--reveal", action="store_true", help="print the hidden number after each check")
     ap.add_argument("--x", type=int, default=12345, help="problem instance x")
-    ap.add_argument("--leak", action="store_true",
+    ap.add_argument("--leak", action="store_true",default=True,
                     help="AND-gate output also feeds D (noise can corrupt 0-bits)")
     ap.add_argument("--runs", type=int, default=0, help="stop after N words (0 = forever)")
     args = ap.parse_args()
