@@ -31,13 +31,29 @@ Measurements (per run / sweep point)
   NOTE: the true secret is used ONLY to score the attacker (Hamming distance,
   p_leak). The attacker itself only sees SELECT words and the commitment oracle.
 
+BTC loop (optional, --btc)
+  price feed (Binance/Coinbase/CoinGecko, or offline synthetic) -> momentum predictor
+  -> EventDelay(--delay-ms) -> key tap:  UP = Shift+W,  DOWN = Shift+S
+  Dry-run (prints only) unless --inject.  The graded hit rate vs a coin flip is reported.
+  This path is independent of D / SELECT, so the leak measurements are unaffected.
+  Toy signal, not financial advice.
+
 Usage
-  python optoelectronic_sim_delay.py --leak --synthetic --headless --delay-ms 150
+  # leak attack + delay, offline, virtual time
+  python optoelectronic_sim_delay.py --leak --synthetic --headless --fast
+  # delay sweep
   python optoelectronic_sim_delay.py --leak --synthetic --headless --fast --sweep-delay 0,50,100,150,300,600 --trials 10
-  python optoelectronic_sim_delay.py --leak --delay-ms 150            # real webcam + window
+  # BTC loop offline (dry-run keys)
+  python optoelectronic_sim_delay.py --leak --synthetic --headless --fast --btc --btc-seconds 60
+  # BTC live price, dry-run keys
+  python optoelectronic_sim_delay.py --leak --synthetic --headless --btc --btc-seconds 120
+  # BTC live price, REAL Shift+W / Shift+S to the focused window (5 s countdown)
+  python optoelectronic_sim_delay.py --leak --synthetic --headless --btc --inject
+  # real webcam + window
+  python optoelectronic_sim_delay.py --leak --btc
 
 Keys (window): q = quit, r = restart word
-Requires: numpy, opencv-python (opencv only for webcam / window)
+Requires: numpy; opencv-python (webcam / window only); pynput (only for --inject)
 """
 import argparse
 import collections
@@ -152,6 +168,21 @@ class DelayLine:
         return self.out
 
 
+class EventDelay:
+    """Delays discrete events by a fixed time. Unlike sampling a level, a slow frame can never skip one."""
+    def __init__(self, delay_s):
+        self.delay, self.q = delay_s, collections.deque()
+
+    def push(self, t, payload):
+        self.q.append((t + self.delay, payload))
+
+    def due(self, now):
+        out = []
+        while self.q and self.q[0][0] <= now:
+            out.append(self.q.popleft()[1])
+        return out
+
+
 class TimeCodeLatch:
     def __init__(self, value, nbits):
         self.value, self.nbits = value, nbits
@@ -194,7 +225,8 @@ class SyntheticPriceFeed:
 
 
 class LivePriceFeed:
-    """Polls a public spot-price endpoint in a background thread (never blocks the frame loop)."""
+    """Polls a public spot-price endpoint in a background thread (never blocks the frame loop).
+    Uses one keep-alive HTTPS connection (no TLS handshake per poll) and a fixed poll cadence."""
     SOURCES = {
         "coinbase": ("https://api.coinbase.com/v2/prices/BTC-USD/spot",
                      lambda j: float(j["data"]["amount"])),
@@ -203,28 +235,56 @@ class LivePriceFeed:
         "coingecko": ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
                       lambda j: float(j["bitcoin"]["usd"])),
     }
+    MIN_POLL = {"coinbase": 0.4, "binance": 0.1, "coingecko": 5.0}   # stay under public rate limits
 
     def __init__(self, source, poll_s):
         import threading
+        floor = self.MIN_POLL[source]
+        if poll_s < floor:
+            print(f"[btc] {source}: poll {poll_s}s is too fast for its public rate limit; using {floor}s")
+            poll_s = floor
         self.source, self.poll_s = source, poll_s
         self._lock, self._stop = threading.Lock(), threading.Event()
         self._latest, self._seq, self._seen, self.err = None, 0, 0, None
+        self.polls = self.errors = 0
+        self.lat_ms = 0.0
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
+        import http.client
         import json
-        import urllib.request
+        import urllib.parse
         url, parse = self.SOURCES[self.source]
+        u = urllib.parse.urlparse(url)
+        path = u.path + ("?" + u.query if u.query else "")
+        conn, next_t = None, time.monotonic()
         while not self._stop.is_set():
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "optoelectronic-sim"})
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    p = parse(json.load(r))
+                if conn is None:
+                    conn = http.client.HTTPSConnection(u.netloc, timeout=5)
+                t0 = time.monotonic()
+                conn.request("GET", path, headers={"User-Agent": "optoelectronic-sim"})
+                r = conn.getresponse()
+                body = r.read()
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+                p = parse(json.loads(body))
                 with self._lock:
                     self._latest, self._seq = p, self._seq + 1
+                self.polls += 1
+                self.lat_ms += ((time.monotonic() - t0) * 1000 - self.lat_ms) / min(self.polls, 20)
             except Exception as e:           # network down, rate-limited, geo-blocked...
-                self.err = str(e)
-            self._stop.wait(self.poll_s)
+                self.err, self.errors = str(e), self.errors + 1
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+            next_t += self.poll_s
+            wait = next_t - time.monotonic()
+            if wait < 0:                     # can't keep up: don't build a backlog
+                next_t, wait = time.monotonic(), 0
+            self._stop.wait(wait)
 
     def update(self, now):
         with self._lock:
@@ -239,36 +299,45 @@ class LivePriceFeed:
 
 class Predictor:
     """Momentum t-stat on recent log-returns -> direction (+1 up, -1 down, 0 no call).
-    Scores itself: each call is graded against the next price tick."""
+    Repeated prices are ignored (they carry no information and give zero variance).
+    Scores itself: each call is graded against the next *changed* price."""
     def __init__(self, window=12, thr=0.5):
-        self.px = collections.deque(maxlen=window + 1)
+        self.window = max(2, window)
+        self.px = collections.deque(maxlen=self.window + 1)
         self.thr, self.pending = thr, None
-        self.n = self.hits = 0
+        self.n = self.hits = self.calls = self.moves = 0
 
     def update(self, price):
-        if self.pending and self.pending[0] != 0 and price != self.pending[1]:
+        """Returns (direction, score), or None if the price did not change."""
+        if self.px and price == self.px[-1]:
+            return None
+        self.moves += 1
+        if self.pending and self.pending[0] != 0:
             self.n += 1
             self.hits += int((price > self.pending[1]) == (self.pending[0] > 0))
         self.px.append(price)
         d, score = 0, 0.0
-        if len(self.px) >= 6:
+        need = min(6, self.px.maxlen)          # was a fixed 6: never reached when window < 5
+        if len(self.px) >= need:
             r = np.diff(np.log(np.array(self.px)))
-            sd = r.std(ddof=1)
+            sd = r.std(ddof=1) if len(r) > 1 else 0.0
             if sd > 0:
                 score = float(r.mean() / (sd / math.sqrt(len(r))))
                 d = 1 if score > self.thr else -1 if score < -self.thr else 0
+        self.calls += int(d != 0)
         self.pending = (d, price)
         return d, score
 
     def stats(self):
         z = (self.hits - self.n / 2) / math.sqrt(self.n / 4) if self.n else 0.0
-        return dict(n=self.n, hits=self.hits, rate=self.hits / self.n if self.n else float("nan"), z=z)
+        return dict(n=self.n, hits=self.hits, rate=self.hits / self.n if self.n else float("nan"),
+                    z=z, calls=self.calls, moves=self.moves)
 
 
 class KeyInjector:
     """Taps Shift+W / Shift+S. Dry-run (print only) unless enabled AND pynput works."""
     def __init__(self, enabled, cooldown=1.0):
-        self.kb, self.cooldown, self.last, self.sent = None, cooldown, -1e9, []
+        self.kb, self.cooldown, self.last, self.sent, self.suppressed = None, cooldown, -1e9, [], 0
         if enabled:
             try:
                 from pynput.keyboard import Controller, Key
@@ -277,7 +346,8 @@ class KeyInjector:
                 print(f"[key] pynput unavailable ({e}); falling back to dry-run")
 
     def combo(self, letter, now):
-        if now - self.last < self.cooldown:
+        if now - self.last < self.cooldown - 0.01:   # tolerance for frame-time jitter
+            self.suppressed += 1
             return False
         self.last = now
         label = f"Shift+{letter.upper()}"
@@ -428,8 +498,7 @@ def run_session(cfg, delay_ms, seed=1, verbose=True):
                 else LivePriceFeed(src, cfg.btc_poll))
     pred = Predictor(cfg.btc_window, cfg.btc_thr)
     keys = KeyInjector(cfg.inject, cfg.key_cooldown)
-    dly_up, dly_dn = DelayLine(delay_ms / 1000.0), DelayLine(delay_ms / 1000.0)
-    prev_up = prev_dn = False
+    key_delay = EventDelay(delay_ms / 1000.0)
     last_dir = last_fired = 0
     last_price, last_score, ticks = None, 0.0, 0
     run_until = ((cfg.btc_seconds if cfg.btc_seconds is not None else 60.0) if cfg.btc else 0)
@@ -459,24 +528,21 @@ def run_session(cfg, delay_ms, seed=1, verbose=True):
             meter.frame(g_and)
 
             if feed:
-                pulse_up = pulse_dn = False
                 px = feed.update(now)
                 if px is not None:
                     ticks += 1
-                    last_price = px
-                    last_dir, last_score = pred.update(px)
-                    if last_dir and (cfg.every_tick or last_dir != last_fired):
-                        pulse_up, pulse_dn = last_dir > 0, last_dir < 0
-                        last_fired = last_dir
-                    if verbose:
-                        arrow = {1: "UP", -1: "DOWN", 0: "--"}[last_dir]
-                        print(f"[btc] ${px:,.2f}  score={last_score:+.2f}  predict={arrow}")
-                up_d, dn_d = dly_up.step(now, pulse_up), dly_dn.step(now, pulse_dn)
-                if up_d and not prev_up:
-                    keys.combo("w", now)
-                if dn_d and not prev_dn:
-                    keys.combo("s", now)
-                prev_up, prev_dn = up_d, dn_d
+                    res = pred.update(px)
+                    if res is not None:                    # price actually moved
+                        last_price = px
+                        last_dir, last_score = res
+                        if last_dir and (not cfg.on_change or last_dir != last_fired):
+                            key_delay.push(now, "w" if last_dir > 0 else "s")   # AND-style delay, then key
+                            last_fired = last_dir
+                        if verbose:
+                            arrow = {1: "UP", -1: "DOWN", 0: "--"}[last_dir]
+                            print(f"[btc] ${px:,.2f}  score={last_score:+.2f}  predict={arrow}")
+                for letter in key_delay.due(now):
+                    keys.combo(letter, now)
 
             y = bool(latch.bit(slot))
             d = y or (g_and_dly and cfg.leak)
@@ -553,7 +619,9 @@ def run_session(cfg, delay_ms, seed=1, verbose=True):
     s = meter.summary()
     s.update(recovered=recovered is not None, words=runs, secret=secret, acc=attacker.acc,
              commitment=verifier.commitment, hexw=hexw,
-             btc=pred.stats(), btc_ticks=ticks, keys=list(keys.sent), btc_err=getattr(feed, 'err', None))
+             btc=pred.stats(), btc_ticks=ticks, keys=list(keys.sent), suppressed=keys.suppressed,
+             btc_err=getattr(feed, 'err', None), btc_errors=getattr(feed, 'errors', 0),
+             lat_ms=getattr(feed, 'lat_ms', 0.0), elapsed=max(1e-9, clock.now() - t_start))
     return s
 
 
@@ -570,23 +638,23 @@ def main():
     ap.add_argument("--reveal", action="store_true")
     ap.add_argument("--x", type=int, default=12345)
     ap.add_argument("--leak", action="store_true", help="enable D = Y OR AND_dly")
-    ap.add_argument("--delay-ms", type=float, default=150.0, help="AND -> D delay (default ~RC tau)")
+    ap.add_argument("--delay-ms", type=float, default=100.0, help="AND -> D delay and prediction -> key delay")
     ap.add_argument("--sweep-delay", default=None, help="comma list of delays in ms, e.g. 0,50,150,300")
-    ap.add_argument("--trials", type=int, default=10, help="trials per sweep point")
-    ap.add_argument("--runs", type=int, default=0, help="stop after N words (0 = until recovered)")
+    ap.add_argument("--trials", type=int, default=10000, help="trials per sweep point")
+    ap.add_argument("--runs", type=int, default=10000, help="stop after N words (0 = until recovered)")
     ap.add_argument("--btc", action="store_true", help="fetch BTC price, predict, fire delayed keys")
-    ap.add_argument("--btc-source", default="coinbase",
+    ap.add_argument("--btc-source", default="binance",
                     choices=["coinbase", "binance", "coingecko", "synthetic"])
-    ap.add_argument("--btc-poll", type=float, default=5.0, help="seconds between price polls")
-    ap.add_argument("--btc-window", type=int, default=12, help="returns used by the predictor")
-    ap.add_argument("--btc-thr", type=float, default=0.5, help="|t-stat| needed to make a call")
+    ap.add_argument("--btc-poll", type=float, default=0.1, help="seconds between price polls")
+    ap.add_argument("--btc-window", type=int, default=4, help="returns used by the predictor")
+    ap.add_argument("--btc-thr", type=float, default=5e-8, help="|t-stat| needed to make a call")
     ap.add_argument("--btc-seconds", type=float, default=None,
-                    help="keep running this long after the attack ends (default 60 with --btc)")
+                    help="total seconds to run the BTC loop (default 60 with --btc)")
     ap.add_argument("--inject", action="store_true",
                     help="REALLY send Shift+W (up) / Shift+S (down) to the focused window; default is dry-run")
-    ap.add_argument("--key-cooldown", type=float, default=1.0, help="min seconds between injected combos")
-    ap.add_argument("--every-tick", action="store_true",
-                    help="fire on every directional call, not only when the direction changes")
+    ap.add_argument("--key-cooldown", type=float, default=0.1, help="min seconds between injected combos")
+    ap.add_argument("--on-change", action="store_true",
+                    help="fire only when the predicted direction flips (default: every directional call)")
     cfg = ap.parse_args()
 
     if cfg.fast and not (cfg.synthetic and cfg.headless):
@@ -613,9 +681,12 @@ def main():
         print(f"autocorr   : {s['autocorr']:+.3f}   (lag-1, successive slots)")
         print(f"leak/word  : {s['bits_per_word']:.2f} of {cfg.bits} bits (Z-channel)")
         if cfg.btc:
-            b = s["btc"]
-            print(f"BTC ticks  : {s['btc_ticks']}   calls graded: {b['n']}   "
-                  f"hit rate: {b['rate']:.2f}  (z={b['z']:+.2f} vs coin-flip)   keys sent: {len(s['keys'])}")
+            b, el = s["btc"], s["elapsed"]
+            print(f"BTC fetches: {s['btc_ticks']} ({s['btc_ticks'] / el:.1f}/s, latency~{s['lat_ms']:.0f} ms, "
+                  f"errors {s['btc_errors']})  price moves: {b['moves']} ({b['moves'] / el:.1f}/s)")
+            print(f"BTC calls  : {b['calls']} directional   graded: {b['n']}   hit rate: {b['rate']:.2f} "
+                  f"(z={b['z']:+.2f} vs coin-flip)")
+            print(f"keys sent  : {len(s['keys'])}   suppressed by cooldown: {s['suppressed']}")
             if s["btc_err"]:
                 print(f"BTC feed error (last): {s['btc_err']}")
         if s["recovered"]:
