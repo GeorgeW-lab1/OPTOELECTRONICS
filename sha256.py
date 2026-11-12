@@ -1,340 +1,809 @@
 
 #!/usr/bin/env python3
 """
-photon_preimage.py - Direct photon preimage decoder.
+PHOTON TEMPORAL-CODE POW
+Author: George Wagenknecht
 
-NO BRUTE FORCE.
-NO CANDIDATE ENUMERATION.
-NO BIT FLIPPING.
-NO SALT GRINDING.
-NO RETRIES.
+Two-level photon recognition architecture.
 
-Architecture:
-    1. Generate a secret and a random salt.
-    2. Create one SHA-256 commitment.
-    3. Load the secret into the simulated photon circuit.
-    4. Collect photon measurements.
-    5. A zero observed in any measurement identifies a zero bit.
-    6. Bits never observed as zero are decoded as one.
-    7. Construct exactly ONE candidate.
-    8. Perform exactly ONE SHA-256 verification.
+LEVEL 1: PHYSICAL SIGNAL EXTRACTION
+    Photon A / Photon B
+        -> AND coincidence gate
+        -> RC integration
+        -> Hysteresis
+        -> Reference channel
+        -> Digital noise cancellation
+        -> Residual temporal trace
 
-The photon circuit is simulated. It is not an independent
-physical SHA-256 solver or a cryptographic preimage attack.
+LEVEL 2: TEMPORAL CODE RECOGNITION
+    Residual trace
+        -> Temporal correlation
+        -> Two-level code recognition
+        -> Bit confidence
+        -> Reconstructed nonce
+
+FINAL:
+    Reconstructed nonce + block header
+        -> Double SHA-256
+        -> Target verification
+
+NO BRUTE FORCE
+NO NONCE INCREMENTING
+NO CANDIDATE ENUMERATION
+NO BIT FLIPPING
+NO SALT GRINDING
+
+The simulator encodes a known nonce in the photon statistics.
+The decoder does not receive the nonce directly.
+
+This is a classical stochastic simulation of a proposed
+optoelectronic architecture, not a quantum hardware simulation.
 """
 
 import argparse
 import hashlib
 import secrets
+import struct
+import time
 
 import numpy as np
 
 
+# =========================================================
+# PHYSICAL PARAMETERS
+# =========================================================
+
 VCC = 5.0
 V_BE = 0.7
 
-TAU = 10e3 * 15e-6
-CLK = 0.100
-FRAME_DT = 5e-7
+TAU = 0.15
+FRAME_DT = 0.005
+
+VERSION = 1
+
+# Two temporal codewords.
+#
+# Bit 1: first two chips active.
+# Bit 0: last two chips active.
+#
+# The decoder does not enumerate codewords.
+# It measures their temporal correlation.
+
+CODE_ONE = np.array([1, 1, 0, 0], dtype=np.float64)
+CODE_ZERO = np.array([0, 0, 1, 1], dtype=np.float64)
+
+REFERENCE_GAIN = 0.18
 
 
-def commit(salt, value, nbits):
-    width = (nbits + 3) // 4
-    encoded = f"{salt}:{value:0{width}X}".encode()
-    return hashlib.sha256(encoded).hexdigest()
+# =========================================================
+# HASHING
+# =========================================================
+
+def double_sha256(data):
+
+    first = hashlib.sha256(data).digest()
+
+    return hashlib.sha256(first).digest()
 
 
-def lz_bits(hexdigest):
-    return 256 - int(hexdigest, 16).bit_length()
+def leading_zero_bits(digest):
+
+    return 256 - int.from_bytes(digest, "big").bit_length()
 
 
-def zeros_info(h):
-    hexz = len(h) - len(h.lstrip("0"))
-    return f"{h} [{lz_bits(h)} zero bits, {hexz} hex 0s]"
+def make_target(difficulty):
+
+    return (1 << (256 - difficulty)) - 1
 
 
-class PhotonCircuit:
+# =========================================================
+# INPUT PARSING
+# =========================================================
 
-    def __init__(self, secret, nbits, rng,
-                 mean_photons=40.0, thr=0.45):
+def parse_integer(value):
 
-        self.secret = secret
+    try:
+        return int(value, 0)
+    except ValueError:
+        return int(value, 16)
+
+
+def parse_hex(value):
+
+    return bytes.fromhex(value.replace(" ", "").replace(":", ""))
+
+
+# =========================================================
+# PHOTON SOURCE
+# =========================================================
+
+class PhotonSource:
+
+    """
+    Simulated photon source.
+
+    The source encodes the nonce in temporal photon
+    statistics rather than passing the nonce to the decoder.
+
+    For each secret bit, the source generates four temporal
+    coincidence windows.
+
+    Bit 1:
+        High coincidence probability in windows 0 and 1.
+
+    Bit 0:
+        High coincidence probability in windows 2 and 3.
+
+    Common-mode photon noise is shared with a reference
+    detector channel.
+    """
+
+    def __init__(
+        self,
+        secret_nonce,
+        nbits,
+        rng,
+        photons=40.0,
+        signal_strength=2.5
+    ):
+
+        self._secret_nonce = secret_nonce
+
         self.nbits = nbits
         self.rng = rng
 
-        self.lam = mean_photons
-        self.thr = thr
-        self.hyst = 0.03
+        self.photons = photons
+        self.signal_strength = signal_strength
 
-        self.state = False
-        self.vc = 0.0
-        self.t = 0.0
+        self.total_photons = 0
 
-        self.alpha = 1 - np.exp(-FRAME_DT / TAU)
+        self.total_frames = 0
+        self.total_coincidences = 0
 
-    def _b_out(self, intensity):
+        self.source_time = 0.0
 
-        if self.state and intensity < self.thr - self.hyst:
-            self.state = False
+        self.alpha = 1.0 - np.exp(
+            -FRAME_DT / TAU
+        )
 
-        elif not self.state and intensity > self.thr + self.hyst:
-            self.state = True
+    def _emit_chip(self, active):
 
-        drive = VCC if self.state else 0.0
+        """
+        Emit photons and measure one temporal chip.
 
-        self.vc += (drive - self.vc) * self.alpha
+        A and B are detected independently.
+        Their coincidence is the AND gate output.
 
-        return self.vc > V_BE
+        R is a reference detector tracking common-mode noise.
+        """
 
-    def word(self):
+        vc = 0.0
+        latch = False
 
-        bits = 0
-        frames = int(round(CLK / FRAME_DT))
+        reference_sum = 0
+        coincidence_sum = 0
 
-        for slot in range(self.nbits):
+        frames = 96
 
-            t = self.t + FRAME_DT * np.arange(1, frames + 1)
-            self.t = float(t[-1])
+        base = 0.8
+
+        signal = (
+            self.signal_strength if active else 0.0
+        )
+
+        for _ in range(frames):
+
+            self.source_time += FRAME_DT
+
+            modulation = (
+                1.0
+                + 0.20 * np.sin(
+                    2 * np.pi * 0.4 * self.source_time
+                )
+                + self.rng.normal(0.0, 0.08)
+            )
+
+            modulation = max(0.1, modulation)
+
+            # Shared optical environment.
+            common_noise = max(
+                0.1,
+                modulation * self.rng.lognormal(
+                    mean=0.0,
+                    sigma=0.10
+                )
+            )
+
+            # Photon channels.
+            nA = self.rng.poisson(
+                self.photons
+                * (base + signal)
+                * common_noise
+                / 40.0
+            )
 
             nB = self.rng.poisson(
-                self.lam * (1 + 0.8 * np.sin(2 * np.pi * 0.4 * t))
+                self.photons
+                * (base + signal)
+                * common_noise
+                / 40.0
             )
 
-            nA = self.rng.poisson(
-                self.lam * (1 + 0.8 * np.sin(2 * np.pi * 0.7 * t + 1))
+            nR = self.rng.poisson(
+                self.photons
+                * base
+                * common_noise
+                / 40.0
             )
 
-            inten = nB / (2 * self.lam)
-            a_odd = nA & 1
+            self.total_photons += nA + nB + nR
+            self.total_frames += 1
 
-            d = False
+            # Detector threshold.
+            detector_a = nA >= 2
+            detector_b = nB >= 2
 
-            for i in range(frames):
-                b = self._b_out(inten[i])
-                d = bool(a_odd[i]) and b
+            # Physical AND coincidence.
+            and_output = detector_a and detector_b
 
-            y = (self.secret >> (self.nbits - 1 - slot)) & 1
+            if and_output:
+                self.total_coincidences += 1
+                coincidence_sum += 1
 
-            # Z-channel:
-            # Secret 1 always produces 1.
-            # Secret 0 may produce a noise-induced 1.
+            reference_output = nR >= 2
 
-            measured = bool(y) or d
+            reference_sum += int(reference_output)
 
-            bits = (bits << 1) | int(measured)
+            # RC integrator.
+            drive = VCC if and_output else 0.0
 
-        return bits
+            vc += (drive - vc) * self.alpha
+
+            # Schmitt-trigger hysteresis.
+            if latch and vc < 0.75:
+                latch = False
+
+            elif not latch and vc > 0.90:
+                latch = True
+
+        reference_rate = reference_sum / frames
+
+        coincidence_rate = coincidence_sum / frames
+
+        # Final RC state.
+        #
+        # This is the signal passed to the digital
+        # noise-cancellation stage.
+
+        return (
+            float(latch),
+            reference_rate,
+            coincidence_rate
+        )
+
+    def capture_bit_trace(self, bit_index):
+
+        """
+        Generate one four-chip temporal trace.
+
+        This method accesses the encoded source state.
+        The downstream decoder does not.
+        """
+
+        source_bit = (
+            self._secret_nonce
+            >> (self.nbits - 1 - bit_index)
+        ) & 1
+
+        code = CODE_ONE if source_bit else CODE_ZERO
+
+        trace = []
+
+        for chip in range(4):
+
+            latch, reference, coincidence = (
+                self._emit_chip(bool(code[chip]))
+            )
+
+            trace.append({
+                "latch": latch,
+                "reference": reference,
+                "coincidence": coincidence
+            })
+
+        return trace
 
 
-class PhotonStatistics:
+# =========================================================
+# LEVEL 1: DIGITAL NOISE CANCELLATION
+# =========================================================
+
+class NoiseCancellation:
+
+    """
+    Extract the residual photon signal.
+
+    Inputs:
+        RC latch output
+        Reference detector
+        AND coincidence statistics
+
+    Output:
+        Noise-cancelled temporal residual.
+    """
+
+    def __init__(self, reference_gain=REFERENCE_GAIN):
+
+        self.reference_gain = reference_gain
+
+    def process(self, trace):
+
+        residuals = []
+        diagnostics = []
+
+        for sample in trace:
+
+            latch = sample["latch"]
+            reference = sample["reference"]
+
+            residual = (
+                latch
+                - self.reference_gain * reference
+            )
+
+            residuals.append(residual)
+
+            diagnostics.append({
+                "latch": latch,
+                "reference": reference,
+                "coincidence": sample["coincidence"],
+                "residual": residual
+            })
+
+        return (
+            np.asarray(residuals, dtype=np.float64),
+            diagnostics
+        )
+
+
+# =========================================================
+# LEVEL 2: TEMPORAL CODE RECOGNITION
+# =========================================================
+
+class TemporalCodeDecoder:
+
+    """
+    Recognise the photon temporal code.
+
+    No candidate enumeration.
+
+    The decoder measures the difference between the
+    first and second halves of the four-chip trace.
+
+    Positive correlation -> bit 1.
+    Negative correlation -> bit 0.
+    """
 
     def __init__(self, nbits):
 
         self.nbits = nbits
-        self.n = 0
-        self.zeros = np.zeros(nbits, dtype=np.int64)
 
-    def update(self, word):
+        self.confidence = []
+        self.temporal_scores = []
 
-        self.n += 1
+        self.decoded_bits = []
 
-        for i in range(self.nbits):
+    def decode_bit(self, residual):
 
-            bit = (word >> (self.nbits - 1 - i)) & 1
+        if len(residual) != 4:
+            raise ValueError("Expected four temporal chips")
 
-            if bit == 0:
-                self.zeros[i] += 1
+        first_half = np.mean(residual[:2])
 
-    def unknown_positions(self):
+        second_half = np.mean(residual[2:])
 
-        return [
-            i for i in range(self.nbits)
-            if self.zeros[i] == 0
-        ]
+        score = first_half - second_half
 
-    def direct_candidate(self):
+        bit = int(score > 0)
+
+        # Confidence is a normalized temporal margin.
+        scale = np.mean(np.abs(residual)) + 1e-9
+
+        confidence = float(
+            np.clip(abs(score) / scale, 0.0, 1.0)
+        )
+
+        self.temporal_scores.append(float(score))
+        self.confidence.append(confidence)
+
+        self.decoded_bits.append(bit)
+
+        return bit, confidence, score
+
+    def decode(self, residual_traces):
 
         candidate = 0
 
-        for i in range(self.nbits):
+        for residual in residual_traces:
 
-            bit = 1 if self.zeros[i] == 0 else 0
+            bit, confidence, score = self.decode_bit(
+                residual
+            )
 
             candidate = (candidate << 1) | bit
 
         return candidate
 
 
-def decode_direct(stats, verify):
+# =========================================================
+# BLOCK HEADER
+# =========================================================
 
-    """
-    Construct one candidate directly from photon statistics.
+def create_header_prefix(args):
 
-    No search.
-    No combinations.
-    No permutations.
-    No bit flipping.
+    if args.prefix_hex:
 
-    Exactly one verification.
-    """
+        prefix = parse_hex(args.prefix_hex)
 
-    candidate = stats.direct_candidate()
+        if len(prefix) != 76:
+            raise ValueError(
+                "Block prefix must be exactly 76 bytes"
+            )
 
-    verified = verify(candidate)
+        return prefix
 
-    return candidate, verified
+    # Custom 76-byte header prefix.
+    version = struct.pack(">I", VERSION)
 
+    previous_hash = secrets.token_bytes(32)
 
-def cmd_preimage_photon(a):
+    merkle_root = secrets.token_bytes(32)
 
-    n = max(4, a.bits - a.bits % 4)
+    timestamp = int(time.time())
 
-    rng = np.random.default_rng(a.seed)
+    bits = struct.pack(">I", args.difficulty)
 
-    # Deterministic secret generation for the selected seed.
-    secret_bytes = rng.bytes((n + 7) // 8)
-
-    secret = (
-        int.from_bytes(secret_bytes, "big")
-        & ((1 << n) - 1)
+    return (
+        version
+        + previous_hash
+        + merkle_root
+        + struct.pack(">I", timestamp)
+        + bits
     )
 
-    # Generate salt ONCE. No grinding.
-    salt = secrets.token_hex(8)
 
-    # Generate commitment ONCE.
-    target = commit(salt, secret, n)
+# =========================================================
+# POW VERIFICATION
+# =========================================================
 
-    print("=" * 65)
-    print("PHOTON PREIMAGE DECODER")
-    print("=" * 65)
+def verify_pow(prefix, nonce, target):
 
-    print(f"Bits       : {n}")
-    print(f"Salt       : {salt}")
-    print(f"Target     : {zeros_info(target)}")
-    print(f"Measurements: {a.samples}")
-    print()
+    """
+    Exactly one candidate.
+    Exactly one double-SHA-256 computation.
+    """
 
-    stats = PhotonStatistics(n)
+    nonce_bytes = struct.pack(">I", nonce)
 
-    circ = PhotonCircuit(
-        secret,
-        n,
-        rng,
-        mean_photons=a.photons,
-        thr=a.threshold
-    )
+    header = prefix + nonce_bytes
 
-    # Acquire measurements.
-    # These are observations, not candidate searches.
+    digest = double_sha256(header)
 
-    for sample in range(1, a.samples + 1):
+    hash_value = int.from_bytes(digest, "big")
 
-        measured = circ.word()
+    success = hash_value <= target
 
-        stats.update(measured)
+    return header, digest, success
 
-        print(
-            f"measurement {sample:3d}: "
-            f"{measured:0{(n + 3) // 4}X} "
-            f"| observed zeros: "
-            f"{int(stats.zeros.sum())}"
-        )
 
-    print()
-    print("-" * 65)
+# =========================================================
+# COMPLETE PHOTON PIPELINE
+# =========================================================
 
-    unknown = stats.unknown_positions()
+def run(args):
 
-    print(f"Measurements collected : {stats.n}")
-    print(f"Positions never zero   : {len(unknown)}")
-    print(f"Positions observed zero: {n - len(unknown)}")
+    rng = np.random.default_rng(args.seed)
 
-    # Exactly ONE candidate is constructed.
-    candidate = stats.direct_candidate()
+    # The nonce is encoded into the photon source.
+    # It is not given to the decoder.
 
-    width = (n + 3) // 4
+    if args.solution_nonce is None:
 
-    print()
-    print(f"Direct candidate : {candidate:0{width}X}")
-    print(f"Actual secret    : {secret:0{width}X}")
-
-    # Exactly ONE SHA-256 verification.
-    verification_count = 0
-
-    def verify(value):
-
-        nonlocal verification_count
-
-        verification_count += 1
-
-        digest = commit(salt, value, n)
-
-        print()
-        print("SHA-256 VERIFICATION")
-        print(f"Candidate hash : {zeros_info(digest)}")
-        print(f"Target hash    : {target}")
-
-        return digest == target
-
-    found, success = decode_direct(stats, verify)
-
-    print()
-    print("=" * 65)
-
-    if success:
-
-        print("RESULT: PREIMAGE VERIFIED")
+        source_nonce = secrets.randbits(32)
 
     else:
 
-        print("RESULT: VERIFICATION FAILED")
-        print("The photon measurements did not recover the committed value.")
-        print("No alternative candidates were attempted.")
+        source_nonce = args.solution_nonce
 
-    print("=" * 65)
+    if not 0 <= source_nonce <= 0xFFFFFFFF:
+        raise ValueError("Nonce must fit in 32 bits")
 
-    print(f"Candidate attempts : 1")
-    print(f"SHA-256 operations : {verification_count}")
-    print(f"Candidate correct  : {found == secret}")
+    # Build challenge.
+    prefix = create_header_prefix(args)
 
-    assert verification_count == 1
+    if args.target:
+
+        target = int(
+            args.target.removeprefix("0x"),
+            16
+        )
+
+        if not 0 <= target <= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:
+            raise ValueError("Target must fit in 256 bits")
+
+    else:
+
+        target = make_target(args.difficulty)
+
+    # Instantiate source.
+    source = PhotonSource(
+        source_nonce,
+        32,
+        rng,
+        photons=args.photons,
+        signal_strength=args.signal_strength
+    )
+
+    cancellation = NoiseCancellation()
+
+    decoder = TemporalCodeDecoder(32)
+
+    print("=" * 72)
+    print("PHOTON TEMPORAL-CODE PROOF OF WORK")
+    print("=" * 72)
+
+    print("Architecture : Two-level photon recognition")
+    print("Physical gate: AND")
+    print("Signal path  : RC + hysteresis + DNC")
+    print("Decoder      : Temporal code correlation")
+    print("Hash         : Double SHA-256")
+    print("Nonce width  : 32 bits")
 
     print()
-    print("BRUTE FORCE OPERATIONS: 0")
-    print("SALT GRINDING        : 0")
-    print("BIT FLIPS            : 0")
-    print("CANDIDATE RETRIES    : 0")
-    print("TOTAL VERIFICATIONS  : 1")
+    print("BLOCK CHALLENGE")
+    print("-" * 50)
 
+    print("Prefix       :", prefix.hex())
+    print("Target       :", f"{target:064X}")
+
+    print()
+    print("LEVEL 1: PHOTON ACQUISITION")
+    print("-" * 50)
+
+    acquisition_start = time.perf_counter()
+
+    residual_traces = []
+
+    for i in range(32):
+
+        trace = source.capture_bit_trace(i)
+
+        residual, diagnostics = cancellation.process(
+            trace
+        )
+
+        residual_traces.append(residual)
+
+        print(
+            f"Position {i:02d} | "
+            f"AND={np.mean(residual):+.4f} | "
+            f"reference={np.mean([x['reference'] for x in diagnostics]):.3f}"
+        )
+
+    acquisition_time = (
+        time.perf_counter() - acquisition_start
+    )
+
+    print()
+    print("LEVEL 2: TEMPORAL CODE RECOGNITION")
+    print("-" * 50)
+
+    decoding_start = time.perf_counter()
+
+    candidate = decoder.decode(residual_traces)
+
+    decoding_time = (
+        time.perf_counter() - decoding_start
+    )
+
+    print()
+
+    print(
+        "Decoded nonce :",
+        f"{candidate:08X}"
+    )
+
+    print(
+        "Mean confidence:",
+        f"{np.mean(decoder.confidence):.4f}"
+    )
+
+    print(
+        "Temporal correlation range:",
+        f"{min(decoder.temporal_scores):+.4f}",
+        "to",
+        f"{max(decoder.temporal_scores):+.4f}"
+    )
+
+    # -----------------------------------------------------
+    # ONE HASH VERIFICATION
+    # -----------------------------------------------------
+
+    print()
+    print("FINAL POW VERIFICATION")
+    print("-" * 50)
+
+    hash_start = time.perf_counter()
+
+    header, digest, success = verify_pow(
+        prefix,
+        candidate,
+        target
+    )
+
+    hash_time = time.perf_counter() - hash_start
+
+    score = leading_zero_bits(digest)
+
+    print("Candidate hash :", digest.hex())
+
+    print("Leading zeros  :", score)
+
+    print("Target         :", f"{target:064X}")
+
+    # -----------------------------------------------------
+    # RESULTS
+    # -----------------------------------------------------
+
+    print()
+    print("=" * 72)
+
+    if success:
+
+        print("RESULT: PHOTON-DECODED POW VERIFIED")
+
+    else:
+
+        print("RESULT: POW VERIFICATION FAILED")
+
+        print(
+            "The decoded nonce did not satisfy the supplied target."
+        )
+
+    print("=" * 72)
+
+    print()
+    print("DIAGNOSTICS")
+    print("-" * 50)
+
+    print(
+        "Source nonce (simulation only):",
+        f"{source_nonce:08X}" if args.reveal_source else "HIDDEN"
+    )
+
+    if args.reveal_source:
+
+        print(
+            "Decoder matches source:",
+            candidate == source_nonce
+        )
+
+    print("Photon frames     :", source.total_frames)
+
+    print("Photon counts     :", source.total_photons)
+
+    print("AND coincidences  :", source.total_coincidences)
+
+    print("Decoded bits      :", len(decoder.decoded_bits))
+
+    print("Candidate count   : 1")
+
+    print("SHA-256 primitives: 2")
+
+    print("PoW verifications : 1")
+
+    print("Nonce increments  : 0")
+
+    print("Candidate search  : DISABLED")
+
+    print()
+    print("TIMING")
+    print("-" * 50)
+
+    print(f"Acquisition : {acquisition_time:.6f} s")
+
+    print(f"Decoding    : {decoding_time:.6f} s")
+
+    print(f"Hashing     : {hash_time:.9f} s")
+
+    print(
+        f"Total       : "
+        f"{acquisition_time + decoding_time + hash_time:.6f} s"
+    )
+
+    print("=" * 72)
+
+    return success
+
+
+# =========================================================
+# COMMAND LINE
+# =========================================================
 
 def main():
 
-    ap = argparse.ArgumentParser(
-        description="Direct photon preimage decoder - no brute force"
+    parser = argparse.ArgumentParser(
+        description="Two-level photon temporal-code PoW"
     )
 
-    ap.add_argument("--bits", type=int, default=10)
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--samples", type=int, default=8)
-    ap.add_argument("--photons", type=float, default=40.0)
-    ap.add_argument("--threshold", type=float, default=0.45)
+    parser.add_argument(
+        "--difficulty",
+        type=int,
+        default=0
+    )
 
-    a = ap.parse_args()
+    parser.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help="Optional explicit 256-bit target in hexadecimal"
+    )
 
-    if a.bits < 4:
-        ap.error("--bits must be at least 4")
+    parser.add_argument(
+        "--prefix-hex",
+        type=str,
+        default=None,
+        help="Optional exact 76-byte block header prefix"
+    )
 
-    if a.samples < 1:
-        ap.error("--samples must be at least 1")
+    parser.add_argument(
+        "--solution-nonce",
+        type=parse_integer,
+        default=None,
+        help="Nonce encoded in the simulated photon source"
+    )
 
-    if a.photons <= 0:
-        ap.error("--photons must be positive")
+    parser.add_argument(
+        "--photons",
+        type=float,
+        default=40.0
+    )
 
-    if not 0 <= a.threshold <= 1:
-        ap.error("--threshold must be between 0 and 1")
+    parser.add_argument(
+        "--signal-strength",
+        type=float,
+        default=2.5
+    )
 
-    cmd_preimage_photon(a)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None
+    )
+
+    parser.add_argument(
+        "--reveal-source",
+        action="store_true"
+    )
+
+    args = parser.parse_args()
+
+    if not 0 <= args.difficulty <= 256:
+        parser.error("Difficulty must be between 0 and 256")
+
+    if args.photons <= 0:
+        parser.error("Photon intensity must be positive")
+
+    if args.signal_strength <= 0:
+        parser.error("Signal strength must be positive")
+
+    try:
+
+        run(args)
+
+    except (ValueError, OverflowError) as exc:
+
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":
