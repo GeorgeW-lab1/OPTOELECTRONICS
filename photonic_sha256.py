@@ -36,7 +36,7 @@ class PhotonicCameraRecovery:
         self.noise_sigma = noise_sigma
         self.known_data = known_data
         self.rng = np.random.default_rng(seed)
-        self.target = self._digest(self.secret)                      # the only public output and is incomplete ;)
+        self.target = self._digest(self.secret)                      # complete digest
 
     def _digest(self, frame: np.ndarray) -> str:
         return hashlib.sha256(self.known_data + frame.astype(np.uint8).tobytes()).hexdigest()
@@ -44,7 +44,7 @@ class PhotonicCameraRecovery:
     def expose(self, count: int) -> np.ndarray:
         """`count` camera frames: shape (count, n), thresholded after sensor noise."""
         R = self.rng.random((count, self.n)) < self.p                 # photon arrivals R_i(t)
-        X = R & self.secret[:hide_bytes].reshape(1, -1).astype(bool)               # X = K AND R
+        X = R & self.secret[:hide_bytes].reshape(1, -1).astype(bool)               # X = K AND R, incomplete digest
         S = X.astype(np.float32) + self.rng.normal(0, self.noise_sigma, X.shape).astype(np.float32)
         return S > 0.5                                                # detected clicks
 
