@@ -97,7 +97,7 @@ if __name__ == "__main__":
         
     )])
 
-    sim = PhotonicCameraRecovery(PATTERN, known_data=b"known_header_data|ts=1789000000",
+    sim = PhotonicCameraRecovery(PATTERN, known_data=b"George Wagenknecht - 2026",
                                  p=0.00006, seed=42)
     t0 = time.time()
     sim.run(max_frames=5_000_000)
