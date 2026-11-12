@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """
-photon_suite.py - everything in one file.
+photon_suite.py - v2 decoder only, single file.
 
-Simulated known-solution optoelectronic circuit read out through a Z-channel:
+Simulated known-solution optoelectronic circuit read through a Z-channel:
     secret bit 1 -> always observed 1
     secret bit 0 -> observed 1 with probability p (photon noise), else 0
 
-  Level 1 (statistics): a bit ever seen as 0 is certainly 0. Estimate p from those.
-  Level 2 (code):       enumerate candidates over the never-seen-0 set U by number
-                        of flips (v2) or over 2^|U| with a cap (v1), and test each
-                        against a verification oracle.
+  Level 1: a bit ever seen as 0 is certainly 0. U = bits never seen 0.
+  Level 2: try 0, 1, 2, ... flips (1 -> 0) over U, checking each candidate with a
+           verification oracle. Cost is sum_k C(|U|, k), bounded by a per-word
+           hash budget (no 2^|U| cap, no posterior gate).
 
-Oracles:
-    - salted SHA-256 commitment   (decode mode)
-    - N % candidate == 0          (factor mode)
+Oracles: salted SHA-256 commitment (decode) or N % candidate == 0 (factor).
 
-IMPORTANT: this is a *decoder*, not a solver. The simulated latch is loaded with the
-answer by the simulator. It cannot factor a number nobody has the factors of; factor
-mode demonstrates exactly that (A works only if p is preloaded, B fails, C is real
-factoring cost).
+NOTE: a decoder, not a solver. The simulated latch is loaded with the answer by the
+simulator. It cannot factor a number nobody has the factors of; `factor` shows that.
 
 Usage:
-    python photon_suite.py decode                       # 16-bit, v1 vs v2
-    python photon_suite.py decode --bits 64 --trials 60
-    python photon_suite.py decode --scaling --budget 5000
-    python photon_suite.py factor                       # 32-bit primes, 64-bit N
-    python photon_suite.py factor --bits 24
+    python photon_suite.py decode [--bits 64] [--trials 60] [--budget 5000] [--scaling] [--reveal]
+    python photon_suite.py factor [--bits 32] [--runs 20] [--rho-max 44]
 """
 import argparse
 import hashlib
@@ -37,27 +30,22 @@ from math import comb, gcd
 
 import numpy as np
 
-# ============================================================== circuit constants
 VCC, V_BE = 5.0, 0.7
 TAU = 10e3 * 15e-6           # RC = 0.15 s
-CLK = 0.100                  # 10 Hz clock (one bit slot per tick)
-FRAME_DT = 0.005             # simulated frame period (200 fps)
+CLK = 0.100                  # 10 Hz clock, one bit slot per tick
+FRAME_DT = 0.005             # 200 fps simulation
 
 
-# ============================================================== oracles
 def commit(salt, v, nbits):
     return hashlib.sha256(f"{salt}:{v:0{(nbits + 3) // 4}X}".encode()).hexdigest()
 
 
-# ============================================================== photon channel
 class PhotonCircuit:
-    """Simulated analog front end with Poisson photon arrivals.
-    D = Y OR (A AND B_out), where Y is the latched secret bit."""
+    """Poisson photon front end. D = Y OR (A AND B_out), Y = latched secret bit."""
 
     def __init__(self, secret, nbits, rng, mean_photons=40.0, thr=0.45):
         self.secret, self.nbits, self.rng = secret, nbits, rng
-        self.lam = mean_photons
-        self.thr, self.hyst = thr, 0.03
+        self.lam, self.thr, self.hyst = mean_photons, thr, 0.03
         self.state, self.vc, self.t = False, 0.0, 0.0
 
     def _b_out(self, intensity):
@@ -67,33 +55,28 @@ class PhotonCircuit:
             self.state = True
         drive = VCC if self.state else 0.0
         self.vc += (drive - self.vc) * (1 - np.exp(-FRAME_DT / TAU))
-        return self.vc > V_BE                       # NPN: Vc > 0.7 -> HIGH
+        return self.vc > V_BE
 
     def word(self):
-        """Clock out one nbits-wide SELECT word."""
-        bits = 0
-        frames_per_clk = int(round(CLK / FRAME_DT))
+        bits, frames = 0, int(round(CLK / FRAME_DT))
         for slot in range(self.nbits):
             d = 0
-            for _ in range(frames_per_clk):
+            for _ in range(frames):
                 self.t += FRAME_DT
                 nB = self.rng.poisson(self.lam * (1 + 0.8 * np.sin(2 * np.pi * 0.4 * self.t)))
                 nA = self.rng.poisson(self.lam * (1 + 0.8 * np.sin(2 * np.pi * 0.7 * self.t + 1)))
-                a = bool(nA & 1)                    # shot-noise parity
-                b = self._b_out(nB / (2 * self.lam))
-                d = (a and b)                       # value at the sampling edge
+                d = bool(nA & 1) and self._b_out(nB / (2 * self.lam))
             y = (self.secret >> (self.nbits - 1 - slot)) & 1
             bits = (bits << 1) | int(bool(y) or d)
         return bits
 
 
-# ============================================================== level 1
 class PhotonStatistics:
-    """Per-bit Z-channel evidence."""
+    """Level 1: count zeros per bit."""
 
     def __init__(self, nbits):
         self.nbits, self.n = nbits, 0
-        self.zeros = np.zeros(nbits, int)           # times each bit was seen as 0
+        self.zeros = np.zeros(nbits, int)
 
     def update(self, word):
         self.n += 1
@@ -101,53 +84,20 @@ class PhotonStatistics:
             if not (word >> (self.nbits - 1 - i)) & 1:
                 self.zeros[i] += 1
 
-    def proven_zero(self):
-        return self.zeros > 0
-
     def noise_rate(self):
-        """Estimate p = P(observe 1 | secret 0) from bits proven zero (biased low early)."""
-        z = self.proven_zero()
+        """p = P(observe 1 | secret 0), from bits proven zero (reporting only)."""
+        z = self.zeros > 0
         if not z.any() or self.n == 0:
             return 0.5
-        p = 1.0 - self.zeros[z].sum() / (self.n * z.sum())
-        return float(np.clip(p, 0.01, 0.97))
-
-    def posterior_one(self):
-        p, post = self.noise_rate(), np.zeros(self.nbits)
-        post[~self.proven_zero()] = 1.0 / (1.0 + p ** self.n)
-        return post
-
-
-# ============================================================== level 2 decoders
-def decode_v1(stats, verify, nbits, max_ambiguous=12, thr=0.999):
-    """Original: enumerate ambiguous bits (posterior < thr), capped at |U| <= 12."""
-    post = stats.posterior_one()
-    base = 0
-    for i in range(nbits):
-        if post[i] >= 0.5:
-            base |= 1 << (nbits - 1 - i)
-    amb = [i for i in range(nbits) if 0 < post[i] < thr]
-    if len(amb) > max_ambiguous:
-        return None, len(amb), 0
-    tries = 0
-    for k in range(len(amb) + 1):
-        for flip in itertools.combinations(amb, k):
-            cand = base
-            for i in flip:
-                cand &= ~(1 << (nbits - 1 - i))
-            tries += 1
-            if verify(cand):
-                return cand, len(amb), tries
-    return None, len(amb), tries
+        return float(np.clip(1.0 - self.zeros[z].sum() / (self.n * z.sum()), 0.01, 0.97))
 
 
 def decode_v2(stats, verify, nbits, budget=5000):
-    """Improved: flip 0, 1, 2, ... of the never-seen-0 bits (1 -> 0); cost is
-    sum_k C(|U|, k) bounded by a per-word hash budget instead of a 2^|U| cap."""
+    """Level 2: flip 0,1,2,... bits of U (never seen 0) until verify() passes
+    or the per-word hash budget would be exceeded."""
     U = [i for i in range(nbits) if stats.zeros[i] == 0]
     masks = [1 << (nbits - 1 - i) for i in U]
-    base = sum(masks)
-    tries = 0
+    base, tries = sum(masks), 0
     for k in range(len(U) + 1):
         if tries + comb(len(U), k) > budget:
             break
@@ -161,60 +111,47 @@ def decode_v2(stats, verify, nbits, budget=5000):
     return None, len(U), tries
 
 
-# ============================================================== driver
-def read_until_solved(secret_in_latch, nbits, verify, decoder, rng,
-                      max_words=200, **kw):
-    """Clock words, update statistics, try to decode after each word."""
-    circ, stats = PhotonCircuit(secret_in_latch, nbits, rng), PhotonStatistics(nbits)
+def read_until_solved(latch_value, nbits, verify, rng, max_words=200, budget=5000):
+    circ, stats = PhotonCircuit(latch_value, nbits, rng), PhotonStatistics(nbits)
     total = 0
     for w in range(1, max_words + 1):
         stats.update(circ.word())
-        cand, nU, tries = decoder(stats, verify, nbits, **kw)
+        cand, nU, tries = decode_v2(stats, verify, nbits, budget)
         total += tries
         if cand is not None:
             return dict(cand=cand, words=w, tries=total, nU=nU, p=stats.noise_rate())
     return dict(cand=None, words=max_words, tries=total, nU=-1, p=stats.noise_rate())
 
 
-def commitment_attack(nbits, seed, decoder, **kw):
+def commitment_attack(nbits, seed, budget):
     rng = np.random.default_rng(seed)
     secret = int(rng.integers(0, 1 << nbits)) if nbits < 63 else secrets.randbits(nbits)
     salt = secrets.token_hex(8)
     target = commit(salt, secret, nbits)
-    verify = lambda c: commit(salt, c, nbits) == target
-    r = read_until_solved(secret, nbits, verify, decoder, rng, **kw)
+    r = read_until_solved(secret, nbits, lambda c: commit(salt, c, nbits) == target,
+                          rng, budget=budget)
     r.update(ok=r["cand"] == secret, secret=secret)
     return r
-
-
-def summarize(label, res):
-    W = np.array([r["words"] for r in res])
-    T = np.array([r["tries"] for r in res])
-    print(f"  {label:<18} succ={np.mean([r['ok'] for r in res]):4.0%}  "
-          f"words mean={W.mean():5.2f} max={W.max():3d}  "
-          f"hashes mean={T.mean():9.1f} max={T.max():8d}")
 
 
 def cmd_decode(a):
     sizes = [16, 32, 64, 128, 256] if a.scaling else [a.bits - a.bits % 4]
     for n in sizes:
         trials = a.trials if n <= 128 else max(20, a.trials // 3)
-        print(f"n={n}  (brute force 2^{n} = {2.0 ** n:.2e}, trials={trials})")
-        r1 = [commitment_attack(n, s, decode_v1) for s in range(trials)]
-        r2 = [commitment_attack(n, s, decode_v2, budget=a.budget) for s in range(trials)]
-        summarize("v1 (cap<=12)", r1)
-        summarize(f"v2 (budget {a.budget})", r2)
-        w1, w2 = (np.mean([r["words"] for r in x]) for x in (r1, r2))
-        print(f"  -> words saved {w1 - w2:.2f} ({(w1 - w2) / w1:.0%}); hw time v2 ~ "
-              f"{w2 * n * CLK:.0f}s vs v1 ~ {w1 * n * CLK:.0f}s")
+        res = [commitment_attack(n, s, a.budget) for s in range(trials)]
+        W = np.array([r["words"] for r in res])
+        T = np.array([r["tries"] for r in res])
+        print(f"bits={n:3d} trials={trials:3d} success={np.mean([r['ok'] for r in res]):4.0%}  "
+              f"words mean={W.mean():5.2f} p90={np.percentile(W, 90):4.0f} max={W.max():3d}  "
+              f"hashes mean={T.mean():8.1f} max={T.max():7d}  "
+              f"hw~{W.mean() * n * CLK:5.0f}s  (brute force 2^{n} = {2.0 ** n:.2e})")
         if a.reveal:
-            r = r2[0]
-            print(f"  e.g. secret={r['secret']:0{(n + 3) // 4}X} "
+            r = res[0]
+            print(f"   e.g. secret={r['secret']:0{(n + 3) // 4}X} "
                   f"guess={(r['cand'] or 0):0{(n + 3) // 4}X}")
-        print()
 
 
-# ============================================================== factoring demo
+# ------------------------------------------------------------ factoring reality check
 _SMALL = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
@@ -249,7 +186,6 @@ def rand_prime(bits, rng):
 
 
 def brent_rho(n, rng):
-    """Pollard-Brent rho: finds a nontrivial factor in ~sqrt(smallest prime factor)."""
     if n % 2 == 0:
         return 2
     while True:
@@ -265,8 +201,7 @@ def brent_rho(n, rng):
                 for _ in range(min(m, r - k)):
                     y = (y * y + c) % n
                     q = q * abs(x - y) % n
-                g = gcd(q, n)
-                k += m
+                g, k = gcd(q, n), k + m
             r *= 2
         if g == n:
             g = 1
@@ -279,20 +214,16 @@ def brent_rho(n, rng):
 
 def cmd_factor(a):
     rng = random.Random(7)
-    bits = a.bits
-    p, q = rand_prime(bits, rng), rand_prime(bits, rng)
+    p, q = rand_prime(a.bits, rng), rand_prime(a.bits, rng)
     N = p * q
     verify = lambda c: 1 < c < N and N % c == 0
     print(f"N = {N}  ({N.bit_length()} bits)\n")
 
-    r = read_until_solved(p, bits, verify, decode_v2, np.random.default_rng(0), max_words=60)
+    r = read_until_solved(p, a.bits, verify, np.random.default_rng(0), max_words=60)
     print(f"A) latch preloaded with p : recovered={r['cand'] == p}  words={r['words']}"
           f"   <- only because p was put there")
-
-    ok = 0
-    for s in range(a.runs):
-        r = read_until_solved(0, bits, verify, decode_v2, np.random.default_rng(s), max_words=60)
-        ok += r["cand"] is not None
+    ok = sum(read_until_solved(0, a.bits, verify, np.random.default_rng(s), max_words=60)
+             ["cand"] is not None for s in range(a.runs))
     print(f"B) latch empty (real case): solved {ok}/{a.runs} runs after 60 words each")
 
     print("\nC) real factoring cost, Brent rho, balanced semiprimes (median of 5):")
@@ -308,26 +239,22 @@ def cmd_factor(a):
     print("\n   Beyond ~100 bits use ECM / quadratic sieve / GNFS (CADO-NFS, msieve, YAFU).")
 
 
-# ============================================================== main
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
-
-    d = sub.add_parser("decode", help="commitment attack, v1 vs v2")
+    d = sub.add_parser("decode")
     d.add_argument("--bits", type=int, default=16)
     d.add_argument("--trials", type=int, default=20)
     d.add_argument("--budget", type=int, default=5000)
     d.add_argument("--scaling", action="store_true")
     d.add_argument("--reveal", action="store_true")
     d.set_defaults(fn=cmd_decode)
-
-    f = sub.add_parser("factor", help="factoring reality check")
-    f.add_argument("--bits", type=int, default=32, help="bits per prime")
+    f = sub.add_parser("factor")
+    f.add_argument("--bits", type=int, default=32)
     f.add_argument("--runs", type=int, default=20)
-    f.add_argument("--rho-max", type=int, default=44, help="largest prime size for rho timing")
+    f.add_argument("--rho-max", type=int, default=44)
     f.set_defaults(fn=cmd_factor)
-
     a = ap.parse_args()
     if not a.cmd:
         a = ap.parse_args(["decode"])
