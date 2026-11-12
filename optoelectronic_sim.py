@@ -246,7 +246,7 @@ def main():
     verifier = Verifier(secret, nbits)
 
     print(f"Hidden number committed: sha256(salt:number) = {verifier.commitment}")
-    print(f"salt={verifier.salt}  bits={nbits}  driver-B threshold={DriverB(args.x).thr:.2f}")
+    print(f"bits={nbits}  driver-B threshold={DriverB(args.x).thr:.2f}  (salt withheld until oracle done)")
 
     # ---- attack 2: brute force from commitment only
     if args.bruteforce:
@@ -272,6 +272,8 @@ def main():
 
     slot, select_bits, runs = 0, [], 0
     recovered = None
+    done = False                  # becomes True only once the oracle is finished
+    HID = "*" * hexw              # shown in place of anything that would leak the secret
     last_t = time.time()
     next_clk = last_t + CLK_PERIOD
     prev_I_B = None
@@ -301,6 +303,8 @@ def main():
 
             for k, v in zip(["A", "B_out", "OR", "AND", "Y", "D", "SELECT"],
                             [a, b, g_or, g_and, y, d, ff.q]):
+                if k in ("Y", "D", "SELECT") and not done:
+                    v = 0                                   # hidden until the oracle is done
                 traces[k].append(int(v))
 
             if now >= next_clk:                             # 10 Hz clock edge
@@ -313,15 +317,19 @@ def main():
                     attacker.update(val)                    # noise only adds 1s -> AND strips it
                     ok = verifier.check(attacker.acc)       # test guess against commitment
                     runs += 1
-                    print(f"run {runs:3d}  SELECT={val:0{hexw}X}  ACC guess={attacker.acc:0{hexw}X}  "
-                          f"conf~{attacker.confidence():.4f}  "
-                          f"{'RECOVERED' if ok else 'not yet'}"
-                          + (f"  (hidden={secret:0{hexw}X})" if args.reveal else ""))
+                    done = ok or bool(args.runs and runs >= args.runs)
+                    if done:
+                        print(f"run {runs:3d}  SELECT={val:0{hexw}X}  ACC guess={attacker.acc:0{hexw}X}  "
+                              f"conf~{attacker.confidence():.4f}  "
+                              f"{'RECOVERED' if ok else 'not yet'}"
+                              + (f"  (hidden={secret:0{hexw}X})" if args.reveal else ""))
+                    else:
+                        print(f"run {runs:3d}  SELECT={HID}  ACC guess={HID}  oracle: not yet")
                     slot, select_bits = 0, []
                     if ok:
                         recovered = attacker.acc
                         break
-                    if args.runs and runs >= args.runs:
+                    if done:
                         break
 
             if args.headless:
@@ -331,10 +339,13 @@ def main():
             import cv2
             sel = "".join(map(str, select_bits))
             sel_hex = f"{int(sel, 2):X}" if sel else "-"
+            if not done:
+                sel, sel_hex = "*" * len(select_bits), "*"
             lines = [f"I_B={I_B:.2f} dI={d_int:+.3f}  Vc={link.vc:.2f}V  thr={drvB.thr:.2f}",
-                     f"A={int(a)} Bout={int(b)} OR={int(g_or)} AND={int(g_and)} Y={int(y)} D={int(d)} Q={ff.q}",
+                     f"A={int(a)} Bout={int(b)} OR={int(g_or)} AND={int(g_and)} "
+                     f"Y={int(y) if done else '*'} D={int(d) if done else '*'} Q={ff.q if done else '*'}",
                      f"slot {slot}/{nbits}  SELECT bits={sel}  hex={sel_hex}",
-                     f"ACC guess={attacker.acc:0{hexw}X}  runs={runs}"]
+                     f"ACC guess={format(attacker.acc, '0%dX' % hexw) if done else HID}  runs={runs}"]
             cv2.imshow("optoelectronic sim", draw(bgr, roiB_box, roiA_box, lines, traces))
             k = cv2.waitKey(1) & 0xFF
             if k == ord("q"):
