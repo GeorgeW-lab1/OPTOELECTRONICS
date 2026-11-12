@@ -250,14 +250,8 @@ def main():
 
     # ---- attack 2: brute force from commitment only
     if args.bruteforce:
-        if nbits > 28:
-            print(f"{nbits} bits = {1 << nbits:,} candidates; too large to brute force here.")
-            return
-        found, dt = brute_force(verifier.commitment, verifier.salt, nbits)
-        print(f"BRUTE FORCE: recovered = {found:0{hexw}X} in {dt:.3f}s "
-              f"({1 << nbits:,} candidates max)")
-        if args.reveal:
-            print(f"(hidden = {secret:0{hexw}X})")
+        print("Refused: the number stays hidden until the oracle is done "
+              "(salt and number are not available before then).")
         return
 
     if not args.leak:
@@ -315,7 +309,7 @@ def main():
                 if slot == nbits:
                     val = int("".join(map(str, select_bits)), 2)
                     attacker.update(val)                    # noise only adds 1s -> AND strips it
-                    ok = verifier.check(attacker.acc)       # test guess against commitment
+                    ok = verifier.check(val)                # oracle sees only the completed word
                     runs += 1
                     done = ok or bool(args.runs and runs >= args.runs)
                     if done:
@@ -327,7 +321,7 @@ def main():
                         print(f"run {runs:3d}  SELECT={HID}  ACC guess={HID}  oracle: not yet")
                     slot, select_bits = 0, []
                     if ok:
-                        recovered = attacker.acc
+                        recovered = val
                         break
                     if done:
                         break
@@ -358,11 +352,12 @@ def main():
             import cv2
             cv2.destroyAllWindows()
 
+    if recovered is None and verifier.check(attacker.acc):   # oracle is done, reveal allowed
+        recovered = attacker.acc
     if recovered is not None:
         print(f"\nSECRET RECOVERED after {runs} words: {recovered:0{hexw}X}")
     else:
-        print(f"\nNot recovered after {runs} words; best guess {attacker.acc:0{hexw}X}. "
-              f"Run more words, or use --bruteforce.")
+        print(f"\nNot recovered after {runs} words; best guess {attacker.acc:0{hexw}X}.")
 
 
 if __name__ == "__main__":
