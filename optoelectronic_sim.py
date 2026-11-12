@@ -1,23 +1,45 @@
 #!/usr/bin/env python3
 """
-Webcam-driven simulation of the optoelectronic circuit:
+Webcam-driven simulation of the optoelectronic circuit, with an attacker that
+recovers the "hidden" number using only what leaks.
 
   IR detector A/B (two webcam ROIs) -> Driver A (randomized) / Driver B (deterministic)
   Driver B -> RC node C -> NPN "IF V(C) > 0.7 V THEN output HIGH"  (IF/THEN link)
   A and B_out -> OR / AND gates
   Y (time code, latched from an isolated number) forces D HIGH
+  D = Y OR (A AND B_out)            [AND path only reaches D with --leak]
   74HC74 D flip-flop clocked at 10 Hz (T = 100 ms) -> SELECT bit
-  SELECT bits are pooled into a hex number and compared with the isolated number.
+  SELECT bits are pooled into a word and compared with the commitment.
+
+Attack model
+  With --leak, the camera-driven AND path reaches D:
+
+      D = Y OR (A AND B_out)
+
+  Therefore each SELECT bit is:
+
+      SELECT_i = secret_i OR camera_noise_i
+
+  Camera noise can turn a secret 0 into an observed 1, but cannot turn a
+  secret 1 into 0.  The attacker AND-accumulates many noisy SELECT words:
+
+      acc &= SELECT
+
+  Once every secret-zero bit has been observed clean at least once, the
+  accumulator equals the secret.  The SHA-256 commitment then verifies the
+  recovered value, which unlocks/reveals it.
 
 Usage:
-  python optoelectronic_sim.py                    # webcam 0, window
-  python optoelectronic_sim.py --cam 1 --bits 16            # random hidden number
-  python optoelectronic_sim.py --secret A5C3 --reveal         # fixed number, show it at the end
-  python optoelectronic_sim.py --synthetic --headless --runs 3   # no hardware
-  python optoelectronic_sim.py --leak             # let the AND path reach D too
+  python optoelectronic_sim_attack.py --leak --synthetic --headless
+  python optoelectronic_sim_attack.py --leak --synthetic --headless --runs 100
+  python optoelectronic_sim_attack.py --leak --secret A5C3 --reveal --synthetic --headless
+  python optoelectronic_sim_attack.py --bruteforce --bits 16
 
-Keys (window): q = quit, r = restart word.
-Requires: numpy, opencv-python
+Keys (window):
+  q = quit
+  r = restart word
+
+Requires: numpy, opencv-python (opencv only for webcam / window)
 """
 import argparse
 import hashlib
@@ -47,7 +69,6 @@ class Camera:
 
     def read(self):
         """Return (gray uint8 image, bgr image)."""
-        import cv2
         if self.synthetic:
             t = time.time() - self.t0
             h, w = 240, 320
@@ -55,7 +76,9 @@ class Camera:
             base[:, : w // 2] = 110 + 90 * np.sin(2 * np.pi * 0.4 * t)       # B side
             base[:, w // 2:] = 110 + 90 * np.sin(2 * np.pi * 0.7 * t + 1.0)  # A side
             img = np.clip(base + self.rng.normal(0, 3, (h, w)), 0, 255).astype(np.uint8)
-            return img, cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            bgr = np.dstack([img, img, img])
+            return img, bgr
+        import cv2
         ok, bgr = self.cap.read()
         if not ok:
             raise RuntimeError("Webcam read failed")
@@ -83,9 +106,15 @@ class DriverB:
 
 
 class DriverA:
-    """Randomized: parity of the sensor-noise LSBs in detector-A ROI."""
+    """Randomized: hash parity of the detector-A ROI.
+
+    Unlike raw LSB parity, this toggles even if a real camera produces
+    constant low bits, so the camera-driven leak is observable.
+    """
     def step(self, roi):
-        return VCC if int(np.bitwise_and(roi, 1).sum()) & 1 else 0.0
+        import hashlib
+        digest = hashlib.sha256(np.ascontiguousarray(roi).tobytes()).digest()
+        return VCC if digest[0] & 1 else 0.0
 
 
 class IfThenLink:
@@ -123,18 +152,55 @@ def hi(v):
     return v > VCC / 2
 
 
+# --------------------------------------------------------------------------- commitment
+def commit_hash(salt, value, nbits):
+    return hashlib.sha256(f"{salt}:{value:0{nbits // 4}X}".encode()).hexdigest()
+
+
 class Verifier:
     """Holds only a salted SHA-256 commitment to the hidden number, never the number itself."""
     def __init__(self, value, nbits, salt=None):
         self.nbits = nbits
         self.salt = salt or secrets.token_hex(8)
-        self.commitment = self._h(value)
-
-    def _h(self, value):
-        return hashlib.sha256(f"{self.salt}:{value:0{self.nbits // 4}X}".encode()).hexdigest()
+        self.commitment = commit_hash(self.salt, value, nbits)
 
     def check(self, value):
-        return secrets.compare_digest(self._h(value), self.commitment)
+        return secrets.compare_digest(commit_hash(self.salt, value, self.nbits), self.commitment)
+
+
+# --------------------------------------------------------------------------- attacks
+def brute_force(commitment, salt, nbits):
+    """Attack 2: offline search of the whole space using only commitment + salt."""
+    t0 = time.time()
+    for v in range(1 << nbits):
+        if secrets.compare_digest(commit_hash(salt, v, nbits), commitment):
+            return v, time.time() - t0
+    return None, time.time() - t0
+
+
+class AndAccumulator:
+    """Attack 1: noise only adds 1s, so AND-ing SELECT words strips it."""
+    def __init__(self, nbits):
+        self.nbits = nbits
+        self.acc = (1 << nbits) - 1
+        self.ones = np.zeros(nbits, int)
+        self.n = 0
+
+    def update(self, word):
+        self.acc &= word
+        self.n += 1
+        for i in range(self.nbits):
+            self.ones[i] += (word >> (self.nbits - 1 - i)) & 1
+
+    def confidence(self):
+        """Estimated chance that the current accumulator is correct."""
+        zero_pos = [i for i in range(self.nbits)
+                    if not (self.acc >> (self.nbits - 1 - i)) & 1]
+        if self.n == 0 or not zero_pos:
+            return 0.0
+        p = float(np.mean([self.ones[i] / self.n for i in zero_pos]))
+        ones_in_acc = self.nbits - len(zero_pos)
+        return (1 - p ** self.n) ** ones_in_acc
 
 
 # --------------------------------------------------------------------------- drawing
@@ -151,7 +217,6 @@ def draw(frame, roiB, roiA, text_lines, traces):
         cv2.putText(out, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         y += 16
 
-    # scrolling logic trace panel
     names = ["A", "B_out", "OR", "AND", "Y", "D", "SELECT"]
     pw, rowh = max(w, 480), 22
     panel = np.full((rowh * len(names) + 8, pw, 3), 25, np.uint8)
@@ -177,30 +242,51 @@ def main():
     ap.add_argument("--bits", type=int, default=16, help="word length (multiple of 4)")
     ap.add_argument("--secret", default=None,
                     help="hidden isolated number, hex (default: random, never shown)")
-    ap.add_argument("--reveal", action="store_true", help="print the hidden number after each check")
+    ap.add_argument("--reveal", action="store_true", help="print the hidden number (for debugging)")
     ap.add_argument("--x", type=int, default=12345, help="problem instance x")
-    ap.add_argument("--leak", action="store_true",default=True,
-                    help="AND-gate output also feeds D (noise can corrupt 0-bits)")
-    ap.add_argument("--runs", type=int, default=0, help="stop after N words (0 = forever)")
+    ap.add_argument("--leak", action="store_true",
+                    help="enable the camera-driven AND leak: D = Y OR (A AND B_out)")
+    ap.add_argument("--bruteforce", action="store_true",
+                    help="attack the commitment offline (salt + hash only), then exit")
+    ap.add_argument("--runs", type=int, default=0, help="stop after N words (0 = until recovered)")
     args = ap.parse_args()
 
-    nbits = args.bits - args.bits % 4
+    nbits = max(4, args.bits - args.bits % 4)
     mask = (1 << nbits) - 1
     secret = (int(args.secret, 16) if args.secret else secrets.randbits(nbits)) & mask
     hexw = nbits // 4
     verifier = Verifier(secret, nbits)
 
+    print(f"Hidden number committed: sha256(salt:number) = {verifier.commitment}")
+    print(f"bits={nbits}  driver-B threshold={DriverB(args.x).thr:.2f}  (salt withheld until oracle done)")
+
+    if args.bruteforce:
+        print("Refused: the number stays hidden until the oracle is done "
+              "(salt and number are not available before then).")
+        return
+
+    if not args.leak:
+        print("Note: without --leak, D == Y exactly, so the first SELECT word "
+              "already equals the secret.")
+    else:
+        print("Note: --leak is enabled. SELECT = secret OR camera noise; "
+              "the attacker AND-accumulates words to strip the noise. "
+              "A correct accumulated guess is confirmed by the commitment oracle.")
+
     cam = Camera(args.cam, args.synthetic)
     drvA, drvB, link = DriverA(), DriverB(args.x), IfThenLink()
     latch, ff = TimeCodeLatch(secret, nbits), DFlipFlop74HC74()
     traces = collections.defaultdict(lambda: collections.deque(maxlen=600))
+    attacker = AndAccumulator(nbits)
 
     slot, select_bits, runs = 0, [], 0
+    recovered = None
+    done = False
+    HID = "*" * hexw
     last_t = time.time()
     next_clk = last_t + CLK_PERIOD
     prev_I_B = None
-    print(f"Hidden number committed: sha256(salt:number) = {verifier.commitment}")
-    print(f"salt={verifier.salt}  bits={nbits}  driver-B threshold={drvB.thr:.2f}")
+    and_hits = 0
 
     try:
         while True:
@@ -214,7 +300,7 @@ def main():
             roiA = gray[roiA_box[1]:roiA_box[3], roiA_box[0]:roiA_box[2]]
 
             I_B = float(roiB.mean()) / 255.0
-            d_int = 0.0 if prev_I_B is None else I_B - prev_I_B   # "delta intensity"
+            d_int = 0.0 if prev_I_B is None else I_B - prev_I_B
             prev_I_B = I_B
 
             vA = drvA.step(roiA)
@@ -222,7 +308,13 @@ def main():
             vB_out = link.step(vB, dt)                      # IF V(C) > 0.7 THEN HIGH
             a, b = hi(vA), hi(vB_out)
             g_or, g_and = a or b, a and b
-            y = bool(latch.bit(slot))                       # time code forces HIGH
+
+            if g_and:
+                and_hits += 1
+
+            # Camera-driven leak is part of the circuit whenever --leak is set.
+            # It corrupts secret-zero bits with camera noise.
+            y = bool(latch.bit(slot))
             d = y or (g_and and args.leak)
 
             for k, v in zip(["A", "B_out", "OR", "AND", "Y", "D", "SELECT"],
@@ -234,15 +326,39 @@ def main():
                 ff.clock(d)
                 select_bits.append(ff.q)
                 slot += 1
+
                 if slot == nbits:
                     val = int("".join(map(str, select_bits)), 2)
-                    ok = verifier.check(val)
-                    print(f"SELECT = {val:0{hexw}X}  -> "
-                          f"{'VERIFIED: matches hidden number' if ok else 'MISMATCH'}"
-                          + (f"   (hidden = {secret:0{hexw}X})" if args.reveal else ""))
+
+                    # The attacker always observes the camera-corrupted word.
+                    attacker.update(val)
+
+                    # The commitment oracle confirms the accumulated guess.
+                    # A correct accumulated guess is what unlocks recovery.
+                    ok = verifier.check(attacker.acc)
+
                     runs += 1
+
+                    if ok:
+                        done = True
+                        print(f"run {runs:3d}  SELECT={val:0{hexw}X}  ACC guess={attacker.acc:0{hexw}X}  "
+                              f"conf~{attacker.confidence():.4f}  RECOVERED"
+                              + (f"  (hidden={secret:0{hexw}X})" if args.reveal else ""))
+                    elif args.runs and runs >= args.runs:
+                        done = True
+                        print(f"run {runs:3d}  SELECT={val:0{hexw}X}  ACC guess={attacker.acc:0{hexw}X}  "
+                              f"conf~{attacker.confidence():.4f}  not yet"
+                              + (f"  (hidden={secret:0{hexw}X})" if args.reveal else ""))
+                    else:
+                        print(f"run {runs:3d}  SELECT={HID}  ACC guess={HID}  "
+                              f"AND hits={and_hits}  oracle: waiting for correct guess")
+
                     slot, select_bits = 0, []
-                    if args.runs and runs >= args.runs:
+
+                    if ok:
+                        recovered = attacker.acc
+                        break
+                    if done:
                         break
 
             if args.headless:
@@ -253,9 +369,10 @@ def main():
             sel = "".join(map(str, select_bits))
             sel_hex = f"{int(sel, 2):X}" if sel else "-"
             lines = [f"I_B={I_B:.2f} dI={d_int:+.3f}  Vc={link.vc:.2f}V  thr={drvB.thr:.2f}",
-                     f"A={int(a)} Bout={int(b)} OR={int(g_or)} AND={int(g_and)} Y={int(y)} D={int(d)} Q={ff.q}",
+                     f"A={int(a)} Bout={int(b)} OR={int(g_or)} AND={int(g_and)} "
+                     f"Y={int(y)} D={int(d)} Q={ff.q}",
                      f"slot {slot}/{nbits}  SELECT bits={sel}  hex={sel_hex}",
-                     f"hidden number: {'revealed ' + format(secret, '0%dX' % hexw) if args.reveal else '********'}"]
+                     f"AND hits={and_hits}  ACC guess={format(attacker.acc, '0%dX' % hexw)}  runs={runs}"]
             cv2.imshow("optoelectronic sim", draw(bgr, roiB_box, roiA_box, lines, traces))
             k = cv2.waitKey(1) & 0xFF
             if k == ord("q"):
@@ -267,6 +384,15 @@ def main():
         if not args.headless:
             import cv2
             cv2.destroyAllWindows()
+
+    # Final oracle check: the accumulated guess is the unlock condition.
+    if recovered is None and verifier.check(attacker.acc):
+        recovered = attacker.acc
+
+    if recovered is not None:
+        print(f"\nSECRET RECOVERED after {runs} words: {recovered:0{hexw}X}")
+    else:
+        print(f"\nNot recovered after {runs} words; best guess {attacker.acc:0{hexw}X}.")
 
 
 if __name__ == "__main__":
