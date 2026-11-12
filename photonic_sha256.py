@@ -35,7 +35,7 @@ class PhotonicCameraRecovery:
         self.noise_sigma = noise_sigma
         self.known_data = known_data
         self.rng = np.random.default_rng(seed)
-        self.target = "000000359d5a259561b418d1104b3ec1ce2da984d4cbf0872468e7abe992dd5"                    # the only public output
+        self.target = self._digest(self.secret)                      # the only public output
 
     def _digest(self, frame: np.ndarray) -> str:
         return hashlib.sha256(self.known_data + frame.astype(np.uint8).tobytes()).hexdigest()
