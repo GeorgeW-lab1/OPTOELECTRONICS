@@ -288,7 +288,7 @@ def main():
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument(
-        "--frames", type=int, default=3, help="one fresh dataset per frame"
+        "--frames", type=int, default=1, help="one fresh dataset per frame"
     )
     ap.add_argument(
         "--thr", type=int, default=1, help="motion threshold in DN"
