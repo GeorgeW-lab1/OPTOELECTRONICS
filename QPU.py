@@ -1,658 +1,1215 @@
-#!/usr/init/env python3
+
+#!/usr/bin/env python3
 """
 rp_hidden_number_commit_only.py
-===============================
 
-A self-contained commit-only hidden-number demo integrated with an embedded
-Qiskit circuit factorisation generator and a custom Qiskit BackendV2 execution engine.
+PARALLEL OPTICAL BIT POOLING
+COMMIT-ONLY HIDDEN NUMBER RECOVERY
+CUSTOM QISKIT BACKENDV2
+TQDM PROGRESS MONITORING
 
-An oracle creates a hidden n-bit number K (derived from N) and publishes only:
-    salt
-    commitment C = SHA256(salt || K)
+Architecture:
+    Oracle -> displayed parallel bit grid
+    Display -> USB camera -> one full-frame exposure
+    Camera frame -> parallel spatial pooling
+    Pooling -> parallel bit classification
+    Classification -> parallel vote accumulation
+    Reconstructed number -> SHA256 commitment verification
+    Successful proof -> oracle reveals its stored factors
 
-A recogniser receives only the salt, commitment, and noisy partial
-observations. It never receives K. It accumulates observations, enumerates
-consistent candidates, and proves the correct candidate by matching its
-SHA-256 digest to C.
+Camera mode requires the camera to be pointed at the displayed bit grid.
+Synthetic mode uses the same pooling pipeline without a physical camera.
 
-The oracle stores and reveals the true prime factors of N directly upon proof.
+Install:
+    pip install numpy opencv-python tqdm qiskit sympy
 
-Usage
------
-python rp_hidden_number_commit_only.py --n 9999999999999999
+Example:
+    python rp_hidden_number_commit_only.py --n 9999999999999999
+
+Camera:
+    python rp_hidden_number_commit_only.py --camera 0 --preview
+
+Note:
+    The Qiskit backend is a diagnostic circuit demonstration.
+    It is not a quantum factorisation algorithm.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import itertools
-import math
 import os
-import platform
 import secrets
 import sys
+import math
 import time
 
 import numpy as np
-
-# Qiskit imports
-from qiskit import QuantumCircuit, qpy
-from qiskit.providers import BackendV2, Options, JobV1
-from qiskit.result import Result
-from qiskit.result.models import ExperimentResult, ExperimentResultData
-from qiskit.transpiler import Target
 
 try:
     import cv2
 except ImportError:
     cv2 = None
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("Missing tqdm. Install it with: pip install tqdm")
+    raise
 
-# ---------------------------------------------------------------------------
-# Embedded q.py Source Code Literal & Loader
-# ---------------------------------------------------------------------------
+try:
+    import sympy
+except ImportError:
+    sympy = None
+
+try:
+    from qiskit import QuantumCircuit, qpy
+    from qiskit.providers import BackendV2, Options, JobV1
+    from qiskit.providers import JobStatus
+    from qiskit.result import Result
+    from qiskit.result.models import ExperimentResult, ExperimentResultData
+    from qiskit.transpiler import Target
+    QISKIT_AVAILABLE = True
+except ImportError:
+    QISKIT_AVAILABLE = False
+
+
+# ============================================================
+# EMBEDDED QISKIT CIRCUIT
+# ============================================================
 
 EMBEDDED_Q_PY_CODE = """
-import argparse
-from qiskit import QuantumCircuit, qpy
+from qiskit import QuantumCircuit
 
-def create_factorisation_circuit(N: int) -> tuple[QuantumCircuit, int]:
-    bits = N.bit_length()
-    bits = ((bits + 7) // 8) * 8
-    if bits < 8:
-        bits = 8
+def create_factorisation_circuit(N: int = 0):
+    # Small diagnostic GHZ circuit.
+    # This tests the custom execution backend only.
+    qc = QuantumCircuit(8, 8, name="parallel_bit_pooling_diagnostic")
 
-    print(f"[generator] Factoring Parameter:")
-    print(f"  Modulus N : {N} (Binary width: {N.bit_length()} bits)")
-    print(f"  Padded Qubit Target N (multiple of 8) : {bits} bits")
+    qc.h(0)
 
-    qc = QuantumCircuit(bits, bits, name=f"factorisation_N_{N}")
-    
-    for i in range(bits):
-        qc.h(i)
-        
-    for i in range(bits - 1):
+    for i in range(7):
         qc.cx(i, i + 1)
-        
-    qc.measure(range(bits), range(bits))
-    return qc, bits
+
+    qc.measure(range(8), range(8))
+    return qc, 8
 """
 
 
-def load_embedded_factorisation_circuit(N: int) -> tuple[QuantumCircuit, int]:
-    """Dynamically executes the embedded q.py code to build the circuit."""
-    namespace = {"QuantumCircuit": QuantumCircuit, "qpy": qpy, "argparse": argparse}
+def load_embedded_factorisation_circuit(N=0):
+    if not QISKIT_AVAILABLE:
+        return None, 8
+
+    namespace = {
+        "QuantumCircuit": QuantumCircuit,
+        "qpy": qpy,
+    }
+
     exec(EMBEDDED_Q_PY_CODE, namespace)
-    builder_func = namespace["create_factorisation_circuit"]
-    return builder_func(N)
+
+    return namespace["create_factorisation_circuit"](N)
 
 
-# ---------------------------------------------------------------------------
-# Custom Job & BackendV2 Implementation
-# ---------------------------------------------------------------------------
+# ============================================================
+# CUSTOM QISKIT BACKEND
+# ============================================================
 
-class CustomBackendJob(JobV1):
-    def __init__(self, backend, result_obj):
-        super().__init__(backend, job_id=str(secrets.token_hex(8)))
-        self._result_obj = result_obj
+if QISKIT_AVAILABLE:
 
-    def submit(self):
-        pass
+    class CustomBackendJob(JobV1):
 
-    def result(self):
-        return self._result_obj
+        def __init__(self, backend, result_obj):
+            super().__init__(
+                backend,
+                job_id=secrets.token_hex(8)
+            )
+            self._result_obj = result_obj
 
-    def cancel(self):
-        pass
+        def submit(self):
+            pass
 
-    def status(self):
-        from qiskit.providers import JobStatus
-        return JobStatus.DONE
+        def result(self):
+            return self._result_obj
+
+        def cancel(self):
+            pass
+
+        def status(self):
+            return JobStatus.DONE
 
 
-class CustomExecutionBackend(BackendV2):
-    def __init__(self, name="custom_execution_backend"):
-        super().__init__(name=name, backend_version="1.0.0")
-        self._target = Target(num_qubits=64)
+    class CustomExecutionBackend(BackendV2):
 
-    @classmethod
-    def _default_options(cls) -> Options:
-        return Options(shots=64)
+        def __init__(self, name="parallel_pooling_backend"):
+            super().__init__(
+                name=name,
+                backend_version="1.0.0"
+            )
+            self._target = Target(num_qubits=8)
 
-    @property
-    def target(self) -> Target:
-        return self._target
+        @classmethod
+        def _default_options(cls):
+            return Options(shots=64)
 
-    @property
-    def max_circuits(self) -> int:
-        return 1024
+        @property
+        def target(self):
+            return self._target
 
-    def run(self, run_input, **options):
-        if isinstance(run_input, QuantumCircuit):
-            circuits = [run_input]
-        else:
-            circuits = list(run_input)
+        @property
+        def max_circuits(self):
+            return 1024
 
-        results = []
-        for circ in circuits:
-            results.append(self._execute_circuit(circ, options.get("shots", 64)))
+        def run(self, run_input, **options):
 
-        res = Result(
-            backend_name=self.name,
-            backend_version=self.backend_version,
-            qiskit_version="1.0+",
-            success=True,
-            results=results
-        )
-        return CustomBackendJob(self, res)
-
-    def _execute_circuit(self, circuit: QuantumCircuit, shots: int) -> ExperimentResult:
-        num_qubits = circuit.num_qubits
-        dim = 1 << num_qubits
-        
-        state = np.zeros(dim, dtype=complex)
-        state[0] = 1.0
-
-        for instruction in circuit.data:
-            name = instruction.operation.name
-            qargs = [circuit.find_bit(q).index for q in instruction.qubits]
-
-            if name == 'h':
-                state = self._apply_h(state, qargs[0])
-            elif name in ('cx', 'cnot'):
-                state = self._apply_cx(state, qargs[0], qargs[1])
-            elif name in ('barrier', 'delay'):
-                continue
-
-        probs = np.abs(state) ** 2
-        total_prob = np.sum(probs)
-        if total_prob > 0:
-            probs /= total_prob
-        else:
-            probs[0] = 1.0
-
-        sampled_indices = np.random.choice(dim, size=shots, p=probs)
-        counts = {}
-        for idx in sampled_indices:
-            bstr = format(idx, f"0{num_qubits}b")[::-1]
-            counts[bstr] = counts.get(bstr, 0) + 1
-
-        header = {
-            "name": circuit.name,
-            "memory_slots": circuit.num_clbits
-        }
-
-        data = ExperimentResultData(counts=counts)
-        return ExperimentResult(header=header, success=True, shots=shots, data=data)
-
-    @staticmethod
-    def _apply_h(state, q):
-        new_state = np.zeros_like(state)
-        factor = 1.0 / np.sqrt(2.0)
-        for i, amp in enumerate(state):
-            if amp == 0:
-                continue
-            bit = (i >> q) & 1
-            i0 = i & ~(1 << q)
-            i1 = i | (1 << q)
-            if bit == 0:
-                new_state[i0] += factor * amp
-                new_state[i1] += factor * amp
+            if isinstance(run_input, QuantumCircuit):
+                circuits = [run_input]
             else:
-                new_state[i0] += factor * amp
-                new_state[i1] -= factor * amp
-        return new_state
+                circuits = list(run_input)
 
-    @staticmethod
-    def _apply_cx(state, control, target):
-        new_state = np.zeros_like(state)
-        for i, amp in enumerate(state):
-            if amp == 0:
-                continue
-            if (i >> control) & 1:
-                flipped = i ^ (1 << target)
-                new_state[flipped] = amp
-            else:
-                new_state[i] = amp
-        return new_state
+            shots = int(options.get("shots", 64))
+
+            results = [
+                self._execute_circuit(circuit, shots)
+                for circuit in circuits
+            ]
+
+            result_obj = Result(
+                backend_name=self.name,
+                backend_version=self.backend_version,
+                qiskit_version="1.0+",
+                success=True,
+                results=results
+            )
+
+            return CustomBackendJob(self, result_obj)
+
+        def _execute_circuit(self, circuit, shots):
+
+            # The diagnostic circuit is deliberately limited to 8 qubits.
+            if circuit.num_qubits > 8:
+                raise ValueError(
+                    "Diagnostic backend supports at most 8 qubits"
+                )
+
+            dim = 1 << circuit.num_qubits
+
+            state = np.zeros(dim, dtype=np.complex128)
+            state[0] = 1.0
+
+            for instruction in circuit.data:
+
+                name = instruction.operation.name
+
+                qargs = [
+                    circuit.find_bit(q).index
+                    for q in instruction.qubits
+                ]
+
+                if name == "h":
+                    state = self._apply_h(state, qargs[0])
+
+                elif name in ("cx", "cnot"):
+                    state = self._apply_cx(
+                        state,
+                        qargs[0],
+                        qargs[1]
+                    )
+
+            probabilities = np.abs(state) ** 2
+            probabilities /= probabilities.sum()
+
+            samples = np.random.choice(
+                dim,
+                size=shots,
+                p=probabilities
+            )
+
+            counts = {}
+
+            for sample in samples:
+                bitstring = format(
+                    sample,
+                    f"0{circuit.num_qubits}b"
+                )[::-1]
+
+                counts[bitstring] = (
+                    counts.get(bitstring, 0) + 1
+                )
+
+            header = {
+                "name": circuit.name,
+                "memory_slots": circuit.num_clbits
+            }
+
+            return ExperimentResult(
+                header=header,
+                success=True,
+                shots=shots,
+                data=ExperimentResultData(counts=counts)
+            )
+
+        @staticmethod
+        def _apply_h(state, q):
+
+            result = np.zeros_like(state)
+            factor = 1.0 / np.sqrt(2.0)
+
+            for i, amplitude in enumerate(state):
+
+                if amplitude == 0:
+                    continue
+
+                bit = (i >> q) & 1
+                i0 = i & ~(1 << q)
+                i1 = i | (1 << q)
+
+                if bit == 0:
+                    result[i0] += factor * amplitude
+                    result[i1] += factor * amplitude
+                else:
+                    result[i0] += factor * amplitude
+                    result[i1] -= factor * amplitude
+
+            return result
+
+        @staticmethod
+        def _apply_cx(state, control, target):
+
+            result = np.zeros_like(state)
+
+            for i, amplitude in enumerate(state):
+
+                if amplitude == 0:
+                    continue
+
+                if (i >> control) & 1:
+                    result[i ^ (1 << target)] = amplitude
+                else:
+                    result[i] = amplitude
+
+            return result
 
 
-# ---------------------------------------------------------------------------
-# Oracle: Knows K and maintains its true prime factors directly
-# ---------------------------------------------------------------------------
+# ============================================================
+# ORACLE
+# ============================================================
 
 class HiddenNumberOracle:
+
     def __init__(
         self,
-        bits: int = 16,
-        reveal_probability: float = 0.45,
-        noise_probability: float = 0.03,
-        target_number: int | None = None,
+        target_number,
+        bits,
+        noise_probability=0.02
     ):
-        if bits % 8:
-            raise ValueError("--bits must be a multiple of 8")
-        if not 0 < reveal_probability <= 1:
-            raise ValueError("reveal_probability must be in (0, 1]")
-        if not 0 <= noise_probability < 1:
-            raise ValueError("noise_probability must be in [0, 1)")
 
+        if bits % 8:
+            raise ValueError("Bit width must be a multiple of 8")
+
+        if target_number < 0:
+            raise ValueError("N must be positive")
+
+        if target_number.bit_length() > bits:
+            raise ValueError("N exceeds configured bit width")
+
+        self.hidden_number = target_number
         self.bits = bits
         self.byte_length = bits // 8
-        self.reveal_probability = reveal_probability
         self.noise_probability = noise_probability
 
-        if target_number is not None:
-            if target_number.bit_length() > bits:
-                raise ValueError(f"Target N ({target_number}) exceeds {bits}-bit width")
-            self.hidden_number = target_number
-        else:
-            self.hidden_number = secrets.randbits(bits)
-
-        # The Oracle intrinsically knows and stores the prime factors of N
-        self.prime_factors = self._compute_oracle_factors(self.hidden_number)
-
         self.salt = os.urandom(16)
-        self.commitment = self._hash(self.hidden_number)
 
-    def _compute_oracle_factors(self, n: int) -> list[int]:
-        factors = []
-        temp_n = n
-        while temp_n % 2 == 0:
-            factors.append(2)
-            temp_n //= 2
-        d = 3
-        while d * d <= temp_n:
-            while temp_n % d == 0:
-                factors.append(d)
-                temp_n //= d
-            d += 2
-        if temp_n > 1:
-            factors.append(temp_n)
-        return factors
+        self.commitment = self._hash(
+            self.hidden_number
+        )
 
-    def _hash(self, value: int) -> bytes:
+        self.prime_factors = self._compute_factors(
+            self.hidden_number
+        )
+
+    def _hash(self, value):
+
+        payload = value.to_bytes(
+            self.byte_length,
+            "big"
+        )
+
         return hashlib.sha256(
-            self.salt + value.to_bytes(self.byte_length, "big")
+            self.salt + payload
         ).digest()
 
+    def _compute_factors(self, n):
+
+        if sympy is not None:
+            return [
+                int(x)
+                for x in sympy.factorint(n).keys()
+                for _ in range(int(sympy.factorint(n)[x]))
+            ]
+
+        # Basic fallback for small inputs.
+        factors = []
+        d = 2
+        remaining = n
+
+        while d * d <= remaining:
+
+            while remaining % d == 0:
+                factors.append(d)
+                remaining //= d
+
+            d = 3 if d == 2 else d + 2
+
+        if remaining > 1:
+            factors.append(remaining)
+
+        return factors
+
     def public_parameters(self):
-        """Only these values are given to the recogniser."""
+
         return {
             "salt": self.salt,
             "commitment": self.commitment,
         }
 
-    def next_observation(self):
-        reveal_mask = 0
-        observed_values = 0
+    def bit_vector(self):
 
-        for i in range(self.bits):
-            if secrets.randbelow(10_000) < int(self.reveal_probability * 10_000):
-                bit = (self.hidden_number >> i) & 1
+        return np.array(
+            [
+                (self.hidden_number >> i) & 1
+                for i in range(self.bits)
+            ],
+            dtype=np.uint8
+        )
 
-                if secrets.randbelow(10_000) < int(
-                    self.noise_probability * 10_000
-                ):
-                    bit ^= 1
+    def verify(self, candidate):
 
-                reveal_mask |= 1 << i
-                observed_values |= bit << i
-
-        return reveal_mask, observed_values
-
-    def verify(self, candidate: int) -> bool:
         return self._hash(candidate) == self.commitment
 
-    def reveal_if_proven(self, candidate: int):
+    def reveal_if_proven(self, candidate):
+
         if not self.verify(candidate):
             return None
 
         return {
             "hidden_number": self.hidden_number,
-            "binary": format(self.hidden_number, f"0{self.bits}b"),
-            "salt_hex": self.salt.hex(),
-            "commitment_hex": self.commitment.hex(),
-            "candidate_digest_hex": self._hash(candidate).hex(),
+            "binary": format(
+                self.hidden_number,
+                f"0{self.bits}b"
+            ),
             "prime_factors": self.prime_factors,
+            "commitment": self.commitment.hex(),
             "proof": True,
         }
 
 
-# ---------------------------------------------------------------------------
-# Recogniser: never sees K
-# ---------------------------------------------------------------------------
+# ============================================================
+# PARALLEL BIT GRID
+# ============================================================
 
-class CommitOnlyRecogniser:
-    def __init__(self, bits: int, salt: bytes, commitment: bytes, target_n: int, max_candidates: int = 200_000):
-        self.bits = bits
-        self.byte_length = bits // 8
-        self.salt = salt
-        self.commitment = commitment
-        self.target_n = target_n
-        self.max_candidates = max_candidates
+def create_bit_grid(bit_vector, rows, cols, cell_size=24):
 
-        self.known_mask = 0
-        self.known_values = 0
+    total = rows * cols
 
-        self.cycles = 0
-        self.candidates_tested = 0
-        self.solved_at = None
-        self.recovered = None
-        self.proof = None
+    padded = np.zeros(total, dtype=np.uint8)
+    padded[:len(bit_vector)] = bit_vector
 
-        self._external_circuit_template, _ = load_embedded_factorisation_circuit(self.target_n)
-        self.backend = CustomExecutionBackend()
+    grid = padded.reshape(rows, cols)
 
-    def observe(self, reveal_mask: int, observed_values: int):
-        if self.solved_at is not None:
-            return
+    # Black = 0, white = 1.
+    pixels = grid * 255
 
-        try:
-            job = self.backend.run(self._external_circuit_template, shots=64)
-            _ = job.result().get_counts(self._external_circuit_template)
-        except Exception:
-            pass
+    image = np.repeat(
+        np.repeat(
+            pixels,
+            cell_size,
+            axis=0
+        ),
+        cell_size,
+        axis=1
+    )
 
-        self.known_mask |= reveal_mask
-        self.known_values = (
-            (self.known_values & ~reveal_mask)
-            | (observed_values & reveal_mask)
-        )
+    # Add dark borders between cells.
+    image[::cell_size, :] = 80
+    image[:, ::cell_size] = 80
 
-        self.cycles += 1
-        self._decode()
-
-    def _candidate_digest(self, candidate: int) -> bytes:
-        return hashlib.sha256(
-            self.salt + candidate.to_bytes(self.byte_length, "big")
-        ).digest()
-
-    def _decode(self):
-        unknown = [
-            i for i in range(self.bits)
-            if not (self.known_mask >> i) & 1
-        ]
-        unknown_count = len(unknown)
-
-        for corrections in range(unknown_count + 1):
-            layer_size = math.comb(unknown_count, corrections)
-
-            if self.candidates_tested + layer_size > self.max_candidates:
-                return
-
-            for flip_positions in itertools.combinations(unknown, corrections):
-                candidate = self.known_values
-
-                for i in flip_positions:
-                    candidate |= 1 << i
-
-                self.candidates_tested += 1
-                digest = self._candidate_digest(candidate)
-
-                if digest == self.commitment:
-                    self.solved_at = self.cycles
-                    self.recovered = candidate
-
-                    independent_digest = self._candidate_digest(candidate)
-
-                    self.proof = {
-                        "hidden_number": candidate,
-                        "binary": format(candidate, f"0{self.bits}b"),
-                        "salt_hex": self.salt.hex(),
-                        "commitment_hex": self.commitment.hex(),
-                        "candidate_digest_hex": digest.hex(),
-                        "hash_match": digest == self.commitment,
-                        "independent_recheck": independent_digest == self.commitment,
-                        "cycles_used": self.cycles,
-                        "candidates_tested": self.candidates_tested,
-                        "unknown_positions_at_recovery": unknown_count,
-                        "corrections_applied": corrections,
-                    }
-                    return
-
-    @property
-    def unknown_count(self) -> int:
-        return self.bits - bin(self.known_mask).count("1")
+    return cv2.cvtColor(
+        image.astype(np.uint8),
+        cv2.COLOR_GRAY2BGR
+    ) if cv2 is not None else image
 
 
-# ---------------------------------------------------------------------------
-# Camera front end
-# ---------------------------------------------------------------------------
+# ============================================================
+# CAMERA SOURCE
+# ============================================================
 
 class CameraSource:
-    def __init__(self, source, width=640, height=480, fps=30):
+
+    def __init__(
+        self,
+        source,
+        width=640,
+        height=480,
+        fps=30
+    ):
+
         if cv2 is None:
-            raise RuntimeError("opencv-python is required for camera input")
+            raise RuntimeError(
+                "Install opencv-python for camera input"
+            )
 
         if source == "auto":
             source = 0
 
         self.cap = cv2.VideoCapture(source)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"could not open camera source: {source}")
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                f"Could not open camera: {source}"
+            )
+
+        self.cap.set(
+            cv2.CAP_PROP_FRAME_WIDTH,
+            width
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_FRAME_HEIGHT,
+            height
+        )
+
+        self.cap.set(
+            cv2.CAP_PROP_FPS,
+            fps
+        )
 
     def read(self):
+
         ok, frame = self.cap.read()
-        if not ok or frame is None:
+
+        if not ok:
             return None
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return gray
+        return frame
 
     def close(self):
         self.cap.release()
 
 
 class SyntheticSource:
-    """Noisy synthetic sensor; useful when no camera is available."""
 
-    def __init__(self, width=64, height=48):
-        self.width = width
-        self.height = height
-        self.frame_number = 0
-
-        yy, xx = np.mgrid[0:height, 0:width]
-        self.base = 90 + 50 * (xx / width)
-
-    def read(self):
-        self.frame_number += 1
-        drift = 20 * math.sin(self.frame_number / 25)
-        lam = np.clip(self.base + drift, 1, 250)
-        return np.clip(np.random.poisson(lam), 0, 255).astype(np.uint8)
+    def read(self, grid_image):
+        return grid_image.copy()
 
     def close(self):
         pass
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ============================================================
+# PARALLEL SPATIAL POOLING
+# ============================================================
+
+def parallel_bit_pool(
+    frame,
+    rows,
+    cols,
+    threshold,
+    confidence_threshold
+):
+
+    """
+    One camera frame is divided into rows x cols regions.
+
+    All spatial cells are pooled in one vectorised operation.
+    """
+
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required")
+
+    if frame is None:
+        raise ValueError("Empty camera frame")
+
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY
+        )
+    else:
+        gray = frame
+
+    h, w = gray.shape
+
+    # Equal-sized spatial regions.
+    # Resize ensures exact divisibility.
+    pooled_input = cv2.resize(
+        gray,
+        (cols * 16, rows * 16),
+        interpolation=cv2.INTER_AREA
+    )
+
+    cell_h = 16
+    cell_w = 16
+
+    # Vectorised parallel pooling:
+    # (rows, cell_h, cols, cell_w)
+    cells = pooled_input.reshape(
+        rows,
+        cell_h,
+        cols,
+        cell_w
+    )
+
+    pooled = cells.mean(
+        axis=(1, 3),
+        dtype=np.float32
+    )
+
+    # Parallel binary classification.
+    observed_bits = (
+        pooled > threshold
+    ).astype(np.uint8).ravel()
+
+    # Parallel confidence estimate.
+    confidence = np.abs(
+        pooled.ravel() - threshold
+    )
+
+    # Parallel validity mask.
+    valid = (
+        confidence >= confidence_threshold
+    )
+
+    return observed_bits, confidence, valid, pooled
+
+
+# ============================================================
+# COMMIT-ONLY RECOGNISER
+# ============================================================
+
+class CommitOnlyRecogniser:
+
+    def __init__(
+        self,
+        bits,
+        salt,
+        commitment,
+        max_candidates=200_000
+    ):
+
+        self.bits = bits
+        self.byte_length = bits // 8
+
+        self.salt = salt
+        self.commitment = commitment
+
+        self.max_candidates = max_candidates
+
+        # Parallel observation accumulators.
+        self.ones = np.zeros(
+            bits,
+            dtype=np.uint32
+        )
+
+        self.zeros = np.zeros(
+            bits,
+            dtype=np.uint32
+        )
+
+        self.cycles = 0
+        self.candidates_tested = 0
+
+        self.recovered = None
+        self.proof = None
+
+        self.backend = None
+        self.circuit = None
+
+        if QISKIT_AVAILABLE:
+            self.circuit, _ = (
+                load_embedded_factorisation_circuit()
+            )
+            self.backend = CustomExecutionBackend()
+
+    def observe(
+        self,
+        observed_bits,
+        valid
+    ):
+
+        observed_bits = np.asarray(
+            observed_bits,
+            dtype=np.uint8
+        )
+
+        valid = np.asarray(
+            valid,
+            dtype=bool
+        )
+
+        if len(observed_bits) != self.bits:
+            raise ValueError("Incorrect observation width")
+
+        if len(valid) != self.bits:
+            raise ValueError("Incorrect validity-mask width")
+
+        # Parallel accumulation.
+        self.ones += (
+            observed_bits * valid
+        ).astype(np.uint32)
+
+        self.zeros += (
+            (1 - observed_bits) * valid
+        ).astype(np.uint32)
+
+        self.cycles += 1
+
+        # Run diagnostic Qiskit circuit.
+        if self.backend is not None:
+
+            try:
+                job = self.backend.run(
+                    self.circuit,
+                    shots=64
+                )
+
+                _ = job.result().get_counts()
+
+            except Exception as exc:
+                print(
+                    f"\n[Qiskit diagnostic] {exc}",
+                    file=sys.stderr
+                )
+
+        self._decode()
+
+    def _candidate_digest(self, candidate):
+
+        return hashlib.sha256(
+            self.salt
+            + candidate.to_bytes(
+                self.byte_length,
+                "big"
+            )
+        ).digest()
+
+    def _decode(self):
+
+        totals = self.ones + self.zeros
+
+        known = totals > 0
+
+        if not np.all(known):
+            return
+
+        # Majority vote across every pooled bit.
+        recovered_bits = (
+            self.ones > self.zeros
+        ).astype(np.uint8)
+
+        # Confidence is the difference between the two vote totals.
+        confidence = np.abs(
+            self.ones.astype(np.int64)
+            - self.zeros.astype(np.int64)
+        )
+
+        candidate = sum(
+            int(bit) << i
+            for i, bit in enumerate(recovered_bits)
+        )
+
+        self.candidates_tested += 1
+
+        digest = self._candidate_digest(candidate)
+
+        if digest == self.commitment:
+            self._accept(candidate, 0)
+            return
+
+        # If majority voting contains errors, test a bounded number
+        # of flips among the least-confident positions.
+        uncertain = np.argsort(confidence)[:min(16, self.bits)]
+
+        for corrections in range(1, min(4, len(uncertain)) + 1):
+
+            for positions in itertools.combinations(
+                uncertain,
+                corrections
+            ):
+
+                if self.candidates_tested >= self.max_candidates:
+                    return
+
+                corrected = candidate
+
+                for position in positions:
+                    corrected ^= 1 << int(position)
+
+                self.candidates_tested += 1
+
+                if self._candidate_digest(corrected) == self.commitment:
+                    self._accept(corrected, corrections)
+                    return
+
+    def _accept(self, candidate, corrections):
+
+        digest = self._candidate_digest(candidate)
+
+        self.recovered = candidate
+
+        self.proof = {
+            "hidden_number": candidate,
+            "binary": format(
+                candidate,
+                f"0{self.bits}b"
+            ),
+            "commitment_hex": self.commitment.hex(),
+            "candidate_digest_hex": digest.hex(),
+            "hash_match": digest == self.commitment,
+            "independent_recheck": (
+                self._candidate_digest(candidate)
+                == self.commitment
+            ),
+            "cycles_used": self.cycles,
+            "candidates_tested": self.candidates_tested,
+            "corrections_applied": corrections,
+        }
+
+    @property
+    def unknown_count(self):
+
+        return int(
+            np.count_nonzero(
+                (self.ones + self.zeros) == 0
+            )
+        )
+
+    @property
+    def known_count(self):
+        return self.bits - self.unknown_count
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def run(args):
+
+    if cv2 is None:
+        raise RuntimeError(
+            "OpenCV is required. Install: pip install opencv-python"
+        )
+
     target_n = args.n
-    _, bits = load_embedded_factorisation_circuit(target_n)
 
-    if args.bits is not None and args.bits != bits:
-        print(f"[warning] Overriding --bits {args.bits} with circuit qubit requirement: {bits}")
+    if target_n <= 0:
+        raise ValueError("N must be positive")
 
-    if args.camera is None:
-        source = SyntheticSource()
-        source_description = "synthetic Poisson sensor"
-    else:
-        try:
-            source = CameraSource(args.camera, args.width, args.height, args.fps)
-            source_description = f"camera {args.camera}"
-        except Exception as exc:
-            print(f"[camera] {exc}; using synthetic source", file=sys.stderr)
-            source = SyntheticSource()
-            source_description = "synthetic Poisson sensor"
+    # Pad number to complete bytes.
+    bits = max(
+        8,
+        ((target_n.bit_length() + 7) // 8) * 8
+    )
 
-    print(f"[source] {source_description}")
+    rows = args.rows
+    cols = math.ceil(bits / rows)
+
+    if args.cols is not None:
+        cols = args.cols
+        rows = math.ceil(bits / cols)
+
+    total_cells = rows * cols
 
     oracle = HiddenNumberOracle(
-        bits=bits,
-        reveal_probability=args.reveal,
-        noise_probability=args.noise,
         target_number=target_n,
+        bits=total_cells,
+        noise_probability=args.noise
     )
 
     params = oracle.public_parameters()
 
     recogniser = CommitOnlyRecogniser(
-        bits=bits,
+        bits=total_cells,
         salt=params["salt"],
         commitment=params["commitment"],
-        target_n=target_n,
-        max_candidates=args.max_candidates,
+        max_candidates=args.max_candidates
     )
 
-    print("\n---------- PUBLIC COMMITMENT & BACKEND ----------")
-    print(f"target modulus N    : {target_n}")
-    print(f"hidden-number width : {bits} bits")
-    print(f"salt                : {params['salt'].hex()}")
-    print(f"commitment          : {params['commitment'].hex()}")
-    print("recogniser secret   : none (commit-only)")
-    print("circuit source      : Embedded q.py String Literal (Custom BackendV2)")
+    if args.camera is None:
+        source = SyntheticSource()
+        source_description = "synthetic optical frame"
+    else:
+        try:
+            source = CameraSource(
+                args.camera,
+                args.width,
+                args.height,
+                args.fps
+            )
+            source_description = f"USB camera {args.camera}"
+        except Exception as exc:
+            print(
+                f"[camera] {exc}",
+                file=sys.stderr
+            )
+            print("[camera] Falling back to synthetic mode")
+            source = SyntheticSource()
+            source_description = "synthetic optical frame"
+
+    print("\n========== PARALLEL BIT POOLING ==========")
+    print(f"Target N             : {target_n}")
+    print(f"Number width         : {bits} bits")
+    print(f"Grid                 : {rows} x {cols}")
+    print(f"Parallel bit cells   : {total_cells}")
+    print(f"Observation source   : {source_description}")
+    print(f"Reveal probability   : {args.reveal}")
+    print(f"Noise probability    : {args.noise}")
+    print(f"Salt                 : {params['salt'].hex()}")
+    print(f"Commitment           : {params['commitment'].hex()}")
+    print(f"Qiskit available     : {QISKIT_AVAILABLE}")
+
+    if args.camera is not None:
+        print("\nPoint the USB camera at the displayed ORACLE BIT GRID.")
+        print("Keep the entire grid visible and in focus.")
+
+    # The oracle's grid is displayed separately from the camera input.
+    oracle_bits = oracle.bit_vector()
+
+    grid_image = create_bit_grid(
+        oracle_bits,
+        rows,
+        cols,
+        cell_size=args.cell_size
+    )
+
+    display_scale = args.display_scale
+
+    display_image = cv2.resize(
+        grid_image,
+        (
+            grid_image.shape[1] * display_scale,
+            grid_image.shape[0] * display_scale
+        ),
+        interpolation=cv2.INTER_NEAREST
+    )
+
+   
 
     recovered = False
 
+    progress = tqdm(
+        range(args.cycles),
+        desc="Parallel optical observations",
+        unit="frame"
+    )
+
     try:
-        for cycle in range(1, args.cycles + 1):
-            frame = source.read()
+
+        for cycle in progress:
+
+            # One complete camera exposure per cycle.
+            if isinstance(source, SyntheticSource):
+                frame = source.read(grid_image)
+            else:
+                frame = source.read()
+
             if frame is None:
-                print("[source] stream ended")
+                print("\n[source] Camera frame unavailable")
                 break
 
-            flat = frame.reshape(-1)
-            reveal_mask = 0
-            observed_values = 0
+            # ------------------------------------------------
+            # PARALLEL SPATIAL POOLING
+            # ------------------------------------------------
 
-            for i in range(bits):
-                pixel = flat[(i * 997 + cycle * 31) % flat.size]
-                reveal_this = pixel % 100 < int(args.reveal * 100)
+            observed_bits, confidence, valid, pooled = (
+                parallel_bit_pool(
+                    frame,
+                    rows,
+                    cols,
+                    args.threshold,
+                    args.confidence_threshold
+                )
+            )
 
-                if reveal_this:
-                    reveal_mask_i, observed_value_i = oracle.next_observation()
-                    bit_mask = 1 << i
+            # ------------------------------------------------
+            # PARALLEL REVEAL MASK
+            # ------------------------------------------------
 
-                    if reveal_mask_i & bit_mask:
-                        reveal_mask |= bit_mask
-                        observed_values |= observed_value_i & bit_mask
+            # Each cell is independently eligible for inclusion.
+            reveal_mask = (
+                np.random.random(total_cells)
+                < args.reveal
+            )
 
-            recogniser.observe(reveal_mask, observed_values)
+            # Simulated sensor noise is applied to the optical
+            # observations, not to individual camera exposures.
+            noise_mask = (
+                np.random.random(total_cells)
+                < args.noise
+            )
 
-            if args.verbose:
-                print(
-                    f"[cycle {cycle:3d}] known={recogniser.bits - recogniser.unknown_count:2d}"
-                    f"/{bits} unknown={recogniser.unknown_count:2d}"
-                    f" tested={recogniser.candidates_tested:7d}"
-                    f" recovered={'yes' if recogniser.solved_at else 'no'}"
+            observed_bits = (
+                observed_bits ^ noise_mask.astype(np.uint8)
+            )
+
+            # Confidence and reveal validity combined.
+            valid = valid & reveal_mask
+
+            # ------------------------------------------------
+            # PARALLEL ACCUMULATION
+            # ------------------------------------------------
+
+            recogniser.observe(
+                observed_bits,
+                valid
+            )
+
+            progress.set_postfix(
+                known=recogniser.known_count,
+                unknown=recogniser.unknown_count,
+                tested=recogniser.candidates_tested
+            )
+
+            if args.preview:
+
+                preview = cv2.resize(
+                    frame,
+                    (640, 480)
                 )
 
-            if recogniser.solved_at is not None:
+                cv2.imshow(
+                    "CAMERA EXPOSURE",
+                    preview
+                )
+
+                pooled_view = cv2.resize(
+                    pooled,
+                    (cols * 20, rows * 20),
+                    interpolation=cv2.INTER_NEAREST
+                )
+
+                pooled_view = np.clip(
+                    pooled_view,
+                    0,
+                    255
+                ).astype(np.uint8)
+
+                cv2.imshow(
+                    "PARALLEL POOLED CELLS",
+                    pooled_view
+                )
+
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord("q"):
+                    break
+
+            if recogniser.recovered is not None:
                 recovered = True
                 break
 
-            if args.preview and cv2 is not None:
-                view = cv2.resize(
-                    frame,
-                    (args.width * 3, args.height * 3),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                view = cv2.cvtColor(view, cv2.COLOR_GRAY2BGR)
-                cv2.putText(
-                    view,
-                    f"cycle {cycle} unknown {recogniser.unknown_count}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
-                cv2.imshow("commit-only hidden-number recogniser", view)
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
     except KeyboardInterrupt:
-        pass
+        print("\n[interrupt] Stopping observation loop")
+
     finally:
         source.close()
-        if args.preview and cv2 is not None:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
 
-    print("\n---------- RECOGNISER RESULT ----------")
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+    # ========================================================
+    # RECOGNISER RESULT
+    # ========================================================
+
+    print("\n========== RECOGNISER RESULT ==========")
 
     if recogniser.proof:
-        p = recogniser.proof
-        print(f"RECOVERED at cycle      : {p['cycles_used']}")
-        print(f"recovered number        : {p['hidden_number']}")
-        print(f"recovered binary        : {p['binary']}")
-        print(f"cycles used             : {p['cycles_used']}")
-        print(f"candidates tested       : {p['candidates_tested']}")
-        print(f"unknown bits at recovery: {p['unknown_positions_at_recovery']}")
-        print(f"corrections applied     : {p['corrections_applied']}")
-        print(f"salt                    : {p['salt_hex']}")
-        print(f"commitment              : {p['commitment_hex']}")
-        print(f"candidate digest        : {p['candidate_digest_hex']}")
-        print(f"hash match              : {p['hash_match']}")
-        print(f"independent recheck     : {p['independent_recheck']}")
-        print("PROOF: the recovered candidate hashes to the published commitment.")
-    else:
-        print("NOT RECOVERED")
-        print(f"cycles used             : {recogniser.cycles}")
-        print(f"candidates tested       : {recogniser.candidates_tested}")
-        print(f"still unknown positions : {recogniser.unknown_count}")
-        print("No candidate consistent with the observations matched the commitment.")
 
-    print("\n---------- ORACLE REVEAL & PRIME FACTORS ----------")
+        proof = recogniser.proof
+
+        print("RECOVERY SUCCESSFUL")
+        print(f"Recovered number       : {proof['hidden_number']}")
+        print(f"Recovered binary       : {proof['binary']}")
+        print(f"Cycles                 : {proof['cycles_used']}")
+        print(f"Candidates tested      : {proof['candidates_tested']}")
+        print(f"Corrections applied    : {proof['corrections_applied']}")
+        print(f"Commitment             : {proof['commitment_hex']}")
+        print(f"Candidate digest       : {proof['candidate_digest_hex']}")
+        print(f"Hash match             : {proof['hash_match']}")
+        print(f"Independent recheck    : {proof['independent_recheck']}")
+
+        print(
+            "\nPROOF: Reconstructed number matches the published SHA256 commitment."
+        )
+
+    else:
+
+        print("NOT RECOVERED")
+        print(f"Cycles                 : {recogniser.cycles}")
+        print(f"Known positions        : {recogniser.known_count}")
+        print(f"Unknown positions      : {recogniser.unknown_count}")
+        print(f"Candidates tested      : {recogniser.candidates_tested}")
+
+    # ========================================================
+    # ORACLE REVEAL
+    # ========================================================
+
+    print("\n========== ORACLE REVEAL ==========")
 
     if recogniser.recovered is not None:
-        revealed = oracle.reveal_if_proven(recogniser.recovered)
+
+        revealed = oracle.reveal_if_proven(
+            recogniser.recovered
+        )
 
         if revealed:
-            print(f"oracle hidden number    : {revealed['hidden_number']}")
-            print(f"oracle binary           : {revealed['binary']}")
-            print(f"oracle commitment       : {revealed['commitment_hex']}")
-            
-            # Print the pre-computed oracle prime factors directly
-            print(f"Oracle Prime Factors    : {revealed['prime_factors']}")
+
+            print(f"Oracle number          : {revealed['hidden_number']}")
+            print(f"Oracle binary          : {revealed['binary']}")
+            print(f"Oracle commitment      : {revealed['commitment']}")
+            print(f"Prime factors          : {revealed['prime_factors']}")
 
             print(
-                "MATCH: recogniser recovery equals oracle secret."
-                if revealed["hidden_number"] == recogniser.recovered
-                else "MISMATCH: recogniser and oracle disagree."
+                "MATCH: recogniser reconstruction equals oracle secret."
             )
-        else:
-            print("Oracle refused to reveal: candidate did not verify.")
-    else:
-        print("Oracle did not reveal the hidden number: no proven candidate.")
 
+        else:
+            print("Oracle refused the candidate.")
+
+    else:
+        print("No verified reconstruction; oracle retains its factors.")
+
+    print("\n========== BENCH COMPLETE ==========")
+
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
 
 def main():
+
     parser = argparse.ArgumentParser(
-        description="Commit-only hidden-number recovery with oracle-held prime factors"
+        description=(
+            "Parallel optical bit pooling with commit-only "
+            "hidden-number recovery"
+        )
     )
-    parser.add_argument("--n", type=int, default=9999999999999999, help="Semiprime modulus N to factorise")
-    parser.add_argument("--bits", type=int, default=None, help="optional manual bit-width override")
-    parser.add_argument("--cycles", type=int, default=80, help="maximum observation cycles")
-    parser.add_argument("--reveal", type=float, default=0.45, help="probability a bit is revealed per cycle")
-    parser.add_argument("--noise", type=float, default=0.03, help="probability a revealed bit is flipped")
-    parser.add_argument("--max-candidates", type=int, default=200_000)
-    parser.add_argument("--camera", type=int, default=None, help="camera index; omit for synthetic source")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=float, default=30)
-    parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
+
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=9999999999999999,
+        help="Hidden modulus N"
+    )
+
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=800
+    )
+
+    parser.add_argument(
+        "--reveal",
+        type=float,
+        default=0.45
+    )
+
+    parser.add_argument(
+        "--noise",
+        type=float,
+        default=0.02
+    )
+
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=200000
+    )
+
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=None,
+        help="USB camera index; omit for synthetic mode"
+    )
+
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=640
+    )
+
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=480
+    )
+
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=30
+    )
+
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=8
+    )
+
+    parser.add_argument(
+        "--cols",
+        type=int,
+        default=None
+    )
+
+    parser.add_argument(
+        "--cell-size",
+        type=int,
+        default=24
+    )
+
+    parser.add_argument(
+        "--display-scale",
+        type=int,
+        default=2
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=127.0
+    )
+
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=25.0
+    )
+
+    parser.add_argument(
+        "--preview",
+        action="store_true"
+    )
+
     args = parser.parse_args()
+
+    if not 0 < args.reveal <= 1:
+        parser.error("--reveal must be in (0, 1]")
+
+    if not 0 <= args.noise < 1:
+        parser.error("--noise must be in [0, 1)")
+
+    if args.rows < 1:
+        parser.error("--rows must be at least 1")
+
+    if args.cols is not None and args.cols < 1:
+        parser.error("--cols must be at least 1")
+
+    if args.cell_size < 2:
+        parser.error("--cell-size must be at least 2")
 
     run(args)
 
