@@ -1,715 +1,687 @@
+
 #!/usr/bin/env python3
 """
-Webcam-driven simulation of the optoelectronic circuit, now with a DELAY LINE
-between the AND gate and the flip-flop, plus a meter that measures what the
-AND-accumulating "denoiser" recovers from the camera (photon) leak.
+circuit_sort.py
 
-  IR detector A/B (two webcam ROIs) -> Driver A (randomized) / Driver B (deterministic)
-  Driver B -> RC node C -> NPN "IF V(C) > 0.7 V THEN output HIGH"
-  A and B_out -> OR / AND gates
-  AND --[ delay tau_d ]--> AND_dly
-  Y (time code, latched from an isolated number) forces D HIGH
-  D = Y OR AND_dly                  [only with --leak]
-  74HC74 D flip-flop clocked at 10 Hz -> Q = SELECT bit
-  SELECT bits pooled into a word; attacker AND-accumulates words; SHA-256
-  commitment confirms a correct accumulated guess.
+CONTINUOUS CAMERA-DRIVEN OPTOELECTRONIC BTC DIRECTION PREDICTOR
 
-Leak model
-  SELECT_i = secret_i OR AND_dly(t_i).  Noise can only turn 0 -> 1, so
-  acc &= SELECT strips it (a Z-channel).  The delay moves the sampling instant
-  of the AND path relative to the slow RC/Schmitt state (B_out), which changes
-  how correlated the corrupting bits are from slot to slot and word to word.
+Optical inputs:
+    Right ROI -> Detector A -> stochastic photon detection
+    Left ROI  -> Detector B -> deterministic RC/NPN model
 
-Measurements (per run / sweep point)
-  AND duty          fraction of frames with AND high
-  p_leak            P(AND_dly = 1 | secret bit = 0): corruption probability
-  lag-1 autocorr    correlation of sampled AND_dly between successive slots
-  leak bits/word    Z-channel mutual information I(secret ; SELECT) * nbits
-  words to recover  words until the AND-accumulator equals the secret
-  residual Hamming  bits still wrong in the accumulator after each word
+Main circuit:
+    AND -> 150ms delay -> accumulator -> prediction signal
 
-  NOTE: the true secret is used ONLY to score the attacker (Hamming distance,
-  p_leak). The attacker itself only sees SELECT words and the commitment oracle.
+Leak circuit:
+    OR -> 74HC74 D input -> 10Hz clock -> OBSERVE
 
-BTC loop (optional, --btc)
-  price feed (Binance/Coinbase/CoinGecko, or offline synthetic) -> momentum predictor
-  -> EventDelay(--delay-ms) -> key tap:  UP = Shift+W,  DOWN = Shift+S
-  Dry-run (prints only) unless --inject.  The graded hit rate vs a coin flip is reported.
-  This path is independent of D / SELECT, so the leak measurements are unaffected.
-  Toy signal, not financial advice.
+Independent probe:
+    Separate photon-counting measurement.
 
-Usage
-  # leak attack + delay, offline, virtual time
-  python optoelectronic_sim_delay.py --leak --synthetic --headless --fast
-  # delay sweep
-  python optoelectronic_sim_delay.py --leak --synthetic --headless --fast --sweep-delay 0,50,100,150,300,600 --trials 10
-  # BTC loop offline (dry-run keys)
-  python optoelectronic_sim_delay.py --leak --synthetic --headless --fast --btc --btc-seconds 60
-  # BTC live price, dry-run keys
-  python optoelectronic_sim_delay.py --leak --synthetic --headless --btc --btc-seconds 120
-  # BTC live price, REAL Shift+W / Shift+S to the focused window (5 s countdown)
-  python optoelectronic_sim_delay.py --leak --synthetic --headless --btc --inject
-  # real webcam + window
-  python optoelectronic_sim_delay.py --leak --btc
+Prediction:
+    The optical circuit generates a signed prediction signal.
+    Positive signal = BTC predicted HIGHER -> Shift+W
+    Negative signal = BTC predicted LOWER  -> Shift+S
 
-Keys (window): q = quit, r = restart word
-Requires: numpy; opencv-python (webcam / window only); pynput (only for --inject)
+Timing:
+    Capture -> circuit evaluation -> 150ms circuit delay
+    -> additional 1 second -> BTC/USD fetch -> prediction -> keypress
+
+BTC price does not determine the prediction direction.
+It is used as the reference price for the predicted value.
+
+Install:
+    pip install numpy opencv-python pyautogui
+
+Run:
+    python circuit_sort.py
+    python circuit_sort.py --synthetic
+    python circuit_sort.py --synthetic --no-inject
 """
+
 import argparse
-import collections
 import hashlib
+import json
 import math
-import secrets
 import time
+import urllib.request
+from datetime import datetime, timezone
+
+import cv2
 import numpy as np
 
-VCC = 5.0
-V_BE = 0.7
-R_OHM = 10e3
-C_FARAD = 15e-6          # tau = RC = 0.15 s
-CLK_PERIOD = 0.100       # 10 Hz
-PHOTONS_PER_LEVEL = 4.0  # synthetic camera: photon shot-noise scale
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+H = 96
+W = 128
+
+MAIN_DELAY = 0.150
+POST_DELAY = 1.000
+CLOCK_PERIOD = 0.100
+
+VS = 5.0
+VBE = 0.7
+VIH = 3.5
+
+RC_TAU = 0.050
+
+PHOTON_EFFICIENCY = 0.80
+PHOTON_FLUX = 20.0
+DARK_COUNTS = 0.02
+
+MOTION_THRESHOLD = 1
+
+MAX_PREDICTED_CHANGE_PERCENT = 0.50
+PREDICTION_HORIZON_SECONDS = 60.0
+
+BTC_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+
+LOG_FILE = "circuit_sort_log.jsonl"
 
 
-# --------------------------------------------------------------------------- time
-class Clock:
-    """Real time, or virtual time (--fast) advanced one frame per tick."""
-    def __init__(self, virtual=False, frame_dt=1 / 30):
-        self.virtual, self.frame_dt, self.t = virtual, frame_dt, 0.0
+# ============================================================
+# CAMERA INPUT
+# ============================================================
 
-    def now(self):
-        return self.t if self.virtual else time.time()
+class CameraSource:
+    def __init__(self, index=0):
+        self.cap = cv2.VideoCapture(index)
 
-    def tick(self):
-        if self.virtual:
-            self.t += self.frame_dt
+        if not self.cap.isOpened():
+            raise RuntimeError("Could not open camera.")
 
-
-# --------------------------------------------------------------------------- sources
-class Camera:
-    def __init__(self, index, clock, synthetic=False, seed=1):
-        self.synthetic, self.clock = synthetic, clock
-        self.t0 = clock.now()
-        self.rng = np.random.default_rng(seed)
-        if not synthetic:
-            import cv2
-            self.cap = cv2.VideoCapture(index)
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Cannot open webcam {index}")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
 
     def read(self):
-        """Return (gray uint8 image, bgr image)."""
-        if self.synthetic:
-            t = self.clock.now() - self.t0
-            h, w = 120, 160
-            base = np.zeros((h, w), np.float32)
-            base[:, : w // 2] = 110 + 90 * np.sin(2 * np.pi * 0.4 * t)       # B side
-            base[:, w // 2:] = 110 + 90 * np.sin(2 * np.pi * 0.7 * t + 1.0)  # A side
-            # photon shot noise: Poisson counts, not Gaussian read noise
-            lam = np.clip(base, 0, None) * PHOTONS_PER_LEVEL
-            img = np.clip(self.rng.poisson(lam) / PHOTONS_PER_LEVEL, 0, 255).astype(np.uint8)
-            return img, np.dstack([img, img, img])
-        import cv2
-        ok, bgr = self.cap.read()
+        ok, frame = self.cap.read()
+
         if not ok:
-            raise RuntimeError("Webcam read failed")
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), bgr
+            raise RuntimeError("Camera frame capture failed.")
 
-    def release(self):
-        if not self.synthetic:
-            self.cap.release()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (W, H))
 
-
-# --------------------------------------------------------------------------- circuit blocks
-class DriverB:
-    """Deterministic Schmitt comparator on detector-B intensity; threshold set by instance x."""
-    def __init__(self, x):
-        self.thr = 0.30 + 0.40 * (((x * 2654435761) % 2**32) / 2**32)
-        self.hyst = 0.03
-        self.state = False
-
-    def step(self, intensity):
-        if self.state and intensity < self.thr - self.hyst:
-            self.state = False
-        elif not self.state and intensity > self.thr + self.hyst:
-            self.state = True
-        return VCC if self.state else 0.0
+    def close(self):
+        self.cap.release()
 
 
-class DriverA:
-    """Randomized: hash parity of the detector-A ROI (toggles with photon noise)."""
-    def step(self, roi):
-        digest = hashlib.sha256(np.ascontiguousarray(roi).tobytes()).digest()
-        return VCC if digest[0] & 1 else 0.0
+# ============================================================
+# SYNTHETIC INPUT
+# ============================================================
 
-
-class IfThenLink:
-    """RC node + NPN: IF V(C) > 0.7 V THEN output HIGH."""
+class SyntheticSource:
     def __init__(self):
-        self.vc = 0.0
+        self.phase = 0.0
 
-    def step(self, v_drive, dt):
-        self.vc += (v_drive - self.vc) * (1 - np.exp(-dt / (R_OHM * C_FARAD)))
-        return VCC if self.vc > V_BE else 0.0
+    def read(self):
+        self.phase += 0.13
 
+        x = np.arange(W)[None, :]
+        y = np.arange(H)[:, None]
 
-class DelayLine:
-    """Pure transport delay (e.g. RC/buffer chain) between the AND gate and D."""
-    def __init__(self, delay_s):
-        self.delay = delay_s
-        self.q = collections.deque()   # (timestamp, value)
-        self.out = False
+        wave = (
+            35.0
+            + 25.0 * np.sin(x * 0.09 + self.phase)
+            + 20.0 * np.cos(y * 0.11 - self.phase * 0.7)
+        )
 
-    def step(self, t, v):
-        self.q.append((t, bool(v)))
-        # newest sample that is at least `delay` old becomes the output
-        while self.q and self.q[0][0] <= t - self.delay:
-            self.out = self.q.popleft()[1]
-        return self.out
+        noise = np.random.normal(0, 8, (H, W))
+        frame = np.clip(wave + noise, 0, 255)
 
-
-class EventDelay:
-    """Delays discrete events by a fixed time. Unlike sampling a level, a slow frame can never skip one."""
-    def __init__(self, delay_s):
-        self.delay, self.q = delay_s, collections.deque()
-
-    def push(self, t, payload):
-        self.q.append((t + self.delay, payload))
-
-    def due(self, now):
-        out = []
-        while self.q and self.q[0][0] <= now:
-            out.append(self.q.popleft()[1])
-        return out
-
-
-class TimeCodeLatch:
-    def __init__(self, value, nbits):
-        self.value, self.nbits = value, nbits
-
-    def bit(self, slot):
-        return (self.value >> (self.nbits - 1 - slot)) & 1
-
-
-class DFlipFlop74HC74:
-    def __init__(self):
-        self.q = 0
-
-    def clock(self, d):
-        self.q = int(d)
-
-
-def hi(v):
-    return v > VCC / 2
-
-
-# --------------------------------------------------------------------------- BTC feed / predictor / keys
-class SyntheticPriceFeed:
-    """Offline random walk with mild momentum (so the predictor has something to find)."""
-    def __init__(self, poll_s, seed=7, start=65000.0):
-        self.rng = np.random.default_rng(seed)
-        self.poll_s, self.price, self.mom, self.next_t = poll_s, start, 0.0, None
-
-    def update(self, now):
-        if self.next_t is None:
-            self.next_t = now
-        if now < self.next_t:
-            return None
-        self.next_t += self.poll_s
-        self.mom = 0.3 * self.mom + self.rng.normal(0, 4e-4)
-        self.price *= math.exp(self.mom)
-        return self.price
+        return frame.astype(np.uint8)
 
     def close(self):
         pass
 
 
-class LivePriceFeed:
-    """Polls a public spot-price endpoint in a background thread (never blocks the frame loop).
-    Uses one keep-alive HTTPS connection (no TLS handshake per poll) and a fixed poll cadence."""
-    SOURCES = {
-        "coinbase": ("https://api.coinbase.com/v2/prices/BTC-USD/spot",
-                     lambda j: float(j["data"]["amount"])),
-        "binance": ("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-                    lambda j: float(j["price"])),
-        "coingecko": ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
-                      lambda j: float(j["bitcoin"]["usd"])),
+# ============================================================
+# DETECTOR REGIONS
+# ============================================================
+
+def detector_rois(frame):
+    mid_x = frame.shape[1] // 2
+
+    left = frame[:, :mid_x]
+    right = frame[:, mid_x:]
+
+    return right, left
+
+
+# ============================================================
+# DETECTOR A: STOCHASTIC PHOTON DETECTOR
+# ============================================================
+
+def photon_detection(roi):
+    intensity = float(np.mean(roi)) / 255.0
+
+    expected = max(
+        0.0,
+        intensity * PHOTON_FLUX * PHOTON_EFFICIENCY
+        + DARK_COUNTS
+    )
+
+    detected = int(np.random.poisson(expected))
+
+    return {
+        "intensity": intensity,
+        "expected_photons": expected,
+        "detected_photons": detected,
+        "active": detected > 0
     }
-    MIN_POLL = {"coinbase": 0.4, "binance": 0.1, "coingecko": 5.0}   # stay under public rate limits
-
-    def __init__(self, source, poll_s):
-        import threading
-        floor = self.MIN_POLL[source]
-        if poll_s < floor:
-            print(f"[btc] {source}: poll {poll_s}s is too fast for its public rate limit; using {floor}s")
-            poll_s = floor
-        self.source, self.poll_s = source, poll_s
-        self._lock, self._stop = threading.Lock(), threading.Event()
-        self._latest, self._seq, self._seen, self.err = None, 0, 0, None
-        self.polls = self.errors = 0
-        self.lat_ms = 0.0
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def _loop(self):
-        import http.client
-        import json
-        import urllib.parse
-        url, parse = self.SOURCES[self.source]
-        u = urllib.parse.urlparse(url)
-        path = u.path + ("?" + u.query if u.query else "")
-        conn, next_t = None, time.monotonic()
-        while not self._stop.is_set():
-            try:
-                if conn is None:
-                    conn = http.client.HTTPSConnection(u.netloc, timeout=5)
-                t0 = time.monotonic()
-                conn.request("GET", path, headers={"User-Agent": "optoelectronic-sim"})
-                r = conn.getresponse()
-                body = r.read()
-                if r.status != 200:
-                    raise RuntimeError(f"HTTP {r.status}")
-                p = parse(json.loads(body))
-                with self._lock:
-                    self._latest, self._seq = p, self._seq + 1
-                self.polls += 1
-                self.lat_ms += ((time.monotonic() - t0) * 1000 - self.lat_ms) / min(self.polls, 20)
-            except Exception as e:           # network down, rate-limited, geo-blocked...
-                self.err, self.errors = str(e), self.errors + 1
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = None
-            next_t += self.poll_s
-            wait = next_t - time.monotonic()
-            if wait < 0:                     # can't keep up: don't build a backlog
-                next_t, wait = time.monotonic(), 0
-            self._stop.wait(wait)
-
-    def update(self, now):
-        with self._lock:
-            if self._seq != self._seen:
-                self._seen = self._seq
-                return self._latest
-        return None
-
-    def close(self):
-        self._stop.set()
 
 
-class Predictor:
-    """Momentum t-stat on recent log-returns -> direction (+1 up, -1 down, 0 no call).
-    Repeated prices are ignored (they carry no information and give zero variance).
-    Scores itself: each call is graded against the next *changed* price."""
-    def __init__(self, window=12, thr=0.5):
-        self.window = max(2, window)
-        self.px = collections.deque(maxlen=self.window + 1)
-        self.thr, self.pending = thr, None
-        self.n = self.hits = self.calls = self.moves = 0
+# ============================================================
+# DETECTOR B: DETERMINISTIC RC / NPN
+# ============================================================
 
-    def update(self, price):
-        """Returns (direction, score), or None if the price did not change."""
-        if self.px and price == self.px[-1]:
-            return None
-        self.moves += 1
-        if self.pending and self.pending[0] != 0:
-            self.n += 1
-            self.hits += int((price > self.pending[1]) == (self.pending[0] > 0))
-        self.px.append(price)
-        d, score = 0, 0.0
-        need = min(6, self.px.maxlen)          # was a fixed 6: never reached when window < 5
-        if len(self.px) >= need:
-            r = np.diff(np.log(np.array(self.px)))
-            sd = r.std(ddof=1) if len(r) > 1 else 0.0
-            if sd > 0:
-                score = float(r.mean() / (sd / math.sqrt(len(r))))
-                d = 1 if score > self.thr else -1 if score < -self.thr else 0
-        self.calls += int(d != 0)
-        self.pending = (d, price)
-        return d, score
+class DetectorB:
+    def __init__(self):
+        self.capacitor_voltage = 0.0
+        self.last_time = time.monotonic()
 
-    def stats(self):
-        z = (self.hits - self.n / 2) / math.sqrt(self.n / 4) if self.n else 0.0
-        return dict(n=self.n, hits=self.hits, rate=self.hits / self.n if self.n else float("nan"),
-                    z=z, calls=self.calls, moves=self.moves)
+    def read(self, roi):
+        now = time.monotonic()
+        dt = max(0.001, now - self.last_time)
+        self.last_time = now
+
+        intensity = float(np.mean(roi)) / 255.0
+        input_voltage = intensity * VS
+
+        if input_voltage > VBE:
+            target_voltage = input_voltage
+        else:
+            target_voltage = 0.0
+
+        alpha = 1.0 - math.exp(-dt / RC_TAU)
+
+        self.capacitor_voltage += alpha * (
+            target_voltage - self.capacitor_voltage
+        )
+
+        npn_on = self.capacitor_voltage >= VIH
+
+        return {
+            "intensity": intensity,
+            "input_voltage": input_voltage,
+            "capacitor_voltage": self.capacitor_voltage,
+            "npn_on": bool(npn_on)
+        }
 
 
-class KeyInjector:
-    """Taps Shift+W / Shift+S. Dry-run (print only) unless enabled AND pynput works."""
-    def __init__(self, enabled, cooldown=1.0):
-        self.kb, self.cooldown, self.last, self.sent, self.suppressed = None, cooldown, -1e9, [], 0
-        if enabled:
-            try:
-                from pynput.keyboard import Controller, Key
-                self.kb, self.Key = Controller(), Key
-            except Exception as e:
-                print(f"[key] pynput unavailable ({e}); falling back to dry-run")
+# ============================================================
+# 74HC74 FLIP-FLOP MODEL
+# ============================================================
 
-    def combo(self, letter, now):
-        if now - self.last < self.cooldown - 0.01:   # tolerance for frame-time jitter
-            self.suppressed += 1
+class FlipFlop74HC74:
+    def __init__(self, clock_period=CLOCK_PERIOD):
+        self.clock_period = clock_period
+        self.q = 0
+        self.d = 0
+        self.last_clock = time.monotonic()
+        self.clock_edges = 0
+
+    def set_d(self, value):
+        self.d = int(bool(value))
+
+    def clock(self):
+        now = time.monotonic()
+        elapsed = now - self.last_clock
+
+        edges = int(elapsed / self.clock_period)
+
+        if edges > 0:
+            self.q = self.d
+            self.clock_edges += edges
+            self.last_clock += edges * self.clock_period
+
+        return self.q
+
+
+# ============================================================
+# INDEPENDENT PHOTON PROBE
+# ============================================================
+
+class IndependentProbe:
+    def measure(self, frame):
+        intensity = float(np.mean(frame)) / 255.0
+
+        expected = max(
+            0.0,
+            intensity * PHOTON_FLUX * PHOTON_EFFICIENCY
+        )
+
+        count = int(np.random.poisson(expected))
+
+        return {
+            "intensity": intensity,
+            "expected_photons": expected,
+            "detected_photons": count
+        }
+
+
+# ============================================================
+# MAIN OPTICAL CIRCUIT
+# ============================================================
+
+class MainCircuit:
+    def __init__(self):
+        self.detector_b = DetectorB()
+        self.flipflop = FlipFlop74HC74()
+
+        self.accumulator = 0.0
+        self.samples = 0
+
+    def evaluate(self, detector_a, detector_b):
+        a_signal = detector_a["active"]
+        b_signal = detector_b["npn_on"]
+
+        and_output = int(a_signal and b_signal)
+        or_output = int(a_signal or b_signal)
+
+        # Main circuit delay.
+        time.sleep(MAIN_DELAY)
+
+        # AND path feeds the accumulator.
+        self.accumulator += float(and_output)
+        self.samples += 1
+
+        # Independent OR path feeds the flip-flop.
+        self.flipflop.set_d(or_output)
+        observed_q = self.flipflop.clock()
+
+        accumulator_mean = (
+            self.accumulator / self.samples
+            if self.samples else 0.0
+        )
+
+        return {
+            "and": and_output,
+            "or": or_output,
+            "accumulator": self.accumulator,
+            "samples": self.samples,
+            "accumulator_mean": accumulator_mean,
+            "flipflop_d": self.flipflop.d,
+            "flipflop_q": observed_q,
+            "clock_edges": self.flipflop.clock_edges
+        }
+
+
+# ============================================================
+# BTC/USD REFERENCE PRICE
+# ============================================================
+
+def fetch_btc_price():
+    request = urllib.request.Request(
+        BTC_URL,
+        headers={"User-Agent": "CircuitSort/1.0"}
+    )
+
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    return float(payload["data"]["amount"])
+
+
+# ============================================================
+# CIRCUIT-DRIVEN PREDICTOR
+# ============================================================
+
+class CircuitPredictor:
+    """
+    Experimental circuit-driven prediction mapping.
+
+    Positive circuit signal:
+        Predicted price higher.
+
+    Negative circuit signal:
+        Predicted price lower.
+
+    The BTC reference price does not influence the direction.
+    """
+
+    def __init__(self):
+        self.smoothed_signal = 0.0
+
+    def predict(self, circuit_result, detector_a,
+                detector_b, probe, spot_price):
+
+        photon_level = min(
+            1.0,
+            detector_a["detected_photons"] / 10.0
+        )
+
+        voltage_level = min(
+            1.0,
+            detector_b["capacitor_voltage"] / VS
+        )
+
+        probe_level = min(
+            1.0,
+            probe["detected_photons"] / 10.0
+        )
+
+        accumulator_level = circuit_result["accumulator_mean"]
+
+        and_signal = float(circuit_result["and"])
+        or_signal = float(circuit_result["or"])
+        flipflop_signal = float(circuit_result["flipflop_q"])
+
+        # Circuit measurements form the prediction signal.
+        raw_signal = (
+            0.30 * (photon_level - 0.5)
+            + 0.25 * (voltage_level - 0.5)
+            + 0.15 * (probe_level - 0.5)
+            + 0.15 * (accumulator_level - 0.5)
+            + 0.10 * (and_signal - 0.5)
+            + 0.05 * (or_signal - 0.5)
+            + 0.05 * (flipflop_signal - 0.5)
+        )
+
+        # Smooth noisy circuit measurements.
+        self.smoothed_signal = (
+            0.75 * self.smoothed_signal
+            + 0.25 * raw_signal
+        )
+
+        # Bound the prediction signal.
+        bounded_signal = math.tanh(
+            self.smoothed_signal * 2.0
+        )
+
+        # Positive = higher; negative = lower.
+        predicted_change_percent = (
+            bounded_signal * MAX_PREDICTED_CHANGE_PERCENT
+        )
+
+        predicted_price = spot_price * (
+            1.0 + predicted_change_percent / 100.0
+        )
+
+        direction = (
+            "HIGHER"
+            if bounded_signal >= 0
+            else "LOWER"
+        )
+
+        return {
+            "raw_signal": raw_signal,
+            "smoothed_signal": self.smoothed_signal,
+            "bounded_signal": bounded_signal,
+            "direction": direction,
+            "predicted_change_percent": predicted_change_percent,
+            "reference_price": spot_price,
+            "predicted_price": predicted_price,
+            "horizon_seconds": PREDICTION_HORIZON_SECONDS
+        }
+
+
+# ============================================================
+# KEYBOARD INJECTION
+# ============================================================
+
+def inject_prediction(direction, enabled=True):
+    """
+    HIGHER -> Shift+W
+    LOWER  -> Shift+S
+    """
+
+    if not enabled:
+        print("Keyboard injection disabled.")
+        return False
+
+    try:
+        import pyautogui
+
+        if direction == "HIGHER":
+            pyautogui.hotkey("shift", "w")
+            print("KEY INJECTED: Shift+W")
+
+        elif direction == "LOWER":
+            pyautogui.hotkey("shift", "s")
+            print("KEY INJECTED: Shift+S")
+
+        else:
+            print("Unknown prediction direction.")
             return False
-        self.last = now
-        label = f"Shift+{letter.upper()}"
-        if self.kb:
-            with self.kb.pressed(self.Key.shift):
-                self.kb.press(letter)
-                self.kb.release(letter)
-        print(f"[key] {label}" + ("" if self.kb else "  (dry-run)"))
-        self.sent.append(label)
+
         return True
 
+    except ImportError:
+        print("pyautogui is not installed.")
+        print("Run: pip install pyautogui")
+        return False
 
-# --------------------------------------------------------------------------- commitment
-def commit_hash(salt, value, nbits):
-    return hashlib.sha256(f"{salt}:{value:0{nbits // 4}X}".encode()).hexdigest()
-
-
-class Verifier:
-    """Holds only a salted SHA-256 commitment, never the number."""
-    def __init__(self, value, nbits, salt=None):
-        self.nbits = nbits
-        self.salt = salt or secrets.token_hex(8)
-        self.commitment = commit_hash(self.salt, value, nbits)
-
-    def check(self, value):
-        return secrets.compare_digest(commit_hash(self.salt, value, self.nbits), self.commitment)
+    except Exception as exc:
+        print("Keyboard injection failed:", repr(exc))
+        return False
 
 
-# --------------------------------------------------------------------------- attacker + meter
-class AndAccumulator:
-    """Noise only adds 1s, so AND-ing SELECT words strips it."""
-    def __init__(self, nbits):
-        self.nbits = nbits
-        self.acc = (1 << nbits) - 1
-        self.ones = np.zeros(nbits, int)
-        self.n = 0
+# ============================================================
+# LOGGING
+# ============================================================
 
-    def update(self, word):
-        self.acc &= word
-        self.n += 1
-        for i in range(self.nbits):
-            self.ones[i] += (word >> (self.nbits - 1 - i)) & 1
-
-    def confidence(self):
-        zero_pos = [i for i in range(self.nbits)
-                    if not (self.acc >> (self.nbits - 1 - i)) & 1]
-        if self.n == 0 or not zero_pos:
-            return 0.0
-        p = float(np.mean([self.ones[i] / self.n for i in zero_pos]))
-        return (1 - p ** self.n) ** (self.nbits - len(zero_pos))
+def write_log(record):
+    with open(LOG_FILE, "a", encoding="utf-8") as file:
+        file.write(json.dumps(record) + "\n")
 
 
-def h2(p):
-    return 0.0 if p <= 0 or p >= 1 else -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+# ============================================================
+# ONE COMPLETE PREDICTION CYCLE
+# ============================================================
+
+def run_cycle(frame_index, source, previous_frame,
+              circuit, probe_device, predictor, inject=True):
+
+    # 1. Capture camera frame.
+    frame = source.read()
+
+    # 2. Calculate motion.
+    difference = cv2.absdiff(frame, previous_frame)
+
+    _, motion = cv2.threshold(
+        difference,
+        MOTION_THRESHOLD,
+        255,
+        cv2.THRESH_BINARY
+    )
+
+    digest = hashlib.sha256(
+        motion.tobytes()
+    ).hexdigest()
+
+    # 3. Split optical detector inputs.
+    right_roi, left_roi = detector_rois(motion)
+
+    # 4. Detector measurements.
+    detector_a = photon_detection(right_roi)
+    detector_b = circuit.detector_b.read(left_roi)
+
+    # 5. Independent probe.
+    probe = probe_device.measure(frame)
+
+    # 6. Main optical circuit and 150ms delay.
+    circuit_result = circuit.evaluate(
+        detector_a,
+        detector_b
+    )
+
+    # 7. Additional one-second wait.
+    time.sleep(POST_DELAY)
+
+    # 8. Fetch BTC/USD reference price.
+    spot_price = fetch_btc_price()
+
+    # 9. Generate direction from optical circuit measurements.
+    prediction = predictor.predict(
+        circuit_result,
+        detector_a,
+        detector_b,
+        probe,
+        spot_price
+    )
+
+    # 10. Select keyboard command from prediction.
+    direction = prediction["direction"]
+
+    key_result = inject_prediction(
+        direction,
+        enabled=inject
+    )
+
+    # 11. Report.
+    print("\n" + "=" * 60)
+    print("CYCLE:", frame_index)
+    print("UTC:", datetime.now(timezone.utc).isoformat())
+    print("Motion SHA256:", digest)
+
+    print("\nDETECTOR A")
+    print("Photons:", detector_a["detected_photons"])
+    print("Intensity:", round(detector_a["intensity"], 5))
+
+    print("\nDETECTOR B")
+    print("RC voltage:", round(
+        detector_b["capacitor_voltage"], 5
+    ))
+    print("NPN:", detector_b["npn_on"])
+
+    print("\nMAIN CIRCUIT")
+    print("AND:", circuit_result["and"])
+    print("OR:", circuit_result["or"])
+    print("Accumulator:", circuit_result["accumulator"])
+    print("Accumulator mean:", round(
+        circuit_result["accumulator_mean"], 5
+    ))
+    print("74HC74 Q:", circuit_result["flipflop_q"])
+
+    print("\nINDEPENDENT PROBE")
+    print("Photons:", probe["detected_photons"])
+
+    print("\nBTC/USD")
+    print("Reference:", round(spot_price, 2))
+    print("Prediction:", direction)
+    print(
+        "Predicted change:",
+        round(prediction["predicted_change_percent"], 6),
+        "%"
+    )
+    print(
+        "Predicted price:",
+        round(prediction["predicted_price"], 2)
+    )
+
+    print("\nKEYBOARD")
+    print("Direction:", direction)
+    print("Command:", "Shift+W" if direction == "HIGHER" else "Shift+S")
+    print("Injected:", key_result)
+
+    # 12. Append cycle record to JSONL log.
+    record = {
+        "cycle": frame_index,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "motion_sha256": digest,
+        "detector_a": detector_a,
+        "detector_b": detector_b,
+        "probe": probe,
+        "circuit": circuit_result,
+        "btc_usd_reference": spot_price,
+        "prediction": prediction,
+        "keyboard_direction": direction,
+        "keyboard_injected": key_result
+    }
+
+    write_log(record)
+
+    return frame
 
 
-def zchannel_info(p):
-    """I(X;Y) in bits for uniform input through a Z-channel (1->1 always, 0->1 w.p. p)."""
-    return h2(0.5 + 0.5 * p) - 0.5 * h2(p)
+# ============================================================
+# CONTINUOUS MAIN LOOP
+# ============================================================
 
+def main():
+    parser = argparse.ArgumentParser(
+        description="Optoelectronic BTC direction predictor"
+    )
 
-class LeakMeter:
-    """Scores the leak. Uses the true secret only for scoring, never for attacking."""
-    def __init__(self, secret, nbits):
-        self.secret, self.nbits = secret, nbits
-        self.y, self.and_raw, self.and_dly = [], [], []
-        self.frames = self.and_frames = 0
-        self.hamming = []
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Use synthetic frames instead of webcam"
+    )
 
-    def frame(self, g_and):
-        self.frames += 1
-        self.and_frames += int(g_and)
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+        help="Camera device index"
+    )
 
-    def slot(self, y, g_and, g_and_dly):
-        self.y.append(int(y)); self.and_raw.append(int(g_and)); self.and_dly.append(int(g_and_dly))
+    parser.add_argument(
+        "--no-inject",
+        action="store_true",
+        help="Disable keyboard injection"
+    )
 
-    def word(self, acc):
-        self.hamming.append(bin(acc ^ self.secret).count("1"))
+    args = parser.parse_args()
 
-    def summary(self):
-        y, ad = np.array(self.y), np.array(self.and_dly, float)
-        zeros = ad[y == 0]
-        p_leak = float(zeros.mean()) if len(zeros) else float("nan")
-        ac = float(np.corrcoef(ad[:-1], ad[1:])[0, 1]) if len(ad) > 2 and ad.std() > 0 else 0.0
-        return dict(duty=self.and_frames / max(1, self.frames), p_leak=p_leak, autocorr=ac,
-                    bits_per_word=zchannel_info(p_leak) * self.nbits if p_leak == p_leak else 0.0,
-                    hamming=self.hamming)
+    if args.synthetic:
+        source = SyntheticSource()
+    else:
+        source = CameraSource(args.camera)
 
+    circuit = MainCircuit()
+    probe_device = IndependentProbe()
+    predictor = CircuitPredictor()
 
-# --------------------------------------------------------------------------- drawing
-def draw(frame, roiB, roiA, text_lines, traces):
-    import cv2
-    h, w = frame.shape[:2]
-    out = frame.copy()
-    cv2.rectangle(out, (roiB[0], roiB[1]), (roiB[2], roiB[3]), (60, 60, 255), 2)
-    cv2.putText(out, "IR det B", (roiB[0] + 4, roiB[1] + 18), 0, 0.5, (60, 60, 255), 1)
-    cv2.rectangle(out, (roiA[0], roiA[1]), (roiA[2], roiA[3]), (60, 200, 60), 2)
-    cv2.putText(out, "IR det A", (roiA[0] + 4, roiA[1] + 18), 0, 0.5, (60, 200, 60), 1)
-    y = h - 8 - 16 * len(text_lines)
-    for line in text_lines:
-        cv2.putText(out, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-        y += 16
+    previous_frame = source.read()
+    frame_index = 0
 
-    names = ["A", "B_out", "OR", "AND", "AND_dly", "Y", "D", "SELECT"]
-    pw, rowh = max(w, 480), 22
-    panel = np.full((rowh * len(names) + 8, pw, 3), 25, np.uint8)
-    for i, n in enumerate(names):
-        y0 = 4 + i * rowh
-        cv2.putText(panel, n, (4, y0 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-        data = list(traces[n])[-(pw - 70):]
-        pts = [(60 + k, y0 + (4 if v else 17)) for k, v in enumerate(data)]
-        for p, q in zip(pts[:-1], pts[1:]):
-            cv2.line(panel, p, q, (0, 220, 255), 1)
-    if panel.shape[1] != out.shape[1]:
-        pad = np.zeros((out.shape[0], panel.shape[1] - out.shape[1], 3), np.uint8)
-        out = np.hstack([out, pad])
-    return np.vstack([out, panel])
-
-
-# --------------------------------------------------------------------------- one session
-def run_session(cfg, delay_ms, seed=1, verbose=True):
-    nbits = max(4, cfg.bits - cfg.bits % 4)
-    mask = (1 << nbits) - 1
-    secret = (int(cfg.secret, 16) if cfg.secret else secrets.randbits(nbits)) & mask
-    hexw = nbits // 4
-    verifier = Verifier(secret, nbits)
-    max_words = cfg.runs or (200 if (cfg.sweep_delay or not cfg.leak) else 0)
-
-    clock = Clock(virtual=cfg.fast)
-    cam = Camera(cfg.cam, clock, cfg.synthetic, seed)
-    drvA, drvB, link = DriverA(), DriverB(cfg.x), IfThenLink()
-    delay = DelayLine(delay_ms / 1000.0)
-    latch, ff = TimeCodeLatch(secret, nbits), DFlipFlop74HC74()
-    traces = collections.defaultdict(lambda: collections.deque(maxlen=600))
-    attacker, meter = AndAccumulator(nbits), LeakMeter(secret, nbits)
-
-    slot, select_bits, runs, recovered = 0, [], 0, None
-    HID = "*" * hexw
-    last_t = clock.now()
-    next_clk = last_t + CLK_PERIOD
-    prev_I_B = None
-
-    # --- BTC prediction -> delay -> key injection
-    feed = None
-    if cfg.btc:
-        src = "synthetic" if cfg.fast else cfg.btc_source
-        feed = (SyntheticPriceFeed(cfg.btc_poll) if src == "synthetic"
-                else LivePriceFeed(src, cfg.btc_poll))
-    pred = Predictor(cfg.btc_window, cfg.btc_thr)
-    keys = KeyInjector(cfg.inject, cfg.key_cooldown)
-    key_delay = EventDelay(delay_ms / 1000.0)
-    last_dir = last_fired = 0
-    last_price, last_score, ticks = None, 0.0, 0
-    run_until = ((cfg.btc_seconds if cfg.btc_seconds is not None else 60.0) if cfg.btc else 0)
-    attack_done, t_start = False, clock.now()
+    print("=" * 60)
+    print("OPTOELECTRONIC BTC DIRECTION PREDICTOR")
+    print("=" * 60)
+    print("Input:", "Synthetic" if args.synthetic else "Camera")
+    print("Main delay:", MAIN_DELAY, "seconds")
+    print("Additional wait:", POST_DELAY, "seconds")
+    print("Clock period:", CLOCK_PERIOD, "seconds")
+    print("Higher:", "Shift+W")
+    print("Lower:", "Shift+S")
+    print("Keyboard injection:", not args.no_inject)
+    print("Prediction horizon:", PREDICTION_HORIZON_SECONDS, "seconds")
+    print("Log:", LOG_FILE)
+    print("\nPress Ctrl+C to stop.\n")
 
     try:
         while True:
-            gray, bgr = cam.read()
-            clock.tick()
-            now = clock.now()
-            dt, last_t = now - last_t, now
-            h, w = gray.shape
-            roiB_box = (0, 0, w // 2 - 4, h - 1)
-            roiA_box = (w // 2 + 4, 0, w - 1, h - 1)
-            roiB = gray[roiB_box[1]:roiB_box[3], roiB_box[0]:roiB_box[2]]
-            roiA = gray[roiA_box[1]:roiA_box[3], roiA_box[0]:roiA_box[2]]
+            try:
+                current_frame = run_cycle(
+                    frame_index,
+                    source,
+                    previous_frame,
+                    circuit,
+                    probe_device,
+                    predictor,
+                    inject=not args.no_inject
+                )
 
-            I_B = float(roiB.mean()) / 255.0
-            d_int = 0.0 if prev_I_B is None else I_B - prev_I_B
-            prev_I_B = I_B
+                previous_frame = current_frame
+                frame_index += 1
 
-            vA, vB = drvA.step(roiA), drvB.step(I_B)
-            vB_out = link.step(vB, dt)
-            a, b = hi(vA), hi(vB_out)
-            g_or, g_and = a or b, a and b
-            g_and_dly = delay.step(now, g_and)             # <-- AND -> delay -> D
-            meter.frame(g_and)
+            except Exception as exc:
+                print("\nCycle error:", repr(exc))
+                print("Retrying in 2 seconds...")
+                time.sleep(2.0)
 
-            if feed:
-                px = feed.update(now)
-                if px is not None:
-                    ticks += 1
-                    res = pred.update(px)
-                    if res is not None:                    # price actually moved
-                        last_price = px
-                        last_dir, last_score = res
-                        if last_dir and (not cfg.on_change or last_dir != last_fired):
-                            key_delay.push(now, "w" if last_dir > 0 else "s")   # AND-style delay, then key
-                            last_fired = last_dir
-                        if verbose:
-                            arrow = {1: "UP", -1: "DOWN", 0: "--"}[last_dir]
-                            print(f"[btc] ${px:,.2f}  score={last_score:+.2f}  predict={arrow}")
-                for letter in key_delay.due(now):
-                    keys.combo(letter, now)
-
-            y = bool(latch.bit(slot))
-            d = y or (g_and_dly and cfg.leak)
-
-            for k, v in zip(["A", "B_out", "OR", "AND", "AND_dly", "Y", "D", "SELECT"],
-                            [a, b, g_or, g_and, g_and_dly, y, d, ff.q]):
-                traces[k].append(int(v))
-
-            if now >= next_clk:                            # 10 Hz clock edge
-                next_clk += CLK_PERIOD
-                meter.slot(y, g_and, g_and_dly)
-                ff.clock(d)
-                select_bits.append(ff.q)
-                slot += 1
-
-                if slot == nbits and attack_done:
-                    slot, select_bits = 0, []
-                elif slot == nbits:
-                    val = int("".join(map(str, select_bits)), 2)
-                    attacker.update(val)                   # attacker sees only SELECT
-                    ok = verifier.check(attacker.acc)      # commitment oracle
-                    meter.word(attacker.acc)
-                    runs += 1
-                    if verbose:
-                        tag = "RECOVERED" if ok else "waiting"
-                        sh = f"{val:0{hexw}X}" if (ok or cfg.reveal) else HID
-                        gh = f"{attacker.acc:0{hexw}X}" if (ok or cfg.reveal) else HID
-                        print(f"run {runs:3d}  SELECT={sh}  ACC={gh}  "
-                              f"hamming={meter.hamming[-1]:2d}  conf~{attacker.confidence():.4f}  {tag}"
-                              + (f"  (hidden={secret:0{hexw}X})" if cfg.reveal else ""))
-                    slot, select_bits = 0, []
-                    if ok:
-                        recovered = attacker.acc
-                    if ok or (max_words and runs >= max_words):
-                        if run_until:
-                            attack_done = True      # keep the circuit running for the BTC loop
-                        else:
-                            break
-
-            if run_until and now - t_start >= run_until:
-                break
-
-            if cfg.headless:
-                if not cfg.fast:
-                    time.sleep(0.01)
-                continue
-
-            import cv2
-            sel = "".join(map(str, select_bits))
-            lines = [f"I_B={I_B:.2f} dI={d_int:+.3f}  Vc={link.vc:.2f}V  thr={drvB.thr:.2f}  delay={delay_ms:.0f}ms",
-                     f"A={int(a)} Bout={int(b)} OR={int(g_or)} AND={int(g_and)} "
-                     f"ANDdly={int(g_and_dly)} Y={int(y)} D={int(d)} Q={ff.q}",
-                     f"slot {slot}/{nbits}  SELECT bits={sel}",
-                     f"ACC hamming={meter.hamming[-1] if meter.hamming else nbits}  runs={runs}"]
-            if cfg.btc:
-                lines.append(f"BTC ${last_price or 0:,.0f} score={last_score:+.2f} dir={last_dir:+d} "
-                             f"keys={len(keys.sent)} hit={pred.stats()['rate']:.2f}")
-            cv2.imshow("optoelectronic sim", draw(bgr, roiB_box, roiA_box, lines, traces))
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord("q"):
-                break
-            if k == ord("r"):
-                slot, select_bits = 0, []
     except KeyboardInterrupt:
-        print("\ninterrupted")
+        print("\nStopping prediction loop.")
+
     finally:
-        if feed:
-            feed.close()
-        cam.release()
-        if not cfg.headless:
-            import cv2
-            cv2.destroyAllWindows()
-
-    s = meter.summary()
-    s.update(recovered=recovered is not None, words=runs, secret=secret, acc=attacker.acc,
-             commitment=verifier.commitment, hexw=hexw,
-             btc=pred.stats(), btc_ticks=ticks, keys=list(keys.sent), suppressed=keys.suppressed,
-             btc_err=getattr(feed, 'err', None), btc_errors=getattr(feed, 'errors', 0),
-             lat_ms=getattr(feed, 'lat_ms', 0.0), elapsed=max(1e-9, clock.now() - t_start))
-    return s
-
-
-# --------------------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cam", type=int, default=0)
-    ap.add_argument("--synthetic", action="store_true", help="fake camera (no hardware)")
-    ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--fast", action="store_true",
-                    help="virtual time (30 fps steps, no sleeping); needs --synthetic --headless")
-    ap.add_argument("--bits", type=int, default=16)
-    ap.add_argument("--secret", default=None, help="hidden number, hex (default random)")
-    ap.add_argument("--reveal", action="store_true")
-    ap.add_argument("--x", type=int, default=12345)
-    ap.add_argument("--leak", action="store_true", help="enable D = Y OR AND_dly")
-    ap.add_argument("--delay-ms", type=float, default=100.0, help="AND -> D delay and prediction -> key delay")
-    ap.add_argument("--sweep-delay", default=None, help="comma list of delays in ms, e.g. 0,50,150,300")
-    ap.add_argument("--trials", type=int, default=10000, help="trials per sweep point")
-    ap.add_argument("--runs", type=int, default=10000, help="stop after N words (0 = until recovered)")
-    ap.add_argument("--btc", action="store_true", help="fetch BTC price, predict, fire delayed keys")
-    ap.add_argument("--btc-source", default="binance",
-                    choices=["coinbase", "binance", "coingecko", "synthetic"])
-    ap.add_argument("--btc-poll", type=float, default=0.1, help="seconds between price polls")
-    ap.add_argument("--btc-window", type=int, default=4, help="returns used by the predictor")
-    ap.add_argument("--btc-thr", type=float, default=5e-8, help="|t-stat| needed to make a call")
-    ap.add_argument("--btc-seconds", type=float, default=None,
-                    help="total seconds to run the BTC loop (default 60 with --btc)")
-    ap.add_argument("--inject", action="store_true",
-                    help="REALLY send Shift+W (up) / Shift+S (down) to the focused window; default is dry-run")
-    ap.add_argument("--key-cooldown", type=float, default=0.1, help="min seconds between injected combos")
-    ap.add_argument("--on-change", action="store_true",
-                    help="fire only when the predicted direction flips (default: every directional call)")
-    cfg = ap.parse_args()
-
-    if cfg.fast and not (cfg.synthetic and cfg.headless):
-        ap.error("--fast requires --synthetic and --headless")
-
-    if cfg.inject and not cfg.btc:
-        ap.error("--inject needs --btc")
-    if cfg.inject and not cfg.fast:
-        print("!! --inject: real Shift+W / Shift+S will go to whichever window has focus.")
-        print("!! Starting in 5 s. Focus the target now. Ctrl+C aborts.")
-        try:
-            time.sleep(5)
-        except KeyboardInterrupt:
-            return
-
-    if not cfg.sweep_delay:
-        if not cfg.leak:
-            print("Note: without --leak, D == Y, so the first SELECT word equals the secret.")
-        s = run_session(cfg, cfg.delay_ms)
-        print(f"\ncommitment : {s['commitment']}")
-        print(f"delay      : {cfg.delay_ms:.0f} ms")
-        print(f"AND duty   : {s['duty']:.3f}")
-        print(f"p_leak     : {s['p_leak']:.3f}   (P[AND_dly=1 | secret bit=0])")
-        print(f"autocorr   : {s['autocorr']:+.3f}   (lag-1, successive slots)")
-        print(f"leak/word  : {s['bits_per_word']:.2f} of {cfg.bits} bits (Z-channel)")
-        if cfg.btc:
-            b, el = s["btc"], s["elapsed"]
-            print(f"BTC fetches: {s['btc_ticks']} ({s['btc_ticks'] / el:.1f}/s, latency~{s['lat_ms']:.0f} ms, "
-                  f"errors {s['btc_errors']})  price moves: {b['moves']} ({b['moves'] / el:.1f}/s)")
-            print(f"BTC calls  : {b['calls']} directional   graded: {b['n']}   hit rate: {b['rate']:.2f} "
-                  f"(z={b['z']:+.2f} vs coin-flip)")
-            print(f"keys sent  : {len(s['keys'])}   suppressed by cooldown: {s['suppressed']}")
-            if s["btc_err"]:
-                print(f"BTC feed error (last): {s['btc_err']}")
-        if s["recovered"]:
-            print(f"SECRET RECOVERED after {s['words']} words: {s['acc']:0{s['hexw']}X}")
-        else:
-            print(f"Not recovered after {s['words']} words; best guess {s['acc']:0{s['hexw']}X}")
-        return
-
-    delays = [float(v) for v in cfg.sweep_delay.split(",")]
-    cfg.headless, cfg.btc = True, False
-    print(f"Sweep: {cfg.trials} trials/point, {cfg.bits}-bit secret, leak={'on' if cfg.leak else 'OFF'}\n")
-    print(f"{'delay ms':>8} {'AND duty':>9} {'p_leak':>7} {'autocorr':>9} {'bits/word':>10} "
-          f"{'recovered':>10} {'words (mean)':>13} {'Hamming@5':>10}")
-    for dly in delays:
-        res = [run_session(cfg, dly, seed=1000 + i, verbose=False) for i in range(cfg.trials)]
-        rec = [r["words"] for r in res if r["recovered"]]
-        h5 = [r["hamming"][min(4, len(r["hamming"]) - 1)] for r in res]
-        print(f"{dly:8.0f} {np.mean([r['duty'] for r in res]):9.3f} "
-              f"{np.nanmean([r['p_leak'] for r in res]):7.3f} "
-              f"{np.mean([r['autocorr'] for r in res]):+9.3f} "
-              f"{np.mean([r['bits_per_word'] for r in res]):10.2f} "
-              f"{len(rec):>6}/{cfg.trials:<3} "
-              f"{(np.mean(rec) if rec else float('nan')):13.1f} {np.mean(h5):10.2f}")
+        source.close()
+        print("Camera closed.")
+        print("Completed cycles:", frame_index)
 
 
 if __name__ == "__main__":
