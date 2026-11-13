@@ -1,28 +1,30 @@
+
 #!/usr/bin/env python3
-"""circuit_sort.py - sort a small dataset with the RP circuit from needle.py / scientific.py.
+"""
+circuit_sort.py
 
-How the circuit does the sorting
-1. READ : every input bit is stored as a problem instance x (bit 1 = composite, bit 0 = prime) and
-read back by the full chain Driver A (Miller-Rabin witness from nonce) + Driver B (RC)
--> AND(A,B). One-sided: a prime is never read as 1; a composite is read as 1 once any
-nonce hits a witness (a few retries make a miss vanishingly rare).
-2. SORT : the circuit's AND/OR pair is a 1-bit compare-exchange cell:
-(low, high) = (AND(a,b), OR(a,b)) = (min, max)
-An odd-even transposition network of those cells sorts any 0/1 vector (0-1 principle).
-3. LIFT : numbers are sorted by threshold decomposition: for each t, bit_i = [x_i >= t] is sorted
-as above, and output[i] = sum over t of sorted_bit_t[i]. Only AND/OR gates touch the data.
+CAMERA-DRIVEN NON-DETERMINISTIC OPTOELECTRONIC SORTING
 
-The dataset comes from the camera: digest = SHA-256(motion mask) seeds a hash stream that makes
-n values in 0..m-1 for any n (--pattern: random, sorted, reversed, dups).
+Optical inputs:
+    Right ROI -> Detector A -> stochastic photon detection
+    Left ROI  -> Detector B -> deterministic RC/NPN
 
-Usage:
-python circuit_sort.py --device 0 --frames 3
-python circuit_sort.py --synthetic --n 200 --m 16 --pattern reversed
-python circuit_sort.py --synthetic --data 5,3,7,0,2,6,1,4
-python circuit_sort.py --synthetic --n 200 --m 16 --pattern reversed --save dataset.json
-python circuit_sort.py --synthetic --load dataset.json
+Main circuit:
+    AND -> 150ms delay -> accumulator -> SELECT
 
-Needs numpy (+ opencv-python for a real camera).
+Leak circuit:
+    OR -> 74HC74 D input -> 10Hz clock -> OBSERVE
+
+Independent probe:
+    Separate photon-counting channel.
+    Does not modify the main circuit.
+
+Sorting:
+    AND/OR compare-exchange network.
+    Threshold decomposition for integer sorting.
+
+Photon statistics are simulated using Poisson shot noise.
+This is not a physical single-photon camera measurement.
 """
 
 import argparse
@@ -35,199 +37,701 @@ import time
 
 import numpy as np
 
+
 H, W = 96, 128
-VS, VBE, VIH = 5.0, 0.7, 3.5
+
+VS = 5.0
+VBE = 0.7
+VIH = 3.5
+
+RC_TAU = 0.050
+RC_CHARGE_TIME = 0.100
+
+MAIN_DELAY = 0.150
+CLOCK_PERIOD = 0.100
+
+PHOTON_EFFICIENCY = 0.80
+PHOTON_FLUX = 20.0
+DARK_COUNTS = 0.02
+
+DETECTOR_THRESHOLD = 1
 
 sha = lambda b: hashlib.sha256(b).digest()
 
 
-# ---- camera ---------------------------------------------------------------------------
+# =========================================================
+# CAMERA
+# =========================================================
 
 class Camera:
+
     def __init__(self, device):
+
         import cv2
 
         self.cv2 = cv2
         self.cap = cv2.VideoCapture(device)
 
         if not self.cap.isOpened():
-            sys.exit(f"cannot open camera {device} (use --synthetic)")
+            sys.exit(f"Cannot open camera {device}")
 
     def read(self):
-        ok, f = self.cap.read()
+
+        ok, frame = self.cap.read()
 
         if not ok:
-            sys.exit("camera read failed")
+            sys.exit("Camera read failed")
 
-        g = f if f.ndim == 2 else self.cv2.cvtColor(f, self.cv2.COLOR_BGR2GRAY)
-        return self.cv2.resize(g, (W, H), interpolation=self.cv2.INTER_AREA)
+        if frame.ndim == 2:
+            gray = frame
+        else:
+            gray = self.cv2.cvtColor(
+                frame,
+                self.cv2.COLOR_BGR2GRAY
+            )
+
+        return self.cv2.resize(
+            gray,
+            (W, H),
+            interpolation=self.cv2.INTER_AREA
+        )
+
+    def close(self):
+        self.cap.release()
 
 
 class Synthetic:
+
     def __init__(self):
         self.rng = np.random.default_rng()
 
     def read(self):
-        return np.clip(self.rng.poisson(100.0, (H, W)), 0, 255).astype(np.uint8)
+
+        return np.clip(
+            self.rng.poisson(100.0, (H, W)),
+            0,
+            255
+        ).astype(np.uint8)
 
 
-# ---- number theory --------------------------------------------------------------------
+# =========================================================
+# OPTICAL DETECTORS
+# =========================================================
 
-SP = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+def photon_detection(roi, exposure, rng):
 
+    """
+    Poisson photon-counting model.
 
-def is_witness(a, n):
-    """True iff a proves n composite; never true for primes."""
-    d, s = n - 1, 0
+    The photon arrival count is the source of
+    stochasticity.
 
-    while d % 2 == 0:
-        d //= 2
-        s += 1
+    roi:
+        Normalized optical intensity [0,1].
 
-    y = pow(a, d, n)
+    exposure:
+        Exposure time in seconds.
 
-    if y in (1, n - 1):
-        return False
+    rng:
+        Random number generator for photon statistics.
+    """
 
-    for _ in range(s - 1):
-        y = y * y % n
+    intensity = np.clip(
+        np.asarray(roi, dtype=float),
+        0.0,
+        1.0
+    )
 
-        if y == n - 1:
-            return False
+    mean_intensity = float(intensity.mean())
 
-    return True
+    photon_rate = (
+        mean_intensity
+        * PHOTON_FLUX
+        * PHOTON_EFFICIENCY
+    )
 
+    dark_rate = DARK_COUNTS
 
-def is_prime(n):
-    for p in SP:
-        if n % p == 0:
-            return n == p
+    expected = (
+        photon_rate + dark_rate
+    ) * exposure
 
-    return not any(is_witness(a, n) for a in SP)
+    detected = rng.poisson(expected)
 
-
-def next_prime(n):
-    n |= 1
-
-    while not is_prime(n):
-        n += 2
-
-    return n
-
-
-# ---- circuit --------------------------------------------------------------------------
-
-def driver_b(x, T=0.1, tau=0.05):
-    """RC node + NPN emitter follower, HIGH at VB >= 3.5 V."""
-    vc = VS * (1 - math.exp(-T / tau)) * (1 if x >= 4 else 0)
-    return int(max(0.0, vc - VBE) >= VIH)
+    return int(detected), float(expected)
 
 
-def circuit_and(digest, x, nonce):
-    """Driver A (witness r from the nonce) AND Driver B -> the circuit's decision for instance x."""
-    h = int.from_bytes(sha(sha(digest + nonce)), "big")
-    A = int(is_witness(2 + h % (x - 3), x))
-    return A & driver_b(x)
+def detector_rois(frame):
 
+    """
+    Detector A: right half of camera image.
+    Detector B: left half of camera image.
+    """
+
+    normalized = (
+        np.asarray(frame, dtype=np.float64) / 255.0
+    )
+
+    right_roi = normalized[:, W // 2:]
+    left_roi = normalized[:, :W // 2]
+
+    return right_roi, left_roi
+
+
+def driver_a(right_roi, exposure, rng):
+
+    """
+    Randomized Driver A.
+
+    The input bit controls optical transmission:
+        0 -> blocked
+        1 -> transmitted
+
+    Photon detection determines the output.
+    No random software logic bit is generated.
+    """
+
+    count, expected = photon_detection(
+        right_roi,
+        exposure,
+        rng
+    )
+
+    output = int(count >= DETECTOR_THRESHOLD)
+
+    return output, count, expected
+
+
+def driver_b(left_roi):
+
+    """
+    Deterministic Driver B.
+
+    Optical intensity -> RC node -> NPN emitter follower.
+
+    RC time constant: 50 ms.
+    Charge time: 100 ms.
+    Base-emitter drop: 0.7 V.
+    Output HIGH threshold: 3.5 V.
+    """
+
+    intensity = np.clip(
+        np.asarray(left_roi, dtype=float),
+        0.0,
+        1.0
+    )
+
+    optical_signal = float(intensity.mean())
+
+    input_voltage = VS * optical_signal
+
+    vc = input_voltage * (
+        1.0 - math.exp(
+            -RC_CHARGE_TIME / RC_TAU
+        )
+    )
+
+    ve = max(0.0, vc - VBE)
+
+    output = int(ve >= VIH)
+
+    return output, vc, ve
+
+
+# =========================================================
+# MAIN CIRCUIT
+# =========================================================
+
+def and_gate(a, b):
+    return int(bool(a) and bool(b))
+
+
+def or_gate(a, b):
+    return int(bool(a) or bool(b))
+
+
+class FlipFlop74HC74:
+
+    """
+    Positive-edge-triggered D flip-flop.
+
+    Clock period: 100 ms (10 Hz).
+    """
+
+    def __init__(self):
+
+        self.q = 0
+        self.last_clock = 0
+
+    def clock(self, d, clock_signal):
+
+        rising_edge = (
+            clock_signal == 1
+            and self.last_clock == 0
+        )
+
+        if rising_edge:
+            self.q = int(bool(d))
+
+        self.last_clock = clock_signal
+
+        return self.q
+
+
+class Accumulator:
+
+    def __init__(self):
+
+        self.total = 0
+        self.reads = 0
+
+    def update(self, value):
+
+        self.total += int(value)
+        self.reads += 1
+
+        return self.total
+
+
+class MainCircuit:
+
+    def __init__(self, realtime=False):
+
+        self.accumulator = Accumulator()
+        self.flipflop = FlipFlop74HC74()
+
+        self.realtime = realtime
+        self.last_clock_time = time.monotonic()
+
+        self.gates = 0
+        self.and_high = 0
+        self.or_high = 0
+
+    def evaluate(self, a, b):
+
+        # Parallel AND and OR paths.
+
+        main_and = and_gate(a, b)
+        leak_or = or_gate(a, b)
+
+        self.gates += 2
+
+        self.and_high += main_and
+        self.or_high += leak_or
+
+        # Main 150ms delay.
+
+        if self.realtime:
+            time.sleep(MAIN_DELAY)
+
+        # Accumulator receives the AND result.
+
+        accumulated = self.accumulator.update(
+            main_and
+        )
+
+        # Independent leak path drives D input.
+
+        now = time.monotonic()
+
+        clock_signal = int(
+            now - self.last_clock_time >= CLOCK_PERIOD
+        )
+
+        if clock_signal:
+            self.last_clock_time = now
+
+        observed = self.flipflop.clock(
+            leak_or,
+            clock_signal
+        )
+
+        return {
+            "and": main_and,
+            "or": leak_or,
+            "accumulator": accumulated,
+            "observe": observed
+        }
+
+
+# =========================================================
+# INDEPENDENT PROBE
+# =========================================================
+
+class IndependentProbe:
+
+    """
+    Separate photon detector.
+
+    Probe output is logged independently.
+    It cannot influence the main circuit.
+    """
+
+    def __init__(self, duration=10.0):
+
+        self.duration = duration
+        self.start = time.monotonic()
+
+        self.log = []
+        self.active = True
+
+    def measure(self, roi, exposure, rng):
+
+        if not self.active:
+            return None
+
+        elapsed = time.monotonic() - self.start
+
+        if elapsed >= self.duration:
+            self.active = False
+            return None
+
+        count, expected = photon_detection(
+            roi,
+            exposure,
+            rng
+        )
+
+        result = {
+            "photons": count,
+            "expected": expected,
+            "detected": int(count > 0),
+            "elapsed": elapsed
+        }
+
+        self.log.append(result)
+
+        return result
+
+
+# =========================================================
+# OPTICAL READ
+# =========================================================
+
+def optical_read(
+    right_roi,
+    left_roi,
+    optical_bit,
+    exposure,
+    rng,
+    circuit,
+    probe=None,
+    probe_enabled=False
+):
+
+    """
+    One optical evaluation.
+
+    optical_bit modulates transmission into Detector A.
+
+    Photon statistics determine Driver A.
+    Detector B remains deterministic.
+    """
+
+    # Optical modulation representing the stored bit.
+
+    if optical_bit:
+        transmitted_roi = right_roi
+    else:
+        transmitted_roi = np.zeros_like(right_roi)
+
+    # Detector A: photon detection.
+
+    a, photons, expected = driver_a(
+        transmitted_roi,
+        exposure,
+        rng
+    )
+
+    # Detector B: deterministic RC/NPN.
+
+    b, vc, ve = driver_b(left_roi)
+
+    # Main circuit.
+
+    result = circuit.evaluate(a, b)
+
+    # Independent probe.
+
+    probe_result = None
+
+    if probe_enabled and probe is not None:
+
+        probe_result = probe.measure(
+            right_roi,
+            exposure,
+            rng
+        )
+
+    return {
+        "a": a,
+        "b": b,
+        "photons": photons,
+        "expected": expected,
+        "vc": vc,
+        "ve": ve,
+        "and": result["and"],
+        "or": result["or"],
+        "accumulator": result["accumulator"],
+        "observe": result["observe"],
+        "probe": probe_result
+    }
+
+
+# =========================================================
+# STOCHASTIC BIT STORAGE
+# =========================================================
+
+def read_bit(
+    right_roi,
+    left_roi,
+    bit,
+    retries,
+    exposure,
+    rng,
+    circuit,
+    probe=None,
+    probe_enabled=False,
+    decision="majority"
+):
+
+    """
+    Repeated optical reads.
+
+    Every read obtains a fresh Poisson photon count.
+
+    The accumulator records AND successes.
+
+    The final bit is selected from accumulated
+    photon-detection-driven circuit outputs.
+
+    No additional random bit is generated.
+    """
+
+    successes = 0
+    photons_total = 0
+
+    for _ in range(retries):
+
+        result = optical_read(
+            right_roi,
+            left_roi,
+            bit,
+            exposure,
+            rng,
+            circuit,
+            probe,
+            probe_enabled
+        )
+
+        successes += result["and"]
+        photons_total += result["photons"]
+
+    if decision == "majority":
+        output = int(successes >= math.ceil(retries / 2))
+
+    elif decision == "any":
+        output = int(successes > 0)
+
+    else:
+        raise ValueError("Unknown decision rule")
+
+    return output, successes, photons_total
+
+
+# =========================================================
+# SORTING NETWORK
+# =========================================================
 
 def gate(a, b):
-    """The circuit's AND/OR pair = compare-exchange cell."""
-    return a & b, a | b  # (min, max)
+
+    """
+    AND/OR compare-exchange.
+
+    LOW  = AND(a,b)
+    HIGH = OR(a,b)
+    """
+
+    return int(a & b), int(a | b)
 
 
-# ---- bit storage + read through the circuit -------------------------------------------
+def sort_bits(bits, stats):
 
-def instance(digest, label, bit):
-    base = int.from_bytes(sha(digest + label)[:4], "big") | 1 | (1 << 31)
+    """
+    Odd-even transposition sorting network.
 
-    if bit:  # 1 -> composite
-        while is_prime(base):
-            base += 2
+    Only AND/OR gates touch the data.
+    """
 
-        return base
+    values = list(bits)
 
-    return next_prime(base)  # 0 -> prime
+    for rnd in range(len(values)):
 
+        for i in range(rnd % 2, len(values) - 1, 2):
 
-def read_bit(digest, label, bit, retries, st):
-    x = instance(digest, label, bit)
-
-    for _ in range(retries):  # fresh nonce each try, drawn after the digest
-        st["trials"] += 1
-
-        if circuit_and(digest, x, os.urandom(8)):
-            return 1
-
-    return 0
-
-
-# ---- sorting network ------------------------------------------------------------------
-
-def sort_bits(bits, st):
-    """Odd-even transposition network, n rounds."""
-    v = list(bits)
-
-    for rnd in range(len(v)):
-        for i in range(rnd % 2, len(v) - 1, 2):
-            v[i], v[i + 1] = gate(v[i], v[i + 1])
-            st["gates"] += 1
-
-    return v
-
-
-def circuit_sort(digest, data, m, retries, st, verbose=True):
-    n = len(data)
-    out = [0] * n
-
-    for t in range(1, m):
-        true_bits = [int(d >= t) for d in data]
-        read = [
-            read_bit(digest, f"{t}:{i}".encode(), b, retries, st)
-            for i, b in enumerate(true_bits)
-        ]
-
-        st["miss"] += sum(r != b for r, b in zip(read, true_bits))
-        srt = sort_bits(read, st)
-        out = [o + s for o, s in zip(out, srt)]
-
-        if verbose:
-            print(
-                f" t={t:<2} in {''.join(map(str, read))} "
-                f"-> sorted {''.join(map(str, srt))}"
+            values[i], values[i + 1] = gate(
+                values[i],
+                values[i + 1]
             )
 
-    return out
+            stats["sort_gates"] += 1
+
+    return values
 
 
-# ---- test dataset ---------------------------------------------------------------------
+def circuit_sort(
+    right_roi,
+    left_roi,
+    data,
+    m,
+    retries,
+    exposure,
+    rng,
+    stats,
+    decision="majority",
+    verbose=True
+):
+
+    """
+    Sort integer values using threshold decomposition.
+
+    For each threshold t:
+
+        bit_i = [data_i >= t]
+
+    The photon-driven circuit reads each bit.
+    The AND/OR network sorts the resulting binary vector.
+
+    Integer values are reconstructed by summing
+    the sorted threshold vectors.
+    """
+
+    n = len(data)
+    output = [0] * n
+
+    circuit = MainCircuit()
+    probe = IndependentProbe()
+
+    for threshold in range(1, m):
+
+        true_bits = [
+            int(value >= threshold)
+            for value in data
+        ]
+
+        read_bits = []
+
+        for i, bit in enumerate(true_bits):
+
+            read, successes, photons = read_bit(
+                right_roi,
+                left_roi,
+                bit,
+                retries,
+                exposure,
+                rng,
+                circuit,
+                probe,
+                probe_enabled=False,
+                decision=decision
+            )
+
+            read_bits.append(read)
+
+            stats["trials"] += retries
+            stats["photons"] += photons
+            stats["miss"] += int(read != bit)
+            stats["accumulator_reads"] += retries
+
+        sorted_bits = sort_bits(
+            read_bits,
+            stats
+        )
+
+        output = [
+            old + new
+            for old, new in zip(output, sorted_bits)
+        ]
+
+        if verbose:
+
+            print(
+                f" t={threshold:<3} "
+                f"in {''.join(map(str, read_bits))} "
+                f"-> sorted "
+                f"{''.join(map(str, sorted_bits))}"
+            )
+
+    stats["main_and"] += circuit.and_high
+    stats["leak_or"] += circuit.or_high
+    stats["main_gates"] += circuit.gates
+
+    return output
+
+
+# =========================================================
+# DATASET GENERATION
+# =========================================================
 
 def make_dataset(digest, n, m, pattern="random"):
-    """n values in 0..m-1 from a SHA-256 counter stream seeded by the frame digest (any length)."""
-    d = [
-        int.from_bytes(sha(digest + b"data" + i.to_bytes(8, "big"))[:8], "big") % m
+
+    data = [
+        int.from_bytes(
+            sha(
+                digest
+                + b"data"
+                + i.to_bytes(8, "big")
+            )[:8],
+            "big"
+        ) % m
         for i in range(n)
     ]
 
     if pattern == "sorted":
-        d.sort()
+        data.sort()
+
     elif pattern == "reversed":
-        d.sort(reverse=True)
+        data.sort(reverse=True)
+
     elif pattern == "dups":
-        d = [v % min(m, 3) for v in d]  # only 3 distinct values
+        data = [
+            value % min(m, 3)
+            for value in data
+        ]
 
-    return d
+    return data
 
 
-def save_dataset(path, digest, n, m, pattern, data, sorted_data, sorted_ok):
-    """Save the original dataset, its parameters, and the circuit-sorted result."""
+def show(values):
+
+    if len(values) <= 16:
+        return str(values)
+
+    return (
+        f"[{', '.join(map(str, values[:8]))}, ... "
+        f"{', '.join(map(str, values[-4:]))}] "
+        f"(len {len(values)})"
+    )
+
+
+# =========================================================
+# SAVE / LOAD
+# =========================================================
+
+def save_dataset(
+    path,
+    digest,
+    data,
+    sorted_data,
+    metadata
+):
+
     payload = {
         "digest": digest.hex(),
-        "n": n,
-        "m": m,
-        "pattern": pattern,
         "data": data,
         "sorted_data": sorted_data,
-        "sorted_ok": bool(sorted_ok),
+        "sorted_ok": sorted_data == sorted(data),
+        "metadata": metadata
     }
 
     with open(path, "w", encoding="utf-8") as f:
@@ -237,174 +741,321 @@ def save_dataset(path, digest, n, m, pattern, data, sorted_data, sorted_ok):
 
 
 def load_dataset(path):
-    """Load a dataset previously saved by save_dataset()."""
+
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    required = {"digest", "n", "m", "pattern", "data", "sorted_data", "sorted_ok"}
-    missing = required - payload.keys()
-
-    if missing:
-        raise ValueError(
-            f"dataset file is missing fields: {', '.join(sorted(missing))}"
-        )
-
     digest = bytes.fromhex(payload["digest"])
-    data = [int(v) for v in payload["data"]]
-    sorted_data = [int(v) for v in payload["sorted_data"]]
+    data = [int(x) for x in payload["data"]]
 
-    if len(data) != payload["n"]:
-        raise ValueError(
-            f"dataset length mismatch: n={payload['n']} "
-            f"but file contains {len(data)} values"
-        )
-
-    if len(sorted_data) != payload["n"]:
-        raise ValueError(
-            f"sorted result length mismatch: n={payload['n']} "
-            f"but file contains {len(sorted_data)} values"
-        )
-
-    if any(not (0 <= v < payload["m"]) for v in data):
-        raise ValueError("one or more loaded values are outside 0..m-1")
-
-    return digest, data, sorted_data, payload
+    return digest, data, payload
 
 
-def show(v):
-    if len(v) <= 16:
-        return str(v)
-
-    return (
-        f"[{', '.join(map(str, v[:8]))}, ... "
-        f"{', '.join(map(str, v[-4:]))}] (len {len(v)})"
-    )
-
-
-# ---- main -----------------------------------------------------------------------------
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--device", type=int, default=0)
-    ap.add_argument("--synthetic", action="store_true")
-    ap.add_argument(
-        "--frames", type=int, default=1, help="one fresh dataset per frame"
+
+    parser = argparse.ArgumentParser(
+        description="Photon-driven optoelectronic sorting circuit"
     )
-    ap.add_argument(
-        "--thr", type=int, default=1, help="motion threshold in DN"
+
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=0
     )
-    ap.add_argument(
-        "--n", type=int, default=8, help="dataset length (any size >= 1)"
+
+    parser.add_argument(
+        "--synthetic",
+        action="store_true"
     )
-    ap.add_argument(
+
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=1
+    )
+
+    parser.add_argument(
+        "--thr",
+        type=int,
+        default=1
+    )
+
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=8
+    )
+
+    parser.add_argument(
+        "--m",
+        type=int,
+        default=8
+    )
+
+    parser.add_argument(
         "--pattern",
         choices=("random", "sorted", "reversed", "dups"),
-        default="random",
+        default="random"
     )
-    ap.add_argument(
-        "--m", type=int, default=8, help="values are 0..m-1"
-    )
-    ap.add_argument(
+
+    parser.add_argument(
         "--data",
-        default=None,
-        help="comma list to sort instead of a generated dataset",
+        default=None
     )
-    ap.add_argument(
+
+    parser.add_argument(
         "--retries",
         type=int,
-        default=8,
-        help="nonce tries per bit read (RP repeats)",
+        default=3200
     )
-    ap.add_argument(
-        "--save",
-        default=None,
-        help="save dataset and sorted result to this JSON file",
-    )
-    ap.add_argument(
-        "--load",
-        default=None,
-        help="load a saved dataset and its sorted result from this JSON file",
-    )
-    a = ap.parse_args()
 
-    if a.load and (a.data or a.save):
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        default=0.050
+    )
+
+    parser.add_argument(
+        "--decision",
+        choices=("majority", "any"),
+        default="majority"
+    )
+
+    parser.add_argument(
+        "--photon-flux",
+        type=float,
+        default=PHOTON_FLUX
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional seed; omit for non-repeatable photon simulation"
+    )
+
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Apply actual 150ms software delay per main evaluation"
+    )
+
+    parser.add_argument(
+        "--save",
+        default=None
+    )
+
+    parser.add_argument(
+        "--load",
+        default=None
+    )
+
+    args = parser.parse_args()
+
+    if args.n < 1 or args.m < 2:
+        sys.exit("--n must be >= 1 and --m must be >= 2")
+
+    if args.retries < 1:
+        sys.exit("--retries must be >= 1")
+
+    if args.exposure <= 0:
+        sys.exit("--exposure must be positive")
+
+    if args.frames < 1:
+        sys.exit("--frames must be >= 1")
+
+    if args.load and (args.data or args.save):
         sys.exit("--load cannot be combined with --data or --save")
 
-    src = Synthetic() if a.synthetic else Camera(a.device)
-    prev = src.read().astype(np.int16)
 
-    good = 0
-    st = dict(trials=0, gates=0, miss=0)
+    rng = np.random.default_rng(args.seed)
 
-    for t in range(a.frames):
-        f = src.read().astype(np.int16)
-        E = (np.abs(f - prev) > a.thr).astype(np.uint8)
-        prev = f
-        digest = sha(E.tobytes())  # instance commitment for this frame
+    source = (
+        Synthetic()
+        if args.synthetic
+        else Camera(args.device)
+    )
 
-        if a.load:
-            digest, data, saved_sorted, meta = load_dataset(a.load)
-            m = meta["m"]
+    previous = source.read().astype(np.int16)
+
+    stats = {
+        "trials": 0,
+        "photons": 0,
+        "miss": 0,
+        "sort_gates": 0,
+        "main_gates": 0,
+        "main_and": 0,
+        "leak_or": 0,
+        "accumulator_reads": 0
+    }
+
+    correct = 0
+
+    print("\n=== Photon-Driven Optoelectronic Sort ===")
+
+    print(f"Input source:       {'Synthetic' if args.synthetic else 'Camera'}")
+    print("Detector A:         Right ROI / photon counting")
+    print("Detector B:         Left ROI / deterministic RC")
+    print(f"Photon flux:        {PHOTON_FLUX}")
+    print(f"Photon efficiency:  {PHOTON_EFFICIENCY}")
+    print(f"Exposure:           {args.exposure * 1000:.1f} ms")
+    print(f"RC time constant:   {RC_TAU * 1000:.1f} ms")
+    print(f"Main delay:         {MAIN_DELAY * 1000:.1f} ms")
+    print(f"Clock:              {1 / CLOCK_PERIOD:.1f} Hz")
+    print(f"Decision:           {args.decision}")
+    print(f"Retries:            {args.retries}")
+    print(f"Random seed:        {args.seed}")
+
+    try:
+
+        for frame_index in range(args.frames):
+
+            frame = source.read().astype(np.int16)
+
+            motion = (
+                np.abs(frame - previous) > args.thr
+            ).astype(np.uint8)
+
+            previous = frame
+
+            digest = sha(motion.tobytes())
+
+            # Split optical detector regions.
+
+            right_roi, left_roi = detector_rois(
+                motion * 255
+            )
+
+            b, vc, ve = driver_b(left_roi)
 
             print(
-                f"frame {t} loaded {a.load} digest {digest.hex()[:16]} "
-                f"n={meta['n']} m={m} pattern={meta['pattern']} "
-                f"data {show(data)}"
+                f"\nFrame {frame_index}: "
+                f"digest={digest.hex()[:16]}"
             )
-            print(f" saved sorted result {show(saved_sorted)}")
 
-        elif a.data:
-            data = [int(v) for v in a.data.split(",")]
-            m = max(a.m, max(data) + 1)
-            print(f"frame {t} digest {digest.hex()[:16]} data {show(data)}")
+            print(
+                f"Detector B: HIGH={b} "
+                f"Vc={vc:.3f}V "
+                f"Ve={ve:.3f}V"
+            )
 
-        else:
-            data = make_dataset(digest, a.n, a.m, a.pattern)
-            m = a.m
-            print(f"frame {t} digest {digest.hex()[:16]} data {show(data)}")
+            if args.load:
 
-        t0 = time.time()
-        out = circuit_sort(
-            digest,
-            data,
-            m,
-            a.retries,
-            st,
-            verbose=len(data) <= 16,
-        )
+                digest, data, payload = load_dataset(
+                    args.load
+                )
 
-        ok = out == sorted(data)
-        good += ok
+                m = max(data) + 1 if data else 2
 
-        if a.save:
-            save_path = a.save
+                print(f"Loaded: {args.load}")
 
-            if a.frames > 1:
-                root, ext = os.path.splitext(a.save)
-                save_path = f"{root}_{t}{ext or '.json'}"
+            elif args.data:
 
-            save_dataset(
-                save_path,
-                digest,
-                len(data),
-                m,
-                a.pattern,
+                data = [
+                    int(x)
+                    for x in args.data.split(",")
+                ]
+
+                if not data or any(x < 0 for x in data):
+                    sys.exit("Data must contain non-negative integers")
+
+                m = max(data) + 1
+
+            else:
+
+                data = make_dataset(
+                    digest,
+                    args.n,
+                    args.m,
+                    args.pattern
+                )
+
+                m = args.m
+
+            print(f"Dataset: {show(data)}")
+
+            start = time.monotonic()
+
+            result = circuit_sort(
+                right_roi,
+                left_roi,
                 data,
-                out,
-                ok,
+                m,
+                args.retries,
+                args.exposure,
+                rng,
+                stats,
+                decision=args.decision,
+                verbose=len(data) <= 16
             )
 
-            print(f" saved dataset and sorted result to {save_path}")
+            elapsed = time.monotonic() - start
 
-        print(
-            f" sorted {show(out)} {'OK' if ok else 'MISMATCH'} "
-            f"({time.time() - t0:.1f}s)\n"
-        )
+            expected = sorted(data)
+            ok = result == expected
+
+            correct += int(ok)
+
+            print(f"\nInput:    {show(data)}")
+            print(f"Output:   {show(result)}")
+            print(f"Expected: {show(expected)}")
+
+            print(
+                f"Result: {'OK' if ok else 'MISMATCH'}"
+            )
+
+            print(f"Elapsed: {elapsed:.3f}s")
+
+            if args.save:
+
+                path = args.save
+
+                if args.frames > 1:
+
+                    root, ext = os.path.splitext(path)
+
+                    path = (
+                        f"{root}_{frame_index}"
+                        f"{ext or '.json'}"
+                    )
+
+                save_dataset(
+                    path,
+                    digest,
+                    data,
+                    result,
+                    {
+                        "retries": args.retries,
+                        "exposure": args.exposure,
+                        "decision": args.decision
+                    }
+                )
+
+                print(f"Saved: {path}")
+
+    finally:
+
+        if isinstance(source, Camera):
+            source.close()
+
+    print("\n=== Circuit Statistics ===")
+
+    print(f"Photon detections:       {stats['photons']}")
+    print(f"Circuit trials:          {stats['trials']}")
+    print(f"Main AND/OR gates:       {stats['main_gates']}")
+    print(f"Sorting AND/OR gates:    {stats['sort_gates']}")
+    print(f"Accumulator reads:       {stats['accumulator_reads']}")
+    print(f"Main AND HIGH:           {stats['main_and']}")
+    print(f"Leak OR HIGH:            {stats['leak_or']}")
+    print(f"Bit-read errors:         {stats['miss']}")
 
     print(
-        f"{good}/{a.frames} sorted correctly | circuit trials {st['trials']} | "
-        f"AND/OR cells {st['gates']} | "
-        f"bit reads that missed a 1: {st['miss']} (one-sided errors only)"
+        f"\nCorrect datasets: "
+        f"{correct}/{args.frames}"
     )
 
 
