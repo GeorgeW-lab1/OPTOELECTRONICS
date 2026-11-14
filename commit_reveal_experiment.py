@@ -28,7 +28,7 @@ import time
 
 import numpy as np
 
-SLOTS = 16          # bits per window
+SLOTS = 8          # bits per window
 T = 0.1             # slot length, 10 Hz clock
 THRESH = 1.0        # Driver A threshold in sigma
 P_B = 0.8           # Driver B pass probability
@@ -39,12 +39,18 @@ LEADS = (1, 2, 3, 4)
 class WebcamDetector:
     """Returns (A, B) brightness per slot from two ROIs."""
 
-    def __init__(self, index, roi_a, roi_b):
+    def __init__(self, index, roi_a, roi_b, hz=10.0, width=640, height=480, req_fps=0):
         import cv2
         self.cv2 = cv2
         self.cap = cv2.VideoCapture(index)
         if not self.cap.isOpened():
             sys.exit("Cannot open webcam %d" % index)
+        # MJPG + small frame + high requested fps => highest frame rate the camera can do
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if req_fps:
+            self.cap.set(cv2.CAP_PROP_FPS, req_fps)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         # Lock exposure/gain so the camera does not "correct" the noise away.
         # Property values differ per driver; check with v4l2-ctl / your driver docs.
@@ -54,6 +60,14 @@ class WebcamDetector:
         self.roi_a, self.roi_b = roi_a, roi_b
         for _ in range(30):          # warm up
             self.cap.read()
+        t = time.perf_counter()
+        for _ in range(60):          # measure the real frame rate
+            self.cap.read()
+        self.fps = 60 / (time.perf_counter() - t)
+        # If the requested slot rate is at/above the camera rate, lock slot = 1 frame
+        self.frame_locked = hz >= 0.9 * self.fps
+        print("measured camera rate: %.1f fps; slot mode: %s" % (
+            self.fps, "1 frame per slot (frame-locked)" if self.frame_locked else "time-based"))
 
     def _roi_mean(self, g, roi):
         x, y, w, h = roi
@@ -61,6 +75,12 @@ class WebcamDetector:
 
     def read_slot(self, t_end):
         """Average ROI brightness over all frames that arrive before t_end."""
+        if self.frame_locked:
+            ok, frame = self.cap.read()
+            if not ok:
+                sys.exit("Webcam read failed")
+            g = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
+            return self._roi_mean(g, self.roi_a), self._roi_mean(g, self.roi_b)
         a, b = [], []
         while True:
             ok, frame = self.cap.read()
@@ -116,11 +136,14 @@ def collect(args):
     if args.simulate:
         det = SimDetector(seed=secrets.randbits(32))
     else:
-        det = WebcamDetector(args.camera, tuple(args.roi_a), tuple(args.roi_b))
+        det = WebcamDetector(args.camera, tuple(args.roi_a), tuple(args.roi_b),
+                             hz=args.hz, width=args.width, height=args.height, req_fps=args.fps)
+    slot_T = (1.0 / det.fps) if (not args.simulate and det.frame_locked) else 1.0 / args.hz
+    print("effective slot rate: %.1f Hz -> %.2f s per window" % (1 / slot_T, SLOTS * slot_T))
 
     # Preregistration: hash of this script and the parameters
     with open(__file__, "rb") as f:
-        prereg = hashlib.sha256(f.read() + repr((SLOTS, T, THRESH, P_B, LEADS, args.windows)).encode()).hexdigest()
+        prereg = hashlib.sha256(f.read() + repr((SLOTS, args.hz, THRESH, P_B, LEADS, args.windows)).encode()).hexdigest()
     print("Preregistration hash (store it elsewhere NOW):", prereg)
 
     A = np.zeros((args.windows, SLOTS))
@@ -141,17 +164,12 @@ def collect(args):
             if arm[w] == 0 and args.simulate and args.sim_leak:
                 pass                                   # tilt applied per slot below
 
-            t0 = time.perf_counter() + 0.2
+            t0 = time.perf_counter()
             for k in range(SLOTS):
                 if args.simulate and arm[w] == 0 and args.sim_leak and k + 2 < SLOTS:
                     det.pending_tilt = 2 * args.sim_leak * (y[k + 2] - 0.5)
-                t_end = t0 + (k + 1) * T
+                t_end = t0 + (k + 1) * slot_T
                 A[w, k], B[w, k] = det.read_slot(t_end)
-                if not args.simulate:
-                    while time.perf_counter() < t_end:
-                        pass
-                elif False:
-                    pass
 
             if arm[w] == 1:                            # AFTER arm
                 nonce = secrets.token_bytes(16)
@@ -262,9 +280,13 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("collect")
-    c.add_argument("--windows", type=int, default=100)
+    c.add_argument("--windows", type=int, default=3000)
     c.add_argument("--out", default="run.npz")
     c.add_argument("--camera", type=int, default=0)
+    c.add_argument("--hz", type=float, default=10.0, help="slot rate; >= camera fps means 1 frame per slot")
+    c.add_argument("--fps", type=float, default=0, help="request this camera frame rate (e.g. 60, 120)")
+    c.add_argument("--width", type=int, default=640)
+    c.add_argument("--height", type=int, default=480)
     c.add_argument("--roi-a", type=int, nargs=4, default=[100, 100, 64, 64], metavar=("X", "Y", "W", "H"))
     c.add_argument("--roi-b", type=int, nargs=4, default=[300, 100, 64, 64], metavar=("X", "Y", "W", "H"))
     c.add_argument("--simulate", action="store_true", help="no camera: Poisson + shared-term simulator")
@@ -273,7 +295,7 @@ def main():
 
     a = sub.add_parser("analyze")
     a.add_argument("file")
-    a.add_argument("--perms", type=int, default=200)
+    a.add_argument("--perms", type=int, default=2000)
     a.add_argument("--balanced", action="store_true", help="use A-B to cancel the common beam term")
     a.add_argument("--inject", type=float, default=0.0, help="positive-control tilt (sigma) at L=+2")
     a.set_defaults(fn=analyse)
