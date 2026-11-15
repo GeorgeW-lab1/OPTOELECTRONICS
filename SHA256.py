@@ -16,7 +16,16 @@ SIGMA_C = 0.005
 N_SLOTS = 32
 
 # Adjust difficulty iterations to guarantee a distinct time gap (e.g., ~15-50ms)
-POW_DIFFICULTY_ITERATIONS = 5000000
+POW_DIFFICULTY_ITERATIONS = 50000
+
+
+# ============================================================================
+# CUSTOM QUEUE WITH .pop() SUPPORT
+# ============================================================================
+
+class PopQueue(queue.Queue):
+    def pop(self, timeout=None):
+        return self.get(timeout=timeout)
 
 
 # ============================================================================
@@ -113,15 +122,13 @@ class PipelinedBlockProcessor(threading.Thread):
             # ================================================================
             block_hash = ""
             nonce = 0
-            block_hash = "0"
-
+            
             for i in range(POW_DIFFICULTY_ITERATIONS):
                 nonce += 1
                 header = f"{mock_height}:{nonce}:{start_ns}"
                 test = hashlib.sha256(header.encode()).hexdigest()
-                if test.startswith("00000"):
+                if test.startswith("000"):
                     block_hash = test
-
             # ================================================================
             # 3. END OF MINING CYCLE: ENCODE COMPLETION TIMESTAMP
             # ================================================================
@@ -163,14 +170,14 @@ def main():
     print(" RP-GHOST PROOF-OF-WORK PIPELINED ENCODE/DECODE PIPELINE")
     print("=" * 78)
 
-    output_queue = queue.Queue()
+    output_queue = PopQueue()
     processor = PipelinedBlockProcessor(output_queue)
     processor.start()
 
     try:
         while True:
             try:
-                res = output_queue.get(timeout=0.1)
+                res = output_queue.pop(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -181,7 +188,6 @@ def main():
             print(f"  [COMPLETION]  Completion Time: {res['completion_time']} (Elapsed: {res['mining_duration_ms']:.2f} ms)")
             print(f"  [DECODED TS]  Decoded Time:    {res['decoded_time']} (Bits verified)")
             print(f"  [HASH]        {res['hash']}")
-
             print("-" * 78)
 
     except KeyboardInterrupt:
