@@ -16,7 +16,7 @@ SIGMA_C = 0.005
 N_SLOTS = 32
 
 # Adjust difficulty iterations to guarantee a distinct time gap (e.g., ~15-50ms)
-POW_DIFFICULTY_ITERATIONS = 50000
+POW_DIFFICULTY_ITERATIONS = 5000000
 
 
 # ============================================================================
@@ -113,10 +113,14 @@ class PipelinedBlockProcessor(threading.Thread):
             # ================================================================
             block_hash = ""
             nonce = 0
+            block_hash = "0"
+
             for i in range(POW_DIFFICULTY_ITERATIONS):
                 nonce += 1
                 header = f"{mock_height}:{nonce}:{start_ns}"
-                block_hash = hashlib.sha256(header.encode()).hexdigest()
+                test = hashlib.sha256(header.encode()).hexdigest()
+                if test.startswith("00000"):
+                    block_hash = test
 
             # ================================================================
             # 3. END OF MINING CYCLE: ENCODE COMPLETION TIMESTAMP
@@ -173,10 +177,11 @@ def main():
             print()
             print("-" * 78)
             print(f"  [BLOCK MINED] Height: #{res['height']} (Nonce iterations: {res['nonce']:,})")
-            print(f"  [HASH]        {res['hash']}")
             print(f"  [MINING WORK] Start Time:      {res['start_time']}")
             print(f"  [COMPLETION]  Completion Time: {res['completion_time']} (Elapsed: {res['mining_duration_ms']:.2f} ms)")
             print(f"  [DECODED TS]  Decoded Time:    {res['decoded_time']} (Bits verified)")
+            print(f"  [HASH]        {res['hash']}")
+
             print("-" * 78)
 
     except KeyboardInterrupt:
