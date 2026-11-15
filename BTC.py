@@ -262,6 +262,7 @@ def run_full_predictor_pipeline():
             price_matched = (rec_price_code == target_price_code)
             time_matched = (abs(rec_timestamp - target_time_code) <= 2) # Allow 2-second jitter tolerance
             
+            match_status = "VERIFIED MATCH" if price_matched else "MISMATCH"
             print(f"Target Price Code  : 0x{target_price_code:04X} (~${live_btc_price:,.2f})")
             print(f"Forecasted Code    : 0x{rec_price_code:04X} | Price Match: {price_matched}")
             print(f"Forecasted Time    : 0x{rec_timestamp:04X} | Time Jitter Delta: {abs(rec_timestamp - target_time_code)}s")
@@ -269,6 +270,7 @@ def run_full_predictor_pipeline():
             print(f"Active Queue Depth : {len(fifo_queue)}")
 
             live_btc_price = binance_fetcher.get_price()
+            time.sleep(1.0)
 
     finally:
         binance_fetcher.stop()
