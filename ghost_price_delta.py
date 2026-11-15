@@ -4,8 +4,9 @@ RP-GHOST commit-reveal timestamp and price-delta decoder.
 The 32-slot payload contains a 16-bit millisecond-within-minute
 timestamp and a signed 16-bit price delta in cents.
 
-The synthetic optical channel explicitly encodes the payload after
-reveal; this tests decoding, not prediction before reveal.
+Live BTC prices are sourced from the selected exchange WebSocket.
+The optical channel is a simulated decoder channel; post-reveal encoding
+validates decoding and is not evidence of predicting future prices.
 No keyboard injection is performed.
 """
 
@@ -395,6 +396,30 @@ def lead_stats(arm, leads, n_slots, n_perms):
 # ----------------------------------------------------------------------------
 # Exchange parsers
 # ----------------------------------------------------------------------------
+def _parse_binance(d):
+    """Parse Binance Spot BTCUSDT bookTicker updates."""
+    if d.get("s") != "BTCUSDT":
+        return None
+
+    bid = d.get("b")
+    ask = d.get("a")
+
+    if bid is None or ask is None:
+        return None
+
+    try:
+        bid = float(bid)
+        ask = float(ask)
+
+        if bid <= 0 or ask <= 0:
+            return None
+
+        return (bid + ask) / 2.0
+
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_deribit(d):
     p = d.get("params")
 
@@ -467,6 +492,11 @@ def _parse_okx(d):
 
 
 EXCHANGES = {
+    "binance": {
+        "url": "wss://stream.binance.com:443/ws/btcusdt@bookTicker",
+        "sub": None,
+        "parse": _parse_binance,
+    },
     "deribit": {
         "url": "wss://www.deribit.com/ws/api/v2",
         "sub": {
@@ -529,14 +559,21 @@ EXCHANGES = {
 # Delayed live fetcher
 # ----------------------------------------------------------------------------
 class AsyncPriceFetcher(threading.Thread):
+
     def __init__(
         self,
-        exchange="coinbase",
+        exchange="binance",
         delay_seconds=0.1,
     ):
         super().__init__(daemon=True)
 
+        if exchange not in EXCHANGES:
+            raise ValueError(
+                f"Unsupported exchange: {exchange}"
+            )
+
         cfg = EXCHANGES[exchange]
+
         self.url = cfg["url"]
         self.sub = cfg["sub"]
         self.parse = cfg["parse"]
@@ -546,47 +583,85 @@ class AsyncPriceFetcher(threading.Thread):
         self.delay_ns = int(delay_seconds * 1e9)
 
         self._pending = deque()
+        self._pending_lock = threading.Lock()
 
         self.latest_price = 0.0
         self.latest_timestamp_ns = 0
         self.latest_timestamp = ""
 
         self.update_event = threading.Event()
-        self.last_recv_ns = 0
+
         self.running = True
         self.ws = None
 
+        self._first_tick_logged = False
+        self._release_thread = None
+
     def _on_open(self, ws):
+
         print(
             f"[FETCH] Connected to {self.exchange}"
         )
-        ws.send(json.dumps(self.sub))
-        print(
-            f"[FETCH] Subscription sent: {self.sub}"
-        )
+
+        if self.sub is not None:
+            ws.send(json.dumps(self.sub))
+
+            print(
+                f"[FETCH] Subscription sent: {self.sub}"
+            )
+
+        else:
+            print(
+                "[FETCH] Binance BTCUSDT bookTicker stream active"
+            )
 
     def _on_message(self, ws, message):
-        if len(self._pending) > 1000:
-            self._pending.clear()
 
         try:
-            price = self.parse(_loads(message))
+            data = _loads(message)
+            price = self.parse(data)
+
         except Exception as e:
-            print(f"[PARSE ERROR] {e}")
+            print(
+                f"[PARSE ERROR] {e}"
+            )
             return
 
-        if not price:
+        if price is None or price <= 0:
             return
 
-        received_ns = time.perf_counter_ns()
-        due_ns = received_ns + self.delay_ns
+        received_perf_ns = time.perf_counter_ns()
+        due_perf_ns = received_perf_ns + self.delay_ns
 
-        self._pending.append(
-            (due_ns, time.time_ns() + self.delay_ns, price)
-        )
+        due_wall_ns = time.time_ns() + self.delay_ns
+
+        with self._pending_lock:
+
+            if len(self._pending) >= 1000:
+                self._pending.clear()
+
+            self._pending.append(
+                (
+                    due_perf_ns,
+                    due_wall_ns,
+                    price,
+                )
+            )
+
+        if not self._first_tick_logged:
+
+            self._first_tick_logged = True
+
+            print(
+                f"[FETCH] First {self.exchange} tick: "
+                f"${price:,.2f}"
+            )
 
     def _on_error(self, ws, error):
-        print(f"[FETCH] WebSocket error: {error}")
+
+        print(
+            f"[FETCH] WebSocket error: {error}"
+        )
 
     def _on_close(
         self,
@@ -594,40 +669,79 @@ class AsyncPriceFetcher(threading.Thread):
         close_status_code,
         close_msg,
     ):
+
         print(
             f"[FETCH] WebSocket closed: "
             f"{close_status_code} {close_msg}"
         )
 
     def _release_due_ticks(self):
-        now_ns = time.perf_counter_ns()
 
-        while (
-            self._pending
-            and self._pending[0][0] <= now_ns
-        ):
-            due_ns, wall_ns, price = self._pending.popleft()
+        now_ns = time.perf_counter_ns()
+        due_items = []
+
+        with self._pending_lock:
+
+            while (
+                self._pending
+                and self._pending[0][0] <= now_ns
+            ):
+
+                due_items.append(
+                    self._pending.popleft()
+                )
+
+        for due_perf_ns, wall_ns, price in due_items:
 
             self.latest_price = price
+
             self.latest_timestamp_ns = wall_ns
+
             self.latest_timestamp = (
-                format_clock_time(due_ns)
+                format_clock_time(wall_ns)
             )
-            self.last_recv_ns = due_ns
 
             self.update_event.set()
 
-    def run(self):
-        if not HAS_WS:
-            print(
-                "[FETCH] Missing dependency: "
-                "pip install websocket-client"
-            )
-            return
+    def _release_loop(self):
+
+        """
+        Independent worker.
+
+        Releases delayed ticks while the WebSocket
+        connection is blocking in run_forever().
+        """
 
         while self.running:
+
+            self._release_due_ticks()
+
+            time.sleep(0.005)
+
+    def run(self):
+
+        if not HAS_WS:
+
+            print(
+                "[FETCH] websocket-client missing."
+            )
+
+            print(
+                "Install with: py -m pip install websocket-client"
+            )
+
+            return
+
+        self._release_thread = threading.Thread(
+            target=self._release_loop,
+            daemon=True,
+        )
+
+        self._release_thread.start()
+
+        while self.running:
+
             try:
-                self._release_due_ticks()
 
                 self.ws = websocket.WebSocketApp(
                     self.url,
@@ -637,122 +751,61 @@ class AsyncPriceFetcher(threading.Thread):
                     on_close=self._on_close,
                 )
 
+                print(
+                    f"[FETCH] Connecting to {self.url}"
+                )
+
                 self.ws.run_forever(
                     ping_interval=20,
                     ping_timeout=10,
+                    ping_payload="ghost-binance",
                 )
 
             except Exception as e:
+
                 print(
-                    f"[FETCH] WebSocket exception: {e}"
+                    f"[FETCH] Connection exception: {e}"
                 )
 
             if self.running:
-                time.sleep(0.2)
+
+                print(
+                    "[FETCH] Reconnecting in 2 seconds..."
+                )
+
+                time.sleep(2)
 
     def get_price(self):
+
         return self.latest_price
 
     def get_timestamp(self):
+
         return self.latest_timestamp
 
     def get_timestamp_ns(self):
+
         return self.latest_timestamp_ns
 
     def stop(self):
+
         self.running = False
 
-        if self.ws:
-            self.ws.close()
+        if self.ws is not None:
 
+            try:
+                self.ws.close()
 
-# ----------------------------------------------------------------------------
-# Synthetic delayed fetcher
-# ----------------------------------------------------------------------------
-class SyntheticPriceFetcher(threading.Thread):
-    def __init__(
-        self,
-        delay_seconds=0.1,
-        start_price=100000.0,
-        tick_interval_seconds=0.25,
-    ):
-        super().__init__(daemon=True)
+            except Exception:
+                pass
 
-        self.delay_seconds = delay_seconds
-        self.delay_ns = int(delay_seconds * 1e9)
-        self.tick_interval_seconds = (
-            tick_interval_seconds
-        )
-
-        self._pending = deque()
-
-        self.latest_price = start_price
-        self.latest_timestamp_ns = 0
-        self.latest_timestamp = ""
-
-        self.update_event = threading.Event()
-        self.last_recv_ns = 0
-        self.running = True
-
-    def run(self):
-        print(
-            "[FETCH] Synthetic feed started; "
-            f"tick interval "
-            f"{self.tick_interval_seconds:.3f}s, "
-            f"async delay {self.delay_seconds:.3f}s"
-        )
-
-        while self.running:
-            received_ns = time.perf_counter_ns()
-            due_ns = received_ns + self.delay_ns
-
-            self.latest_price += float(
-                np.random.normal(0.0, 1.0)
-            )
-
-            self._pending.append(
-                (due_ns, time.time_ns() + self.delay_ns, self.latest_price)
-            )
-
-            time.sleep(self.tick_interval_seconds)
-
-            now_ns = time.perf_counter_ns()
-
-            while (
-                self._pending
-                and self._pending[0][0] <= now_ns
-            ):
-                due_ns, wall_ns, price = (
-                    self._pending.popleft()
-                )
-
-                self.latest_price = price
-                self.latest_timestamp_ns = wall_ns
-                self.latest_timestamp = (
-                    format_clock_time(due_ns)
-                )
-                self.last_recv_ns = due_ns
-
-                self.update_event.set()
-
-    def get_price(self):
-        return self.latest_price
-
-    def get_timestamp(self):
-        return self.latest_timestamp
-
-    def get_timestamp_ns(self):
-        return self.latest_timestamp_ns
-
-    def stop(self):
-        self.running = False
 
 
 # ----------------------------------------------------------------------------
 # Main pipeline
 # ----------------------------------------------------------------------------
 def run_full_predictor_pipeline(
-    exchange="synthetic",
+    exchange="binance",
     delay_seconds=0.1,
     n_windows=20000,
     leak_eps_sigma=0.02,
@@ -824,17 +877,16 @@ def run_full_predictor_pipeline(
         f"async delay={delay_seconds:.3f}s"
     )
 
-    if (
-        exchange != "synthetic"
-        and not HAS_WS
-    ):
+    if exchange not in EXCHANGES:
+        raise ValueError(
+            f"Unsupported live exchange {exchange!r}. "
+            f"Choose one of: {", ".join(EXCHANGES)}"
+        )
+
+    if not HAS_WS:
         print(
             "[FETCH] websocket-client is not installed. "
             "Run: pip install websocket-client"
-        )
-        print(
-            "[FETCH] Or use exchange='synthetic' to "
-            "test the decoder without a live feed."
         )
         return
 
@@ -846,15 +898,10 @@ def run_full_predictor_pipeline(
     fifo_queue = FifoTargetQueue(max_capacity=50)
     delta_buf = deque(maxlen=DELTA_BUF_LEN)
 
-    if exchange == "synthetic":
-        fetcher = SyntheticPriceFetcher(
-            delay_seconds=delay_seconds
-        )
-    else:
-        fetcher = AsyncPriceFetcher(
-            exchange=exchange,
-            delay_seconds=delay_seconds,
-        )
+    fetcher = AsyncPriceFetcher(
+        exchange=exchange,
+        delay_seconds=delay_seconds,
+    )
 
     fetcher.start()
     print(
@@ -1328,13 +1375,13 @@ def run_full_predictor_pipeline(
 
 
 if __name__ == "__main__":
-    # Use "synthetic" first to verify the decoder without a live feed.
+    # Live Binance Spot BTCUSDT bookTicker feed; no synthetic exchange.
     run_full_predictor_pipeline(
-        exchange="synthetic",
+        exchange="binance",
         delay_seconds=0.1,
         n_windows=2000,
         leak_eps_sigma=0.02,
         balanced_detection=False,
         n_perms=100,
-        report_every=10,
+        report_every=10000,
     )
