@@ -222,7 +222,7 @@ def run_full_predictor_pipeline():
     try:
         live_btc_price = binance_fetcher.get_price()
         
-        for iteration in range(1, 10):
+        for iteration in range(1, 100000000000):
             current_timestamp = time.time()
             print(f"\n--- PREDICTOR CYCLE {iteration} ---")
 
