@@ -1,3 +1,4 @@
+
 import hashlib
 import heapq
 import json
@@ -8,7 +9,13 @@ import queue
 from collections import deque
 
 import numpy as np
-
+try:
+    import pyautogui
+    HAS_PYAUTOGUI = True
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0.02
+except ImportError:
+    HAS_PYAUTOGUI = False
 try:
     import orjson
     _loads = orjson.loads
@@ -23,6 +30,22 @@ except ImportError:
 
 
 # ============================================================================
+# KEYBOARD OUTPUT
+# ============================================================================
+
+ENABLE_KEYBOARD = True
+
+KEY_HIGH = ("shift", "w")
+KEY_LOW = ("shift", "s")
+
+KEYBOARD_ONLY_AFTER_ARM = True
+KEYBOARD_REQUIRE_CONFIDENCE = True
+KEYBOARD_MIN_DELTA = 0.01
+KEYBOARD_COOLDOWN = 0.0
+
+_last_keyboard_action = 0.0
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 
@@ -33,7 +56,7 @@ N_SLOTS = 32
 FIELD_BITS = 16
 PRICE_DELTA_SCALE = 100.0
 
-REVEAL_DELAY = 10.1
+REVEAL_DELAY = 2.8
 SAMPLE_INTERVAL = 1.0
 
 N_WINDOWS = 2000
@@ -596,7 +619,47 @@ def make_commitment(arm, timestamp_ns, price, price_delta):
 # ============================================================================
 # REVEAL AND DECODER
 # ============================================================================
+def inject_decoded_direction(arm, decoded_delta, min_z, joint_conf):
 
+    global _last_keyboard_action
+
+    if not ENABLE_KEYBOARD:
+        return "DISABLED"
+
+    if not HAS_PYAUTOGUI:
+        return "PYAUTOGUI NOT INSTALLED"
+
+    if KEYBOARD_ONLY_AFTER_ARM and arm != "AFTER":
+        return "SKIPPED: BEFORE ARM"
+
+    if KEYBOARD_REQUIRE_CONFIDENCE:
+        if min_z < Z_MIN or joint_conf < JOINT_CONF_MIN:
+            return "SKIPPED: LOW CONFIDENCE"
+
+    if abs(decoded_delta) < KEYBOARD_MIN_DELTA:
+        return "SKIPPED: ZERO DIRECTION"
+
+    now = time.monotonic()
+
+    if now - _last_keyboard_action < KEYBOARD_COOLDOWN:
+        return "SKIPPED: COOLDOWN"
+
+    if decoded_delta > 0:
+        direction = "HIGH"
+        keys = KEY_HIGH
+    else:
+        direction = "LOW"
+        keys = KEY_LOW
+
+    try:
+        pyautogui.hotkey(*keys)
+        _last_keyboard_action = now
+
+        return f"INJECTED {direction}: {'+'.join(keys).upper()}"
+
+    except Exception as e:
+        return f"KEYBOARD ERROR: {e}"
+    
 def process_reveal(
     event,
     viewport,
@@ -725,7 +788,12 @@ def process_reveal(
         min_z >= Z_MIN
         and joint_conf >= JOINT_CONF_MIN
     )
-
+    keyboard_status = inject_decoded_direction(
+        arm=arm,
+        decoded_delta=decoded_delta,
+        min_z=min_z,
+        joint_conf=joint_conf
+    )
     delta_buf.append(time_error_ms)
 
     entropy, counts = sign_entropy(delta_buf)
@@ -810,7 +878,8 @@ def process_reveal(
     print(f"  Time error:       {time_error_ms:+d} ms")
     print(f"  Decoded delta:    {decoded_delta:+.2f} USD")
     print(f"  Bit recovery:     {exact_bits}/{N_SLOTS}")
-
+    print(f"  Direction:        {'HIGHER' if decoded_delta > 0 else 'LOWER' if decoded_delta < 0 else 'NEUTRAL'}")
+    print(f"  Keyboard:         {keyboard_status}")
     print("-" * 78)
 
     print(f"  Minimum |z|:      {min_z:.2f}")
@@ -1290,6 +1359,6 @@ if __name__ == "__main__":
 
     run_full_predictor_pipeline(
         exchange="binance",
-        delay_seconds=10.1,
+        delay_seconds=REVEAL_DELAY,
         max_cycles=None
     )
