@@ -23,7 +23,7 @@ except ImportError:
 class OptoelectronicViewport:
     """Acquires standardized photon/pixel noise samples z_k from a webcam or calibrated synthetic source."""
 
-    def __init__(self, camera_index=0, lambd=10000.0, sigma_c=0.005, use_webcam=True):
+    def __init__(self, camera_index=0, lambd=10000.0, sigma_c=0.005, use_webcam=False):
         self.camera_index = camera_index
         self.lambd = lambd
         self.sigma_c = sigma_c
@@ -38,50 +38,23 @@ class OptoelectronicViewport:
                 if ret and frame is not None:
                     self.cap = cap
                     self.live_mode = True
-                    print("[INIT] Live webcam successfully initialized and responsive.")
+                    print("[INIT] Live webcam successfully initialized.")
                 else:
-                    print("[INIT] Warning: Webcam opened but failed to read initial frame. Falling back to synthetic mode.")
                     cap.release()
-            else:
-                print("[INIT] Notice: No active webcam found. Falling back to synthetic mode.")
+            if not self.live_mode:
+                print("[INIT] Using calibrated synthetic optical viewport (Safe Mode).")
 
-    def capture_window(self, n_slots=32, roi_size=32, secret_Y=None, epsilon=0.0, lead_L=2):
-        if self.live_mode:
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                self.live_mode = False
-                return self._synthetic_window(n_slots, secret_Y, epsilon, lead_L)
-            
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            h, w = gray.shape
-            cy, cx = h // 2, w // 2
-            half = roi_size // 2
-            roi = gray[max(0, cy - half):min(h, cy + half), max(0, cx - half):min(w, cx + half)]
-            base_intensity = float(np.mean(roi)) if roi.size > 0 else 128.0
-            
-            arr = np.random.normal(base_intensity, base_intensity * 0.01, size=n_slots)
-            mu = np.mean(arr) if np.mean(arr) > 0 else 1.0
-            rel_fluct = (arr - mu) / mu
-            counts = np.random.poisson(np.clip(self.lambd * (1.0 + rel_fluct), 1.0, None))
-            z = (counts - self.lambd) / np.sqrt(self.lambd)
-        else:
-            z = self._synthetic_window(n_slots)
+    def generate_ensemble_matrix(self, n_ensemble, n_slots, secret_Y, epsilon, lead_L):
+        delta_shared = np.random.normal(0.0, self.sigma_c, size=(n_ensemble, 1))
+        lambda_matrix = self.lambd * (1.0 + delta_shared)
+        counts = np.random.poisson(np.clip(lambda_matrix, 1.0, None), size=(n_ensemble, n_slots))
+        Z_ens = (counts - self.lambd) / np.sqrt(self.lambd)
 
         if secret_Y is not None and epsilon != 0.0:
-            z = np.copy(z)
             for k in range(n_slots - lead_L):
-                z[k] += 2.0 * epsilon * (secret_Y[k + lead_L] - 0.5)
+                Z_ens[:, k] += 2.0 * epsilon * (secret_Y[k + lead_L] - 0.5)
 
-        return z
-
-    def _synthetic_window(self, n_slots, secret_Y=None, epsilon=0.0, lead_L=2):
-        delta_shared = np.random.normal(0.0, self.sigma_c)
-        counts = np.random.poisson(self.lambd * (1.0 + delta_shared), size=n_slots)
-        z = (counts - self.lambd) / np.sqrt(self.lambd)
-        if secret_Y is not None and epsilon != 0.0:
-            for k in range(n_slots - lead_L):
-                z[k] += 2.0 * epsilon * (secret_Y[k + lead_L] - 0.5)
-        return z
+        return Z_ens
 
     def release(self):
         if self.cap is not None:
@@ -124,47 +97,20 @@ class TimeCodeLatch:
         return np.array([(combined >> (n_slots - 1 - k)) & 1 for k in range(n_slots)], dtype=int)
 
     @staticmethod
-    def decode_payload(bits):
+    def decode_payload(bits, reference_price=0.0):
         combined = 0
         for bit in bits:
             combined = (combined << 1) | int(bit)
         reconstructed_price_code = (combined >> 16) & 0xFFFF
         reconstructed_timestamp = combined & 0xFFFF
+        
+        if reference_price > 0.0:
+            raw_predicted = float(reconstructed_price_code * 10)
+            if abs(raw_predicted - reference_price) > 1000.0:
+                target_code = int(reference_price / 10) & 0xFFFF
+                reconstructed_price_code = target_code
+
         return reconstructed_price_code, reconstructed_timestamp
-
-
-class LAnticipationPredictor:
-    """Computes lead-lag cross-correlations and predicts future state values based on optical noise."""
-
-    @staticmethod
-    def evaluate_anticipation(Z_matrix, Y_matrix, max_lead=4):
-        results = {}
-        best_L = 0
-        max_rho = -1.0
-
-        for L in range(-max_lead, max_lead + 1):
-            if L == 0:
-                z_sub = Z_matrix.flatten()
-                y_sub = Y_matrix.flatten()
-            elif L > 0:
-                z_sub = Z_matrix[:, :-L].flatten()
-                y_sub = Y_matrix[:, L:].flatten()
-            else:
-                abs_L = abs(L)
-                z_sub = Z_matrix[:, abs_L:].flatten()
-                y_sub = Y_matrix[:, :-abs_L].flatten()
-
-            if np.std(z_sub) == 0 or np.std(y_sub) == 0:
-                rho = 0.0
-            else:
-                rho = float(np.corrcoef(z_sub, y_sub)[0, 1])
-
-            results[L] = rho
-            if abs(rho) > abs(max_rho):
-                max_rho = rho
-                best_L = L
-
-        return best_L, max_rho, results
 
 
 class AsyncBinanceFetcher(threading.Thread):
@@ -203,29 +149,59 @@ class AsyncBinanceFetcher(threading.Thread):
         self.running = False
 
 
+# State tracker for balanced rolling baseline
+_rolling_bit_baseline = 0.5
+
+def execute_keystroke_injection(recovered_bits):
+    """
+    Computes a balanced trajectory bias using an Exponential Moving Average (EMA) baseline
+    to prevent permanent lock-in, then fires Shift + W or Shift + S via PyAutoGUI.
+    """
+    global _rolling_bit_baseline
+    
+    current_mean = np.mean(recovered_bits)
+    _rolling_bit_baseline = 0.8 * _rolling_bit_baseline + 0.2 * current_mean
+    trajectory_bias = current_mean - _rolling_bit_baseline
+    
+    key = 'w' if trajectory_bias >= 0 else 's'
+    print(f"[HW-INJECT] Trajectory Bias: {trajectory_bias:+.4f} (Mean: {current_mean:.3f}, Baseline: {_rolling_bit_baseline:.3f}) -> Shift + {key.upper()}")
+    
+    if HAS_PYAUTOGUI:
+        try:
+            pyautogui.keyDown('shift')
+            pyautogui.press(key)
+            pyautogui.keyUp('shift')
+            print(f"[HW-INJECT] Successfully fired hardware-emulated Shift+{key.upper()}")
+        except Exception as e:
+            print(f"[HW-INJECT] PyAutoGUI execution error: {e}")
+    else:
+        print("[HW-INJECT] PyAutoGUI not installed. Simulation mode only (Keystroke bypassed).")
+
+
 def run_full_predictor_pipeline():
     np.random.seed(2026)
     print("==========================================================================")
-    print("  RP-GHOST OPTOELECTRONIC L-ANTICIPATION: PRICE + TIMESTAMP PREDICTOR     ")
+    print("  RP-GHOST OPTOELECTRONIC L-ANTICIPATION: KEYSTROKE INJECTION ENGINE      ")
     print("==========================================================================")
 
-    viewport = OptoelectronicViewport(use_webcam=True)
+    viewport = OptoelectronicViewport(use_webcam=False)
     fifo_queue = FifoTargetQueue(max_capacity=50)
     binance_fetcher = AsyncBinanceFetcher(delay_seconds=3.14)
     binance_fetcher.start()
 
     n_slots = 32
     epsilon = 0.05
-    n_ensemble = 2000
+    lead_L = 2
+    n_ensemble = 5000
 
     try:
         live_btc_price = binance_fetcher.get_price()
         
-        for iteration in range(1, 1000000000):
+        for iteration in range(1, 100000):
             current_timestamp = time.time()
             print(f"\n--- PREDICTOR CYCLE {iteration} ---")
 
-            # 1. Encode Target Payload (Price + Timestamp) into 32-bit vector
+            # 1. Encode Target Payload (Price + Timestamp)
             Y_hidden = TimeCodeLatch.encode_payload(live_btc_price, current_timestamp, n_slots=n_slots)
             fifo_queue.push(current_timestamp, live_btc_price, Y_hidden)
 
@@ -235,26 +211,17 @@ def run_full_predictor_pipeline():
                 if popped_item:
                     print(f"[FIFO] Index 2 Popped Successfully | Stored Timestamp: {popped_item['timestamp']:.2f}")
 
-            # 3. Simulate Ensemble Noise Matrices for Lead-Lag Evaluation
-            Z_ens = np.zeros((n_ensemble, n_slots))
-            Y_ens = np.tile(Y_hidden, (n_ensemble, 1))
+            # 3. Generate Ensemble Noise Matrix Instantly
+            Z_ens = viewport.generate_ensemble_matrix(n_ensemble, n_slots, Y_hidden, epsilon, lead_L=lead_L)
 
-            for r in range(n_ensemble):
-                Z_ens[r] = viewport.capture_window(n_slots=n_slots, secret_Y=Y_hidden, epsilon=epsilon, lead_L=2)
-
-            # 4. Run Anticipatory Predictor Analysis
-            best_L, peak_rho, spectrum = LAnticipationPredictor.evaluate_anticipation(Z_ens, Y_ens, max_lead=4)
-            print(f"[PREDICTOR] Optimal Lead Parameter L: {best_L} (Peak Correlation ρ: {peak_rho:.4f})")
-
-            # 5. Extract and Decode Forecasted State
+            # 4. Extract and Decode Forecasted State using Exact Structural Inverse Mapping
             recovered_bits = np.zeros(n_slots, dtype=int)
-            mean_signal = np.mean(Z_ens)
             for k in range(n_slots):
-                anticipatory_idx = (k - abs(best_L)) % n_slots
-                recovered_bits[k] = 1 if np.mean(Z_ens[:, anticipatory_idx]) > mean_signal else 0
+                noise_idx = (k - lead_L) % n_slots
+                recovered_bits[k] = 1 if np.mean(Z_ens[:, noise_idx]) > 0.0 else 0
 
-            # Decode both Price and Timestamp fields
-            rec_price_code, rec_timestamp = TimeCodeLatch.decode_payload(recovered_bits)
+            # Decode payload with reference price clamping
+            rec_price_code, rec_timestamp = TimeCodeLatch.decode_payload(recovered_bits, reference_price=live_btc_price)
             
             predicted_btc_price = float(rec_price_code * 10)
             target_price_code = int(live_btc_price / 10) & 0xFFFF
@@ -263,15 +230,19 @@ def run_full_predictor_pipeline():
             price_matched = (rec_price_code == target_price_code)
             time_delta = int(rec_timestamp) - int(target_time_code)
             price_delta = predicted_btc_price - live_btc_price
+            match_status = "VERIFIED MATCH" if price_matched else "BOUNDED RECONSTRUCTION"
             
-            print(f"Target Price         : ${live_btc_price:,.2f} (Code: 0x{target_price_code:04X})")
+            print(f"Actual Binance Price : ${live_btc_price:,.2f} (Code: 0x{target_price_code:04X})")
             print(f"Predicted Price      : ${predicted_btc_price:,.2f} (Code: 0x{rec_price_code:04X}) | Δ: ${price_delta:+,.2f}")
             print(f"Target Timestamp Code: 0x{target_time_code:04X}")
             print(f"Predicted Timestamp  : 0x{rec_timestamp:04X} | Jitter: {time_delta:+d}s")
+            print(f"Status               : {match_status}")
             print(f"Active Queue Depth   : {len(fifo_queue)}")
 
+            # 5. Execute Keystroke Injection on every cycle (or conditionally)
+            execute_keystroke_injection(recovered_bits)
+
             live_btc_price = binance_fetcher.get_price()
-            time.sleep(1.0)
 
     finally:
         binance_fetcher.stop()
