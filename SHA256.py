@@ -16,7 +16,7 @@ SIGMA_C = 0.005
 N_SLOTS = 32
 
 # Adjust difficulty iterations to guarantee a distinct time gap (e.g., ~15-50ms)
-POW_DIFFICULTY_ITERATIONS = 50000
+POW_DIFFICULTY_ITERATIONS = 5000000
 
 
 # ============================================================================
@@ -127,8 +127,9 @@ class PipelinedBlockProcessor(threading.Thread):
                 nonce += 1
                 header = f"{mock_height}:{nonce}:{start_ns}"
                 test = hashlib.sha256(header.encode()).hexdigest()
-                if test.startswith("000"):
+                if test.startswith("000000"):
                     block_hash = test
+                    break
             # ================================================================
             # 3. END OF MINING CYCLE: ENCODE COMPLETION TIMESTAMP
             # ================================================================
@@ -155,7 +156,6 @@ class PipelinedBlockProcessor(threading.Thread):
             }
 
             self.output_queue.put(result)
-            time.sleep(1.0)  # Next block template delay
 
     def stop(self):
         self.running = False
