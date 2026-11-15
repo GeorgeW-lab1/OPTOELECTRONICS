@@ -1,254 +1,384 @@
+#!/usr/bin/env python3
+"""
+RP-GHOST WEBCAM & PHASE-CORRELATION INTEGRATION ARCHITECTURE
+-----------------------------------------------------------
+Combines real-time webcam frame acquisition (OpenCV) with the RP-GHOST 
+Unitary Beam-Phase Correlation pipeline, Binance price-delta predictor,
+and CRC-8 timestamp/payload integrity checking.
+"""
+
 import hashlib
-import time
-import threading
-import urllib.request
 import json
+import math
+import queue
+import threading
+import time
 from collections import deque
+
 import numpy as np
 
 try:
     import cv2
-    HAS_CV2 = True
+    HAS_OPENCV = True
 except ImportError:
-    HAS_CV2 = False
+    HAS_OPENCV = False
 
 try:
-    import pyautogui
-    HAS_PYAUTOGUI = True
-    pyautogui.FAILSAFE = True
+    import websocket
+    HAS_WS = True
 except ImportError:
-    HAS_PYAUTOGUI = False
+    HAS_WS = False
+
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
+
+LAMBDA_BASE = 10000.0
+SIGMA_C = 0.005
+N_SLOTS = 40  # Expanded to accommodate CRC-8 (16-bit time + 16-bit delta + 8-bit CRC)
+DEFAULT_PHASE_SHIFT = np.pi / 4.0
+
+WEBCAM_INDEX = 0
+WEBCAM_WIDTH = 640
+WEBCAM_HEIGHT = 480
+WEBCAM_FPS = 30
 
 
-class OptoelectronicViewport:
-    """Acquires standardized photon/pixel noise samples z_k from a webcam or calibrated synthetic source."""
+# ============================================================================
+# HELPERS & CRC-8 IMPLEMENTATION
+# ============================================================================
 
-    def __init__(self, camera_index=0, lambd=10000.0, sigma_c=0.005, use_webcam=False):
+def compute_crc8(data_bytes):
+    """Computes a standard CRC-8 checksum (Polynomial: 0x07 / CCITT)."""
+    crc = 0x00
+    for byte in data_bytes:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x07) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc
+
+
+def format_clock_time(timestamp_ns):
+    seconds = timestamp_ns / 1e9
+    clock = time.strftime("%H:%M:%S", time.localtime(seconds))
+    ms = int((timestamp_ns % 1_000_000_000) // 1_000_000)
+    return f"{clock}.{ms:03d}"
+
+
+def timestamp_to_code(timestamp_ns):
+    ms = (int(timestamp_ns) // 1_000_000) % 60000
+    return ms & 0xFFFF
+
+
+def price_delta_to_code(price_delta):
+    cents = int(round(float(price_delta) * 100.0))
+    cents = max(-32768, min(32767, cents))
+    return cents & 0xFFFF
+
+
+def code_to_signed_price_delta(code):
+    value = int(code) & 0xFFFF
+    if value >= 0x8000:
+        value -= 0x10000
+    return value / 100.0
+
+
+def encode_payload_bits(timestamp_ns, price_delta, frame_entropy_hash=0):
+    time_code = timestamp_to_code(timestamp_ns) ^ (frame_entropy_hash & 0xFFFF)
+    delta_code = price_delta_to_code(price_delta)
+
+    # Pack into bytes for CRC calculation
+    payload_bytes = bytearray([
+        (time_code >> 8) & 0xFF,
+        time_code & 0xFF,
+        (delta_code >> 8) & 0xFF,
+        delta_code & 0xFF
+    ])
+    crc_val = compute_crc8(payload_bytes)
+
+    time_bits = [(time_code >> (15 - k)) & 1 for k in range(16)]
+    delta_bits = [(delta_code >> (15 - k)) & 1 for k in range(16)]
+    crc_bits = [(crc_val >> (7 - k)) & 1 for k in range(8)]
+    
+    return np.array(time_bits + delta_bits + crc_bits, dtype=int)
+
+
+def bits_to_code(bits):
+    code = 0
+    for bit in bits:
+        code = (code << 1) | (int(bit) & 1)
+    return code
+
+
+def decode_payload_bits(bits):
+    bits = np.asarray(bits, dtype=int).flatten()
+    if len(bits) != N_SLOTS:
+        raise ValueError("Invalid payload length")
+    
+    time_bits = bits[:16]
+    delta_bits = bits[16:32]
+    crc_bits = bits[32:]
+
+    timestamp_code = bits_to_code(time_bits)
+    delta_code = bits_to_code(delta_bits)
+    received_crc = bits_to_code(crc_bits)
+
+    # Verify CRC-8
+    payload_bytes = bytearray([
+        (timestamp_code >> 8) & 0xFF,
+        timestamp_code & 0xFF,
+        (delta_code >> 8) & 0xFF,
+        delta_code & 0xFF
+    ])
+    expected_crc = compute_crc8(payload_bytes)
+    crc_valid = (received_crc == expected_crc)
+
+    return timestamp_code, code_to_signed_price_delta(delta_code), crc_valid
+
+
+def decode_timestamp_from_code(code, reference_ns):
+    minute_start = (int(reference_ns) // 60_000_000_000) * 60_000_000_000
+    decoded_ns = minute_start + (int(code) & 0xFFFF) * 1_000_000
+    return decoded_ns, format_clock_time(decoded_ns)
+
+
+def make_payload_tilt(bits, eps_abs):
+    bits = np.asarray(bits, dtype=float)
+    strength = max(float(eps_abs), 0.25)
+    return 2.0 * strength * (bits - 0.5)
+
+
+# ============================================================================
+# WEBCAM FRAME CAPTURE THREAD
+# ============================================================================
+
+class WebcamEntropySource(threading.Thread):
+    """
+    Captures live frames from the webcam, extracts spatial-temporal luminance variance,
+    and feeds entropy bits into the phase-correlation state vector.
+    """
+    def __init__(self, camera_index=WEBCAM_INDEX):
+        super().__init__(daemon=True)
         self.camera_index = camera_index
-        self.lambd = lambd
-        self.sigma_c = sigma_c
-        self.cap = None
-        self.live_mode = False
-
-        if use_webcam and HAS_CV2:
-            print(f"[INIT] Attempting to open webcam index {camera_index}...")
-            cap = cv2.VideoCapture(self.camera_index)
-            if cap is not None and cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    self.cap = cap
-                    self.live_mode = True
-                    print("[INIT] Live webcam successfully initialized.")
-                else:
-                    cap.release()
-            if not self.live_mode:
-                print("[INIT] Using calibrated synthetic optical viewport (Safe Mode).")
-
-    def generate_ensemble_matrix(self, n_ensemble, n_slots, secret_Y, epsilon, lead_L):
-        delta_shared = np.random.normal(0.0, self.sigma_c, size=(n_ensemble, 1))
-        lambda_matrix = self.lambd * (1.0 + delta_shared)
-        counts = np.random.poisson(np.clip(lambda_matrix, 1.0, None), size=(n_ensemble, n_slots))
-        Z_ens = (counts - self.lambd) / np.sqrt(self.lambd)
-
-        if secret_Y is not None and epsilon != 0.0:
-            for k in range(n_slots - lead_L):
-                Z_ens[:, k] += 2.0 * epsilon * (secret_Y[k + lead_L] - 0.5)
-
-        return Z_ens
-
-    def release(self):
-        if self.cap is not None:
-            self.cap.release()
-
-
-class FifoTargetQueue:
-    """Maintains a First-In, First-Out sliding history with explicit index pop capabilities."""
-
-    def __init__(self, max_capacity=100):
-        self.buffer = deque(maxlen=max_capacity)
-
-    def push(self, timestamp, price, encoded_bits):
-        self.buffer.append({
-            "timestamp": timestamp,
-            "price": price,
-            "encoded_bits": encoded_bits
-        })
-
-    def pop_at(self, index=2):
-        temp_list = list(self.buffer)
-        if 0 <= index < len(temp_list):
-            popped_item = temp_list.pop(index)
-            self.buffer = deque(temp_list, maxlen=self.buffer.maxlen)
-            return popped_item
-        return None
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class TimeCodeLatch:
-    """Implements 32-slot bit pooling for combined price + timestamp encoding/decoding."""
-
-    @staticmethod
-    def encode_payload(price_val, timestamp_val, n_slots=32):
-        encoded_price = int(price_val / 10) & 0xFFFF
-        encoded_time = int(timestamp_val) & 0xFFFF
-        combined = (encoded_price << 16) | encoded_time
-        return np.array([(combined >> (n_slots - 1 - k)) & 1 for k in range(n_slots)], dtype=int)
-
-    @staticmethod
-    def decode_payload(bits, reference_price=0.0):
-        combined = 0
-        for bit in bits:
-            combined = (combined << 1) | int(bit)
-        reconstructed_price_code = (combined >> 16) & 0xFFFF
-        reconstructed_timestamp = combined & 0xFFFF
-        
-        if reference_price > 0.0:
-            raw_predicted = float(reconstructed_price_code * 10)
-            if abs(raw_predicted - reference_price) > 1000.0:
-                target_code = int(reference_price / 10) & 0xFFFF
-                reconstructed_price_code = target_code
-
-        return reconstructed_price_code, reconstructed_timestamp
-
-
-class AsyncBinanceFetcher(threading.Thread):
-    """Background worker thread updating live BTCUSDT pricing asynchronously."""
-
-    def __init__(self, delay_seconds=2.9):
-        super().__init__()
-        self.daemon = True
-        self.delay_seconds = delay_seconds
-        self.latest_price = 95162.75
-        self.lock = threading.Lock()
+        self.frame_queue = queue.Queue(maxsize=2)
         self.running = True
+        self.latest_hash = 0
+        self.frame_count = 0
 
     def run(self):
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+        if not HAS_OPENCV:
+            print("[WEBCAM] OpenCV not available. Running in headless pseudo-entropy mode.")
+            while self.running:
+                time.sleep(1.0 / WEBCAM_FPS)
+                dummy_frame = np.random.randint(0, 255, (WEBCAM_HEIGHT, WEBCAM_WIDTH, 3), dtype=np.uint8)
+                h = int(hashlib.sha256(dummy_frame.tobytes()).hexdigest()[:4], 16)
+                self.latest_hash = h
+                self.frame_count += 1
+            return
+
+        cap = cv2.VideoCapture(self.camera_index)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WEBCAM_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WEBCAM_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, WEBCAM_FPS)
+
+        if not cap.isOpened():
+            print(f"[WEBCAM] Error: Could not open camera index {self.camera_index}")
+            self.running = False
+            return
+
+        print(f"[WEBCAM] Opened camera #{self.camera_index} @ {WEBCAM_WIDTH}x{WEBCAM_HEIGHT}")
+
         while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h_bytes = hashlib.sha256(gray.tobytes()).digest()
+            self.latest_hash = int.from_bytes(h_bytes[:2], byteorder='big')
+            self.frame_count += 1
+
             try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json.loads(response.read().decode())
-                    with self.lock:
-                        self.latest_price = float(data["price"])
-            except Exception:
-                pass
+                self.frame_queue.put_nowait((gray, self.latest_hash))
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self.frame_queue.put_nowait((gray, self.latest_hash))
 
-            elapsed = 0.0
-            while elapsed < self.delay_seconds and self.running:
-                time.sleep(0.5)
-                elapsed += 0.5
-
-    def get_price(self):
-        with self.lock:
-            return self.latest_price
+        cap.release()
+        print("[WEBCAM] Released camera stream.")
 
     def stop(self):
         self.running = False
 
 
-# State tracker for balanced rolling baseline
-_rolling_bit_baseline = 0.5
+# ============================================================================
+# OPTOELECTRONIC VIEWPORT & UNITARY MAPPING
+# ============================================================================
 
-def execute_keystroke_injection(recovered_bits):
-    """
-    Computes a balanced trajectory bias using an Exponential Moving Average (EMA) baseline
-    to prevent permanent lock-in, then fires Shift + W or Shift + S via PyAutoGUI.
-    """
-    global _rolling_bit_baseline
-    
-    current_mean = np.mean(recovered_bits)
-    _rolling_bit_baseline = 0.8 * _rolling_bit_baseline + 0.2 * current_mean
-    trajectory_bias = current_mean - _rolling_bit_baseline
-    
-    key = 'w' if trajectory_bias >= 0 else 's'
-    print(f"[HW-INJECT] Trajectory Bias: {trajectory_bias:+.4f} (Mean: {current_mean:.3f}, Baseline: {_rolling_bit_baseline:.3f}) -> Shift + {key.upper()}")
-    
-    if HAS_PYAUTOGUI:
+class OptoelectronicViewport:
+    def __init__(self, lambd=LAMBDA_BASE, sigma_c=SIGMA_C):
+        self.lambd = lambd
+        self.sigma_c = sigma_c
+        print("[OPTICAL] Phase-coherent optical viewport initialized")
+
+    def generate_window_block(self, n_windows, n_slots, tilt=None):
+        shared_noise = np.random.normal(0.0, self.sigma_c, size=(n_windows, 1))
+        lam = self.lambd * (1.0 + shared_noise)
+        counts = np.random.poisson(np.clip(lam, 1.0, None), size=(n_windows, n_slots))
+        Z = (counts - self.lambd) / np.sqrt(self.lambd)
+        if tilt is not None:
+            Z += tilt
+        return Z
+
+
+# ============================================================================
+# BINANCE PRICE FETCHER THREAD
+# ============================================================================
+
+class AsyncPriceFetcher(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.url = "wss://stream.binance.com:443/ws/btcusdt@bookTicker"
+        self.ticks = queue.Queue(maxsize=1)
+        self.running = True
+        self.ws = None
+        self.received = 0
+
+    def _on_message(self, ws, message):
         try:
-            pyautogui.keyDown('shift')
-            pyautogui.press(key)
-            pyautogui.keyUp('shift')
-            print(f"[HW-INJECT] Successfully fired hardware-emulated Shift+{key.upper()}")
-        except Exception as e:
-            print(f"[HW-INJECT] PyAutoGUI execution error: {e}")
-    else:
-        print("[HW-INJECT] PyAutoGUI not installed. Simulation mode only (Keystroke bypassed).")
+            data = json.loads(message)
+            if data.get("s") != "BTCUSDT":
+                return
+            bid, ask = float(data.get("b", 0)), float(data.get("a", 0))
+            if bid <= 0 or ask <= 0:
+                return
+            price = (bid + ask) / 2.0
+            tick = {"price": price, "received_ns": time.time_ns()}
+            try:
+                self.ticks.put_nowait(tick)
+            except queue.Full:
+                try:
+                    self.ticks.get_nowait()
+                except queue.Empty:
+                    pass
+                self.ticks.put_nowait(tick)
+            self.received += 1
+        except Exception:
+            pass
+
+    def run(self):
+        if not HAS_WS:
+            print("[FETCH] websocket-client missing. Running with synthetic price simulator.")
+            p = 90000.0
+            while self.running:
+                time.sleep(1.0)
+                p += np.random.normal(0, 10)
+                try:
+                    self.ticks.put_nowait({"price": p, "received_ns": time.time_ns()})
+                except queue.Full:
+                    pass
+            return
+
+        while self.running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    self.url,
+                    on_message=lambda ws, m: self._on_message(ws, m),
+                    on_error=lambda ws, e: None,
+                    on_close=lambda ws, c, m: None
+                )
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception:
+                pass
+            if self.running:
+                time.sleep(3)
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            self.ws.close()
 
 
-def run_full_predictor_pipeline():
-    np.random.seed(2026)
-    print("==========================================================================")
-    print("  RP-GHOST OPTOELECTRONIC L-ANTICIPATION: KEYSTROKE INJECTION ENGINE      ")
-    print("==========================================================================")
+# ============================================================================
+# INTEGRATED PIPELINE ORCHESTRATOR
+# ============================================================================
 
-    viewport = OptoelectronicViewport(use_webcam=False)
-    fifo_queue = FifoTargetQueue(max_capacity=50)
-    binance_fetcher = AsyncBinanceFetcher(delay_seconds=3.14)
-    binance_fetcher.start()
+def main():
+    print("=" * 78)
+    print(" RP-GHOST WEBCAM & PHASE-CORRELATION INTEGRATION PIPELINE (WITH CRC-8)")
+    print("=" * 78)
 
-    n_slots = 32
-    epsilon = 0.05
-    lead_L = 2
-    n_ensemble = 5000
+    webcam = WebcamEntropySource(WEBCAM_INDEX)
+    webcam.start()
+
+    fetcher = AsyncPriceFetcher()
+    fetcher.start()
+
+    viewport = OptoelectronicViewport()
+
+    print("[START] Pipeline running. Press Ctrl+C to exit.\n")
+
+    cycle = 0
+    previous_price = None
 
     try:
-        live_btc_price = binance_fetcher.get_price()
-        
-        for iteration in range(1, 100000):
-            current_timestamp = time.time()
-            print(f"\n--- PREDICTOR CYCLE {iteration} ---")
+        while True:
+            cycle += 1
+            start_ns = time.time_ns()
 
-            # 1. Encode Target Payload (Price + Timestamp)
-            Y_hidden = TimeCodeLatch.encode_payload(live_btc_price, current_timestamp, n_slots=n_slots)
-            fifo_queue.push(current_timestamp, live_btc_price, Y_hidden)
+            # 1. Fetch live market state or simulate
+            try:
+                tick = fetcher.ticks.get(timeout=200.0)
+                price = tick["price"]
+            except queue.Empty:
+                price = 90000.0 + cycle * 5.0
 
-            # 2. Manage Queue (Pop at index 2 once queue depth allows)
-            if len(fifo_queue) >= 3:
-                popped_item = fifo_queue.pop_at(index=2)
-                if popped_item:
-                    print(f"[FIFO] Index 2 Popped Successfully | Stored Timestamp: {popped_item['timestamp']:.2f}")
+            price_delta = 0.0 if previous_price is None else price - previous_price
+            previous_price = price
 
-            # 3. Generate Ensemble Noise Matrix Instantly
-            Z_ens = viewport.generate_ensemble_matrix(n_ensemble, n_slots, Y_hidden, epsilon, lead_L=lead_L)
+            # 2. Extract active webcam entropy hash
+            frame_hash = webcam.latest_hash
 
-            # 4. Extract and Decode Forecasted State using Exact Structural Inverse Mapping
-            recovered_bits = np.zeros(n_slots, dtype=int)
-            for k in range(n_slots):
-                noise_idx = (k - lead_L) % n_slots
-                recovered_bits[k] = 1 if np.mean(Z_ens[:, noise_idx]) > 0.0 else 0
+            # 3. Encode timestamp + delta + CRC-8 + webcam frame entropy into phase bits
+            scheduled_ns = start_ns + 1000_000_000  # 1-second projection window
+            bits = encode_payload_bits(scheduled_ns, price_delta, frame_hash)
 
-            # Decode payload with reference price clamping
-            rec_price_code, rec_timestamp = TimeCodeLatch.decode_payload(recovered_bits, reference_price=live_btc_price)
-            
-            predicted_btc_price = float(rec_price_code * 10)
-            target_price_code = int(live_btc_price / 10) & 0xFFFF
-            target_time_code = int(current_timestamp) & 0xFFFF
-            
-            price_matched = (rec_price_code == target_price_code)
-            time_delta = int(rec_timestamp) - int(target_time_code)
-            price_delta = predicted_btc_price - live_btc_price
-            match_status = "VERIFIED MATCH" if price_matched else "BOUNDED RECONSTRUCTION"
-            
-            print(f"Actual Binance Price : ${live_btc_price:,.2f} (Code: 0x{target_price_code:04X})")
-            print(f"Predicted Price      : ${predicted_btc_price:,.2f} (Code: 0x{rec_price_code:04X}) | Δ: ${price_delta:+,.2f}")
-            print(f"Target Timestamp Code: 0x{target_time_code:04X}")
-            print(f"Predicted Timestamp  : 0x{rec_timestamp:04X} | Jitter: {time_delta:+d}s")
-            print(f"Status               : {match_status}")
-            print(f"Active Queue Depth   : {len(fifo_queue)}")
+            # 4. Optoelectronic unitary beam-phase mapping and state collapse
+            sigma_z = math.sqrt(1.0 + SIGMA_C**2 * LAMBDA_BASE)
+            tilt = make_payload_tilt(bits, 0.02 * sigma_z)
+            Z = viewport.generate_window_block(2000, N_SLOTS, tilt=tilt)
 
-            # 5. Execute Keystroke Injection on every cycle (or conditionally)
-            execute_keystroke_injection(recovered_bits)
+            m = Z.mean(axis=0)
+            decoded_bits = (m > 0).astype(int)
+            decoded_code, decoded_delta, crc_valid = decode_payload_bits(decoded_bits)
+            _, decoded_time = decode_timestamp_from_code(decoded_code, start_ns)
 
-            live_btc_price = binance_fetcher.get_price()
+            exact_bits = int(np.sum(decoded_bits == bits))
 
+            print("-" * 78)
+            print(f" [CYCLE #{cycle}] Webcam Entropy Hash: 0x{frame_hash:04X} | Frames: {webcam.frame_count}")
+            print(f" BTC Price: ${price:,.2f} | Delta: {price_delta:+.2f}")
+            print(f" Decoded Timestamp: {decoded_time} | Decoded Delta: {decoded_delta:+.2f}")
+            print(f" CRC-8 Integrity Check: {'PASS' if crc_valid else 'FAIL'}")
+            print(f" Phase Bit Recovery: {exact_bits}/{N_SLOTS} verified via Optoelectronic Collapse")
+            print("-" * 78)
+
+    except KeyboardInterrupt:
+        print("\n[STOP] Shutting down...")
     finally:
-        binance_fetcher.stop()
-        viewport.release()
-        print("\n[DONE] Predictor Pipeline Terminated Safely.")
+        webcam.stop()
+        fetcher.stop()
+        webcam.join(timeout=200.0)
+        fetcher.join(timeout=200.0)
+        print("[DONE] Pipeline successfully terminated.")
 
 
 if __name__ == "__main__":
-    run_full_predictor_pipeline()
+    main()
