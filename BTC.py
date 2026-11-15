@@ -4,7 +4,7 @@ RP-GHOST WEBCAM & PHASE-CORRELATION INTEGRATION ARCHITECTURE
 -----------------------------------------------------------
 Combines real-time webcam frame acquisition (OpenCV) with the RP-GHOST 
 Unitary Beam-Phase Correlation pipeline, Binance price-delta predictor,
-and CRC-8 timestamp/payload integrity checking.
+CRC-8 integrity checking, and live current/decoded timestamp logging.
 """
 
 import hashlib
@@ -35,7 +35,7 @@ except ImportError:
 
 LAMBDA_BASE = 10000.0
 SIGMA_C = 0.005
-N_SLOTS = 40  # Expanded to accommodate CRC-8 (16-bit time + 16-bit delta + 8-bit CRC)
+N_SLOTS = 40  # 16-bit time + 16-bit delta + 8-bit CRC-8
 DEFAULT_PHASE_SHIFT = np.pi / 4.0
 
 WEBCAM_INDEX = 0
@@ -90,7 +90,6 @@ def encode_payload_bits(timestamp_ns, price_delta, frame_entropy_hash=0):
     time_code = timestamp_to_code(timestamp_ns) ^ (frame_entropy_hash & 0xFFFF)
     delta_code = price_delta_to_code(price_delta)
 
-    # Pack into bytes for CRC calculation
     payload_bytes = bytearray([
         (time_code >> 8) & 0xFF,
         time_code & 0xFF,
@@ -126,7 +125,6 @@ def decode_payload_bits(bits):
     delta_code = bits_to_code(delta_bits)
     received_crc = bits_to_code(crc_bits)
 
-    # Verify CRC-8
     payload_bytes = bytearray([
         (timestamp_code >> 8) & 0xFF,
         timestamp_code & 0xFF,
@@ -156,10 +154,6 @@ def make_payload_tilt(bits, eps_abs):
 # ============================================================================
 
 class WebcamEntropySource(threading.Thread):
-    """
-    Captures live frames from the webcam, extracts spatial-temporal luminance variance,
-    and feeds entropy bits into the phase-correlation state vector.
-    """
     def __init__(self, camera_index=WEBCAM_INDEX):
         super().__init__(daemon=True)
         self.camera_index = camera_index
@@ -332,6 +326,7 @@ def main():
         while True:
             cycle += 1
             start_ns = time.time_ns()
+            current_time_str = format_clock_time(start_ns)
 
             # 1. Fetch live market state or simulate
             try:
@@ -365,10 +360,11 @@ def main():
             print("-" * 78)
             print(f" [CYCLE #{cycle}] Webcam Entropy Hash: 0x{frame_hash:04X} | Frames: {webcam.frame_count}")
             print(f" BTC Price: ${price:,.2f} | Delta: {price_delta:+.2f}")
-            print(f" Decoded Timestamp: {decoded_time} | Decoded Delta: {decoded_delta:+.2f}")
+            print(f" Current Timestamp: {current_time_str} | Decoded Timestamp: {decoded_time}")
             print(f" CRC-8 Integrity Check: {'PASS' if crc_valid else 'FAIL'}")
             print(f" Phase Bit Recovery: {exact_bits}/{N_SLOTS} verified via Optoelectronic Collapse")
             print("-" * 78)
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
         print("\n[STOP] Shutting down...")
