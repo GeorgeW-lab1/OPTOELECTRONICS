@@ -1100,8 +1100,9 @@ def run_full_predictor_pipeline(
                         price_delta
                     )
 
-                    print()
                     """
+                    print()
+
                     print(
                         f"[COMMIT] {arm} | "
                         f"BTC=${price:,.2f} | "
