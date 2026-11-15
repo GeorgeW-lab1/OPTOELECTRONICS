@@ -1,21 +1,11 @@
-"""
-RP-GHOST commit-reveal timestamp and price-delta decoder.
-
-The 32-slot payload contains a 16-bit millisecond-within-minute
-timestamp and a signed 16-bit price delta in cents.
-
-Live BTC prices are sourced from the selected exchange WebSocket.
-The optical channel is a simulated decoder channel; post-reveal encoding
-validates decoding and is not evidence of predicting future prices.
-No keyboard injection is performed.
-"""
 
 import hashlib
+import heapq
 import json
 import math
-import socket
 import threading
 import time
+import queue
 from collections import deque
 
 import numpy as np
@@ -32,35 +22,52 @@ try:
 except ImportError:
     HAS_WS = False
 
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# ----------------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------------
 LAMBDA = 10000.0
 SIGMA_C = 0.005
+
 N_SLOTS = 32
 FIELD_BITS = 16
 PRICE_DELTA_SCALE = 100.0
+
+REVEAL_DELAY = 10.1
+SAMPLE_INTERVAL = 1.0
+
+N_WINDOWS = 2000
+N_PERMS = 100
+REPORT_EVERY = 25
+
 LEADS = (0, 1, 2, 3, 4)
-LEAK_LEAD = 0
-DECODE_LEAD = 0
+
 N_SIGMA = 5.0
 MIN_CYCLES = 40
 ROLL_CYCLES = 400
 
 Z_MIN = 4.0
 JOINT_CONF_MIN = 0.999
+
 DELTA_BUF_LEN = 64
 MIN_BUF = 64
 ENTROPY_MAX_BITS = 0.25
 STREAK = 5
 MIN_ABS_DELTA = 2.0
+
+EXCHANGE = "binance"
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def format_clock_time(timestamp_ns):
+    seconds = timestamp_ns / 1e9
+    clock = time.strftime("%H:%M:%S", time.localtime(seconds))
+    ms = int((timestamp_ns % 1_000_000_000) // 1_000_000)
+    return f"{clock}.{ms:03d}"
 
 
 def noise_stats(lambd, sigma_c):
@@ -69,17 +76,20 @@ def noise_stats(lambd, sigma_c):
     return var_z, math.sqrt(var_z), shared / var_z
 
 
-def _phi(z):
+def phi(z):
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
-def sign_entropy(deltas):
-    n = len(deltas)
+def sign_entropy(values):
+    n = len(values)
+
+    if not n:
+        return 0.0, (0, 0, 0)
 
     counts = (
-        sum(d > 0 for d in deltas),
-        sum(d < 0 for d in deltas),
-        sum(d == 0 for d in deltas),
+        sum(x > 0 for x in values),
+        sum(x < 0 for x in values),
+        sum(x == 0 for x in values),
     )
 
     h = 0.0
@@ -92,236 +102,382 @@ def sign_entropy(deltas):
     return h, counts
 
 
-# ----------------------------------------------------------------------------
-# Timestamp encoding and decoding
-# ----------------------------------------------------------------------------
+# ============================================================================
+# 32-BIT PAYLOAD
+# ============================================================================
+
 def timestamp_to_code(timestamp_ns):
-    """Encode milliseconds within the current minute as a 16-bit code."""
-    milliseconds_within_minute = (
-        int(timestamp_ns) // 1_000_000
-    ) % 60_000
-
-    return milliseconds_within_minute & 0xFFFF
-
-
-def encode_timestamp_bits(timestamp_ns, n_slots=FIELD_BITS):
-    """Encode the timestamp field as 16 MSB-first bits."""
-    code = timestamp_to_code(timestamp_ns)
-    return np.array(
-        [(code >> (n_slots - 1 - k)) & 1 for k in range(n_slots)],
-        dtype=int,
-    )
+    ms = (int(timestamp_ns) // 1_000_000) % 60000
+    return ms & 0xFFFF
 
 
 def price_delta_to_code(price_delta):
-    """Encode a USD price delta as signed 16-bit cents (two's complement)."""
-    cents = int(round(float(price_delta) * PRICE_DELTA_SCALE))
+    cents = int(round(float(price_delta) * 100.0))
     cents = max(-32768, min(32767, cents))
     return cents & 0xFFFF
 
 
 def code_to_signed_price_delta(code):
-    """Decode signed 16-bit cents into a USD price delta."""
     value = int(code) & 0xFFFF
+
     if value >= 0x8000:
         value -= 0x10000
-    return value / PRICE_DELTA_SCALE
+
+    return value / 100.0
 
 
 def encode_payload_bits(timestamp_ns, price_delta):
-    """Pack timestamp (16 bits) followed by signed price delta (16 bits)."""
-    time_bits = encode_timestamp_bits(timestamp_ns)
+    time_code = timestamp_to_code(timestamp_ns)
     delta_code = price_delta_to_code(price_delta)
-    delta_bits = np.array(
-        [(delta_code >> (15 - k)) & 1 for k in range(FIELD_BITS)],
-        dtype=int,
-    )
-    return np.concatenate((time_bits, delta_bits))
+
+    time_bits = [
+        (time_code >> (15 - k)) & 1
+        for k in range(16)
+    ]
+
+    delta_bits = [
+        (delta_code >> (15 - k)) & 1
+        for k in range(16)
+    ]
+
+    return np.array(time_bits + delta_bits, dtype=int)
 
 
 def bits_to_code(bits):
-    """Decode MSB-first bits into an unsigned integer."""
     code = 0
-    for bit in np.asarray(bits, dtype=int).flatten():
+
+    for bit in bits:
         code = (code << 1) | (int(bit) & 1)
+
     return code
 
 
 def decode_payload_bits(bits):
     bits = np.asarray(bits, dtype=int).flatten()
+
     if len(bits) != N_SLOTS:
-        raise ValueError(f"Expected {N_SLOTS} bits, received {len(bits)}")
-    timestamp_code = bits_to_code(bits[:FIELD_BITS])
-    delta_code = bits_to_code(bits[FIELD_BITS:])
-    return timestamp_code, code_to_signed_price_delta(delta_code)
+        raise ValueError("Invalid payload length")
 
+    timestamp_code = bits_to_code(bits[:16])
+    delta_code = bits_to_code(bits[16:])
 
-def make_payload_tilt(bits, eps_abs):
-    """Apply the same deterministic bit-channel tilt used by the test control."""
-    bits = np.asarray(bits, dtype=float).flatten()
-    if len(bits) != N_SLOTS:
-        raise ValueError(f"Expected {N_SLOTS} payload bits, received {len(bits)}")
-    # Stronger calibrated channel amplitude keeps the 32-bit demo
-    # decodable at the default finite sample count.
-    signal_strength = max(float(eps_abs), 0.25)
-    return 2.0 * signal_strength * (bits - 0.5)
-
-
-def format_clock_time(timestamp_ns):
-    """Format a nanosecond timestamp as HH:MM:SS.mmm."""
-    seconds = timestamp_ns / 1e9
-
-    clock = time.strftime(
-        "%H:%M:%S",
-        time.localtime(seconds),
+    return (
+        timestamp_code,
+        code_to_signed_price_delta(delta_code)
     )
-
-    milliseconds = int(
-        (timestamp_ns % 1_000_000_000) // 1_000_000
-    )
-
-    return f"{clock}.{milliseconds:03d}"
 
 
 def decode_timestamp_from_code(code, reference_ns):
-    """Reconstruct a readable clock time from a decoded 16-bit code.
-
-    The code represents milliseconds within the current minute.
-    The minute is inferred from the commitment-time reference timestamp.
-    """
-    code = int(code) & 0xFFFF
-
-    minute_start_ns = (
+    minute_start = (
         int(reference_ns) // 60_000_000_000
     ) * 60_000_000_000
 
-    decoded_ns = (
-        minute_start_ns
-        + code * 1_000_000
-    )
+    decoded_ns = minute_start + (int(code) & 0xFFFF) * 1_000_000
 
     return decoded_ns, format_clock_time(decoded_ns)
 
 
-# ----------------------------------------------------------------------------
-# Optical viewport
-# ----------------------------------------------------------------------------
+def make_payload_tilt(bits, eps_abs):
+    bits = np.asarray(bits, dtype=float)
+
+    strength = max(float(eps_abs), 0.25)
+
+    return 2.0 * strength * (bits - 0.5)
+
+
+# ============================================================================
+# OPTICAL CHANNEL
+# ============================================================================
+
 class OptoelectronicViewport:
-    def __init__(
-        self,
-        lambd=LAMBDA,
-        sigma_c=SIGMA_C,
-        camera_index=0,
-        use_webcam=False,
-    ):
+
+    def __init__(self, lambd=LAMBDA, sigma_c=SIGMA_C):
         self.lambd = lambd
         self.sigma_c = sigma_c
-        self.cap = None
 
-        if use_webcam and HAS_CV2:
-            cap = cv2.VideoCapture(camera_index)
+        print("[OPTICAL] Synthetic photon-counting channel initialized")
 
-            if cap is not None and cap.isOpened():
-                self.cap = cap
-                print(
-                    "[INIT] Webcam opened, but noise remains "
-                    "synthetic; frames are not read."
-                )
+    def generate_window_block(self, n_windows, n_slots, tilt=None):
 
-        if self.cap is None:
-            print(
-                "[INIT] Using calibrated synthetic "
-                "optical viewport."
-            )
-
-    def generate_window_block(
-        self,
-        n_windows,
-        n_slots,
-        tilt=None,
-    ):
-        delta = np.random.normal(
+        shared_noise = np.random.normal(
             0.0,
             self.sigma_c,
-            size=(n_windows, 1),
+            size=(n_windows, 1)
         )
 
-        lam = self.lambd * (1.0 + delta)
+        lam = self.lambd * (1.0 + shared_noise)
 
         counts = np.random.poisson(
             np.clip(lam, 1.0, None),
-            size=(n_windows, n_slots),
+            size=(n_windows, n_slots)
         )
 
-        Z = (counts - self.lambd) / np.sqrt(self.lambd)
+        Z = (
+            counts - self.lambd
+        ) / np.sqrt(self.lambd)
 
         if tilt is not None:
             Z += tilt
 
         return Z
 
-    def release(self):
-        if self.cap is not None:
-            self.cap.release()
 
+# ============================================================================
+# ASYNCHRONOUS LIVE PRICE FETCHER
+# ============================================================================
 
-# ----------------------------------------------------------------------------
-# FIFO queue
-# ----------------------------------------------------------------------------
-class FifoTargetQueue:
-    def __init__(self, max_capacity=100):
-        self.buffer = deque(maxlen=max_capacity)
+def parse_binance(d):
 
-    def push(self, timestamp, price, encoded_bits):
-        self.buffer.append(
-            {
-                "timestamp": timestamp,
-                "price": price,
-                "encoded_bits": encoded_bits,
-            }
-        )
-
-    def pop_at(self, index=2):
-        temp_list = list(self.buffer)
-
-        if 0 <= index < len(temp_list):
-            popped = temp_list.pop(index)
-
-            self.buffer = deque(
-                temp_list,
-                maxlen=self.buffer.maxlen,
-            )
-
-            return popped
-
+    if d.get("s") != "BTCUSDT":
         return None
 
-    def __len__(self):
-        return len(self.buffer)
+    bid = d.get("b")
+    ask = d.get("a")
+
+    if bid is None or ask is None:
+        return None
+
+    bid = float(bid)
+    ask = float(ask)
+
+    if bid <= 0 or ask <= 0:
+        return None
+
+    return (bid + ask) / 2.0
 
 
-# ----------------------------------------------------------------------------
-# Lead-lag statistics
-# ----------------------------------------------------------------------------
+class AsyncPriceFetcher(threading.Thread):
+
+    def __init__(self, exchange="binance"):
+
+        super().__init__(daemon=True)
+
+        if exchange != "binance":
+            raise ValueError("This version uses Binance BTCUSDT")
+
+        self.url = (
+            "wss://stream.binance.com:443/ws/"
+            "btcusdt@bookTicker"
+        )
+
+        self.ticks = queue.Queue(maxsize=1)
+
+        self.running = True
+        self.ws = None
+
+        self.received = 0
+        self.last_message_ns = 0
+
+    def _on_open(self, ws):
+        print("[FETCH] Binance WebSocket connected")
+        print("[FETCH] BTCUSDT bookTicker active")
+
+    def _on_message(self, ws, message):
+
+        try:
+            data = _loads(message)
+            price = parse_binance(data)
+
+            if price is None:
+                return
+
+            received_ns = time.time_ns()
+            received_perf_ns = time.perf_counter_ns()
+
+            tick = {
+                "price": price,
+                "received_ns": received_ns,
+                "received_perf_ns": received_perf_ns,
+            }
+
+            # Keep only the newest exchange tick.
+            try:
+                self.ticks.put_nowait(tick)
+            except queue.Full:
+                try:
+                    self.ticks.get_nowait()
+                except queue.Empty:
+                    pass
+
+                self.ticks.put_nowait(tick)
+
+            self.received += 1
+            self.last_message_ns = received_ns
+
+        except Exception as e:
+            print(f"[FETCH] Parse error: {e}")
+
+    def _on_error(self, ws, error):
+        print(f"[FETCH] WebSocket error: {error}")
+
+    def _on_close(self, ws, code, message):
+        print(f"[FETCH] WebSocket closed: {code} {message}")
+
+    def run(self):
+
+        if not HAS_WS:
+            print("[FETCH] Install websocket-client")
+            return
+
+        while self.running:
+
+            try:
+
+                print(f"[FETCH] Connecting: {self.url}")
+
+                self.ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+
+                self.ws.run_forever(
+                    ping_interval=20,
+                    ping_timeout=10
+                )
+
+            except Exception as e:
+                print(f"[FETCH] Connection exception: {e}")
+
+            if self.running:
+                print("[FETCH] Reconnecting in 3 seconds")
+                time.sleep(3)
+
+    def stop(self):
+        self.running = False
+
+        if self.ws:
+            self.ws.close()
+
+
+# ============================================================================
+# ASYNCHRONOUS FORCED REVEAL SCHEDULER
+# ============================================================================
+
+class AsyncRevealScheduler(threading.Thread):
+
+    def __init__(self, output_queue):
+
+        super().__init__(daemon=True)
+
+        self.output_queue = output_queue
+
+        self.condition = threading.Condition()
+        self.pending = []
+
+        self.sequence = 0
+        self.running = True
+
+    def schedule(self, delay_seconds, callback):
+
+        due_perf_ns = (
+            time.perf_counter_ns()
+            + int(delay_seconds * 1e9)
+        )
+
+        due_wall_ns = (
+            time.time_ns()
+            + int(delay_seconds * 1e9)
+        )
+
+        with self.condition:
+
+            self.sequence += 1
+
+            heapq.heappush(
+                self.pending,
+                (
+                    due_perf_ns,
+                    self.sequence,
+                    due_wall_ns,
+                    callback
+                )
+            )
+
+            self.condition.notify()
+
+        return due_wall_ns
+
+    def run(self):
+
+        while self.running:
+
+            item = None
+
+            with self.condition:
+
+                while self.running and not self.pending:
+                    self.condition.wait()
+
+                if not self.running:
+                    break
+
+                due_ns = self.pending[0][0]
+                remaining = (
+                    due_ns - time.perf_counter_ns()
+                ) / 1e9
+
+                if remaining > 0:
+                    self.condition.wait(timeout=remaining)
+                    continue
+
+                item = heapq.heappop(self.pending)
+
+            if item is None:
+                continue
+
+            due_perf_ns, sequence, due_wall_ns, callback = item
+
+            actual_perf_ns = time.perf_counter_ns()
+            actual_wall_ns = time.time_ns()
+
+            try:
+
+                result = callback(
+                    due_wall_ns,
+                    actual_wall_ns
+                )
+
+                result["scheduled_reveal_ns"] = due_wall_ns
+                result["actual_reveal_ns"] = actual_wall_ns
+                result["actual_reveal_perf_ns"] = actual_perf_ns
+
+                self.output_queue.put(result)
+
+            except Exception as e:
+                print(f"[REVEAL] Callback error: {e}")
+
+    def stop(self):
+
+        with self.condition:
+            self.running = False
+            self.condition.notify_all()
+
+
+# ============================================================================
+# LEAD-LAG RECORDS
+# ============================================================================
+
 class ArmRecord:
+
     def __init__(self, maxlen=ROLL_CYCLES):
         self.M = deque(maxlen=maxlen)
         self.Y = deque(maxlen=maxlen)
 
     def add(self, col_means, y_bits):
-        self.M.append(
-            np.asarray(col_means, dtype=float)
-        )
-        self.Y.append(
-            np.asarray(y_bits, dtype=float)
-        )
+        self.M.append(np.asarray(col_means, dtype=float))
+        self.Y.append(np.asarray(y_bits, dtype=float))
 
     def __len__(self):
         return len(self.M)
 
 
 def lead_stats(arm, leads, n_slots, n_perms):
+
     C = len(arm)
+
     M = np.array(arm.M)
     Y = np.array(arm.Y)
 
@@ -332,7 +488,8 @@ def lead_stats(arm, leads, n_slots, n_perms):
     den = {}
 
     for L in leads:
-        x = Mc[:, : n_slots - L]
+
+        x = Mc[:, :n_slots - L]
         y = Yc[:, L:]
 
         d = math.sqrt(
@@ -340,51 +497,55 @@ def lead_stats(arm, leads, n_slots, n_perms):
         )
 
         den[L] = d
+
         obs[L] = (
             float((x * y).sum() / d)
-            if d > 0
-            else 0.0
+            if d > 0 else 0.0
         )
 
     perm_vals = {L: [] for L in leads}
+
     done = 0
 
     while done < n_perms:
+
         P = min(250, n_perms - done)
 
         idx = np.argsort(
             np.random.random((P, C)),
-            axis=1,
+            axis=1
         )
 
         Yp = Yc[idx]
 
         for L in leads:
+
             if den[L] > 0:
+
                 s = np.einsum(
                     "ck,pck->p",
-                    Mc[:, : n_slots - L],
-                    Yp[:, :, L:],
+                    Mc[:, :n_slots - L],
+                    Yp[:, :, L:]
                 )
 
-                perm_vals[L].append(
-                    s / den[L]
-                )
+                perm_vals[L].append(s / den[L])
 
         done += P
 
     out = {}
 
     for L in leads:
+
         if den[L] > 0 and perm_vals[L]:
+
             arr = np.concatenate(perm_vals[L])
             sd = arr.std()
 
             z = (
                 (obs[L] - arr.mean()) / sd
-                if sd > 0
-                else 0.0
+                if sd > 0 else 0.0
             )
+
         else:
             z = 0.0
 
@@ -393,995 +554,742 @@ def lead_stats(arm, leads, n_slots, n_perms):
     return out
 
 
-# ----------------------------------------------------------------------------
-# Exchange parsers
-# ----------------------------------------------------------------------------
-def _parse_binance(d):
-    """Parse Binance Spot BTCUSDT bookTicker updates."""
-    if d.get("s") != "BTCUSDT":
-        return None
+# ============================================================================
+# COMMITMENT CREATION
+# ============================================================================
 
-    bid = d.get("b")
-    ask = d.get("a")
+def make_commitment(arm, timestamp_ns, price, price_delta):
 
-    if bid is None or ask is None:
-        return None
+    if arm == "BEFORE":
 
-    try:
-        bid = float(bid)
-        ask = float(ask)
-
-        if bid <= 0 or ask <= 0:
-            return None
-
-        return (bid + ask) / 2.0
-
-    except (TypeError, ValueError):
-        return None
-
-
-def _parse_deribit(d):
-    p = d.get("params")
-
-    if p and p.get("channel", "").startswith("quote."):
-        q = p["data"]
-
-        if (
-            "best_bid_price" in q
-            and "best_ask_price" in q
-        ):
-            return (
-                float(q["best_bid_price"])
-                + float(q["best_ask_price"])
-            ) / 2.0
-
-    return None
-
-
-def _parse_bitmex(d):
-    if d.get("table") == "quote" and d.get("data"):
-        q = d["data"][-1]
-
-        if q.get("bidPrice") and q.get("askPrice"):
-            return (
-                float(q["bidPrice"])
-                + float(q["askPrice"])
-            ) / 2.0
-
-    return None
-
-
-def _parse_coinbase(d):
-    if (
-        d.get("type") == "ticker"
-        and d.get("best_bid")
-        and d.get("best_ask")
-    ):
-        return (
-            float(d["best_bid"])
-            + float(d["best_ask"])
-        ) / 2.0
-
-    return None
-
-
-def _parse_kraken(d):
-    if d.get("channel") == "ticker" and d.get("data"):
-        t = d["data"][0]
-
-        if "bid" in t and "ask" in t:
-            return (
-                float(t["bid"])
-                + float(t["ask"])
-            ) / 2.0
-
-    return None
-
-
-def _parse_okx(d):
-    if d.get("data") and "bidPx" in d["data"][0]:
-        t = d["data"][0]
-
-        if "askPx" in t:
-            return (
-                float(t["bidPx"])
-                + float(t["askPx"])
-            ) / 2.0
-
-    return None
-
-
-EXCHANGES = {
-    "binance": {
-        "url": "wss://stream.binance.com:443/ws/btcusdt@bookTicker",
-        "sub": None,
-        "parse": _parse_binance,
-    },
-    "deribit": {
-        "url": "wss://www.deribit.com/ws/api/v2",
-        "sub": {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "public/subscribe",
-            "params": {
-                "channels": [
-                    "quote.BTC-PERPETUAL"
-                ]
-            },
-        },
-        "parse": _parse_deribit,
-    },
-    "bitmex": {
-        "url": "wss://ws.bitmex.com/realtime",
-        "sub": {
-            "op": "subscribe",
-            "args": ["quote:XBTUSD"],
-        },
-        "parse": _parse_bitmex,
-    },
-    "coinbase": {
-        "url": "wss://ws-feed.exchange.coinbase.com",
-        "sub": {
-            "type": "subscribe",
-            "product_ids": ["BTC-USD"],
-            "channels": ["ticker"],
-        },
-        "parse": _parse_coinbase,
-    },
-    "kraken": {
-        "url": "wss://ws.kraken.com/v2",
-        "sub": {
-            "method": "subscribe",
-            "params": {
-                "channel": "ticker",
-                "symbol": ["BTC/USD"],
-            },
-        },
-        "parse": _parse_kraken,
-    },
-    "okx": {
-        "url": "wss://ws.okx.com:8443/ws/v5/public",
-        "sub": {
-            "op": "subscribe",
-            "args": [
-                {
-                    "channel": "tickers",
-                    "instId": "BTC-USDT",
-                }
-            ],
-        },
-        "parse": _parse_okx,
-    },
-}
-
-
-# ----------------------------------------------------------------------------
-# Delayed live fetcher
-# ----------------------------------------------------------------------------
-class AsyncPriceFetcher(threading.Thread):
-
-    def __init__(
-        self,
-        exchange="binance",
-        delay_seconds=0.1,
-    ):
-        super().__init__(daemon=True)
-
-        if exchange not in EXCHANGES:
-            raise ValueError(
-                f"Unsupported exchange: {exchange}"
-            )
-
-        cfg = EXCHANGES[exchange]
-
-        self.url = cfg["url"]
-        self.sub = cfg["sub"]
-        self.parse = cfg["parse"]
-
-        self.exchange = exchange
-        self.delay_seconds = delay_seconds
-        self.delay_ns = int(delay_seconds * 1e9)
-
-        self._pending = deque()
-        self._pending_lock = threading.Lock()
-
-        self.latest_price = 0.0
-        self.latest_timestamp_ns = 0
-        self.latest_timestamp = ""
-
-        self.update_event = threading.Event()
-
-        self.running = True
-        self.ws = None
-
-        self._first_tick_logged = False
-        self._release_thread = None
-
-    def _on_open(self, ws):
-
-        print(
-            f"[FETCH] Connected to {self.exchange}"
+        # The payload is committed before the reveal timer starts.
+        bits = encode_payload_bits(
+            timestamp_ns,
+            price_delta
         )
 
-        if self.sub is not None:
-            ws.send(json.dumps(self.sub))
-
-            print(
-                f"[FETCH] Subscription sent: {self.sub}"
-            )
-
-        else:
-            print(
-                "[FETCH] Binance BTCUSDT bookTicker stream active"
-            )
-
-    def _on_message(self, ws, message):
-
-        try:
-            data = _loads(message)
-            price = self.parse(data)
-
-        except Exception as e:
-            print(
-                f"[PARSE ERROR] {e}"
-            )
-            return
-
-        if price is None or price <= 0:
-            return
-
-        received_perf_ns = time.perf_counter_ns()
-        due_perf_ns = received_perf_ns + self.delay_ns
-
-        due_wall_ns = time.time_ns() + self.delay_ns
-
-        with self._pending_lock:
-
-            if len(self._pending) >= 1000:
-                self._pending.clear()
-
-            self._pending.append(
-                (
-                    due_perf_ns,
-                    due_wall_ns,
-                    price,
-                )
-            )
-
-        if not self._first_tick_logged:
-
-            self._first_tick_logged = True
-
-            print(
-                f"[FETCH] First {self.exchange} tick: "
-                f"${price:,.2f}"
-            )
-
-    def _on_error(self, ws, error):
-
-        print(
-            f"[FETCH] WebSocket error: {error}"
+        material = (
+            bits.tobytes()
+            + str(timestamp_ns).encode()
+            + repr(price).encode()
+            + repr(price_delta).encode()
         )
 
-    def _on_close(
-        self,
-        ws,
-        close_status_code,
-        close_msg,
-    ):
+        commitment = hashlib.sha256(material).hexdigest()
 
-        print(
-            f"[FETCH] WebSocket closed: "
-            f"{close_status_code} {close_msg}"
-        )
+        return commitment, bits
 
-    def _release_due_ticks(self):
-
-        now_ns = time.perf_counter_ns()
-        due_items = []
-
-        with self._pending_lock:
-
-            while (
-                self._pending
-                and self._pending[0][0] <= now_ns
-            ):
-
-                due_items.append(
-                    self._pending.popleft()
-                )
-
-        for due_perf_ns, wall_ns, price in due_items:
-
-            self.latest_price = price
-
-            self.latest_timestamp_ns = wall_ns
-
-            self.latest_timestamp = (
-                format_clock_time(wall_ns)
-            )
-
-            self.update_event.set()
-
-    def _release_loop(self):
-
-        """
-        Independent worker.
-
-        Releases delayed ticks while the WebSocket
-        connection is blocking in run_forever().
-        """
-
-        while self.running:
-
-            self._release_due_ticks()
-
-            time.sleep(0.005)
-
-    def run(self):
-
-        if not HAS_WS:
-
-            print(
-                "[FETCH] websocket-client missing."
-            )
-
-            print(
-                "Install with: py -m pip install websocket-client"
-            )
-
-            return
-
-        self._release_thread = threading.Thread(
-            target=self._release_loop,
-            daemon=True,
-        )
-
-        self._release_thread.start()
-
-        while self.running:
-
-            try:
-
-                self.ws = websocket.WebSocketApp(
-                    self.url,
-                    on_open=self._on_open,
-                    on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
-                )
-
-                print(
-                    f"[FETCH] Connecting to {self.url}"
-                )
-
-                self.ws.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10,
-                    ping_payload="ghost-binance",
-                )
-
-            except Exception as e:
-
-                print(
-                    f"[FETCH] Connection exception: {e}"
-                )
-
-            if self.running:
-
-                print(
-                    "[FETCH] Reconnecting in 2 seconds..."
-                )
-
-                time.sleep(2)
-
-    def get_price(self):
-
-        return self.latest_price
-
-    def get_timestamp(self):
-
-        return self.latest_timestamp
-
-    def get_timestamp_ns(self):
-
-        return self.latest_timestamp_ns
-
-    def stop(self):
-
-        self.running = False
-
-        if self.ws is not None:
-
-            try:
-                self.ws.close()
-
-            except Exception:
-                pass
-
-
-
-# ----------------------------------------------------------------------------
-# Main pipeline
-# ----------------------------------------------------------------------------
-def run_full_predictor_pipeline(
-    exchange="binance",
-    delay_seconds=0.1,
-    n_windows=20000,
-    leak_eps_sigma=0.02,
-    balanced_detection=True,
-    n_perms=10000,
-    report_every=25,
-    max_cycles=None,
-):
-    np.random.seed(2026)
-
-    sigma_c = (
-        0.0 if balanced_detection else SIGMA_C
+    # AFTER arm: independent optical noise commitment.
+    # The payload is not encoded into this commitment.
+    noise = np.random.normal(
+        0.0,
+        1.0,
+        size=(256, N_SLOTS)
     )
 
-    var_z, sigma_z, slot_corr = noise_stats(
-        LAMBDA,
-        sigma_c,
-    )
-
-    eps_abs = leak_eps_sigma * sigma_z
-
-    prereg = dict(
-        lambda_=LAMBDA,
-        sigma_c=sigma_c,
-        n_slots=N_SLOTS,
-        leads=list(LEADS),
-        n_sigma=N_SIGMA,
-        n_perms=n_perms,
-        n_windows=n_windows,
-        leak_eps_sigma=leak_eps_sigma,
-        leak_lead=LEAK_LEAD,
-        min_cycles=MIN_CYCLES,
-        delay_seconds=delay_seconds,
-        target=(
-            "32-bit payload: timestamp_ms_within_minute + "
-            "signed_price_delta_cents"
-        ),
-    )
-
-    prereg_hash = hashlib.sha256(
-        json.dumps(prereg, sort_keys=True).encode()
+    commitment = hashlib.sha256(
+        noise.tobytes()
     ).hexdigest()
 
-    print("=" * 78)
-    print(
-        "  RP-GHOST COMMIT-REVEAL TIME + PRICE-DELTA DECODER"
-    )
-    print("=" * 78)
-    print(
-        f"[PREREG] config hash {prereg_hash[:16]}... "
-        "(record before trusting results)"
-    )
-    print(
-        f"[NOISE ] Var(z)={var_z:.3f} "
-        f"sigma_z={sigma_z:.3f} "
-        f"slot correlation={slot_corr:.3f}"
-        f"{' (balanced detection)' if balanced_detection else ''}"
-    )
-    print(
-        f"[CTRL  ] positive-control tilt = "
-        f"{leak_eps_sigma} sigma_z = "
-        f"{eps_abs:.4f} z units"
-    )
-    print(
-        "[TARGET] 32 bits: timestamp milliseconds + signed price delta cents"
-    )
-    print(
-        f"[FETCH ] exchange={exchange}; "
-        f"async delay={delay_seconds:.3f}s"
-    )
+    return commitment, None
 
-    if exchange not in EXCHANGES:
-        raise ValueError(
-            f"Unsupported live exchange {exchange!r}. "
-            f"Choose one of: {", ".join(EXCHANGES)}"
+
+# ============================================================================
+# REVEAL AND DECODER
+# ============================================================================
+
+def process_reveal(
+    event,
+    viewport,
+    before,
+    after,
+    delta_buf,
+    analysis,
+    counters
+):
+
+    arm = event["arm"]
+
+    fetch_ns = event["fetch_ns"]
+    fetch_price = event["price"]
+    price_delta = event["price_delta"]
+
+    scheduled_ns = event["scheduled_reveal_ns"]
+    actual_ns = event["actual_reveal_ns"]
+
+    if arm == "BEFORE":
+
+        # Payload was committed before the delay.
+        # Its timestamp represents the scheduled reveal.
+        Y = event["committed_bits"].copy()
+        payload_timestamp_ns = scheduled_ns
+
+    else:
+
+        # AFTER arm: payload is first encoded here,
+        # after the independent commitment and reveal delay.
+        payload_timestamp_ns = actual_ns
+
+        Y = encode_payload_bits(
+            payload_timestamp_ns,
+            price_delta
         )
 
-    if not HAS_WS:
+    # Optical encoding occurs only after reveal.
+    _, sigma_z, _ = noise_stats(
+        LAMBDA,
+        SIGMA_C
+    )
+
+    eps_abs = 0.02 * sigma_z
+
+    tilt = make_payload_tilt(Y, eps_abs)
+
+    Z = viewport.generate_window_block(
+        N_WINDOWS,
+        N_SLOTS,
+        tilt
+    )
+
+    m = Z.mean(axis=0)
+
+    col_z = (
+        m
+        / (
+            Z.std(axis=0, ddof=1)
+            / math.sqrt(N_WINDOWS)
+        )
+    )
+
+    bit_z = col_z.copy()
+
+    decoded_bits = (bit_z > 0).astype(int)
+
+    decoded_code, decoded_delta = decode_payload_bits(
+        decoded_bits
+    )
+
+    actual_code = timestamp_to_code(
+        payload_timestamp_ns
+    )
+
+    decoded_ns, decoded_time = decode_timestamp_from_code(
+        decoded_code,
+        actual_ns
+    )
+
+    time_error_ms = (
+        (decoded_code - actual_code + 30000) % 60000
+    ) - 30000
+
+    exact_bits = int(
+        np.sum(decoded_bits == Y)
+    )
+
+    if arm == "BEFORE":
+        before.add(m, Y)
+    else:
+        after.add(m, Y)
+
+    counters["revealed"] += 1
+
+    if time_error_ms == 0:
+        counters["timestamp_hits"] += 1
+
+    if abs(time_error_ms) <= 1:
+        counters["within_1ms"] += 1
+
+    if abs(time_error_ms) <= 10:
+        counters["within_10ms"] += 1
+
+    counters["timestamp_total"] += 1
+
+    delta_error = decoded_delta - price_delta
+
+    counters["delta_abs_error"] += abs(delta_error)
+    counters["delta_total"] += 1
+
+    if abs(delta_error) < 0.0051:
+        counters["delta_exact"] += 1
+
+    # Confidence statistics.
+    min_z = float(np.abs(bit_z).min())
+
+    joint_conf = float(
+        np.prod([
+            phi(z)
+            for z in np.abs(bit_z)
+        ])
+    )
+
+    certain = (
+        min_z >= Z_MIN
+        and joint_conf >= JOINT_CONF_MIN
+    )
+
+    delta_buf.append(time_error_ms)
+
+    entropy, counts = sign_entropy(delta_buf)
+
+    n_pos, n_neg, n_zero = counts
+
+    low_entropy = (
+        len(delta_buf) >= MIN_BUF
+        and entropy <= ENTROPY_MAX_BITS
+    )
+
+    dominant = (
+        1 if n_pos > n_neg
+        else -1 if n_neg > n_pos
+        else 0
+    )
+
+    agrees = (
+        time_error_ms != 0
+        and dominant != 0
+        and (time_error_ms > 0) == (dominant > 0)
+    )
+
+    recent = list(delta_buf)[-STREAK:]
+
+    streak_ok = (
+        len(recent) == STREAK
+        and (
+            all(x > 0 for x in recent)
+            or all(x < 0 for x in recent)
+        )
+    )
+
+    big_enough = abs(time_error_ms) >= MIN_ABS_DELTA
+
+    gates = {
+        "positive control recovered": analysis["pipeline_ok"],
+        "after-arm channel signal": analysis["channel_decode_ok"],
+        "certain": certain,
+        "low entropy": low_entropy,
+        "agrees": agrees,
+        "streak": streak_ok,
+        "big enough": big_enough
+    }
+
+    failed = [
+        name
+        for name, passed in gates.items()
+        if not passed
+    ]
+
+    elapsed_ms = (
+        event["actual_reveal_perf_ns"]
+        - event["commit_perf_ns"]
+    ) / 1e6
+
+    scheduled_time = format_clock_time(scheduled_ns)
+    actual_time = format_clock_time(actual_ns)
+    fetch_time = format_clock_time(fetch_ns)
+    commit_time = format_clock_time(event["commit_ns"])
+
+    print()
+    print("=" * 78)
+    print(f"[{counters['revealed']}] {arm} ARM | FORCED DATA REVEAL")
+    print("=" * 78)
+
+    print(f"  Commitment:       {event['commitment'][:24]}...")
+    print(f"  Fetched at:       {fetch_time}")
+    print(f"  Committed at:     {commit_time}")
+    print(f"  Scheduled reveal: {scheduled_time}")
+    print(f"  Actual reveal:    {actual_time}")
+    print(f"  Elapsed delay:    {elapsed_ms:.2f} ms")
+
+    print("-" * 78)
+
+    print(f"  BTC price:        ${fetch_price:,.2f}")
+    print(f"  Actual delta:     {price_delta:+.2f} USD")
+
+    print("-" * 78)
+
+    print(f"  Decoded time:     {decoded_time}")
+    print(f"  Time error:       {time_error_ms:+d} ms")
+    print(f"  Decoded delta:    {decoded_delta:+.2f} USD")
+    print(f"  Bit recovery:     {exact_bits}/{N_SLOTS}")
+
+    print("-" * 78)
+
+    print(f"  Minimum |z|:      {min_z:.2f}")
+    print(f"  Joint confidence: {joint_conf:.8f}")
+    print(f"  Entropy:          {entropy:.4f}")
+
+    if failed:
+        print(f"  [GATE] WITHHELD: {', '.join(failed)}")
+    else:
+        print("  [GATE] All gates passed; no external action taken.")
+
+    print("=" * 78)
+
+    return time_error_ms
+
+
+# ============================================================================
+# STATISTICAL ANALYSIS
+# ============================================================================
+
+def run_analysis(before, after, analysis, counters):
+
+    if (
+        len(before) < MIN_CYCLES
+        or len(after) < MIN_CYCLES
+    ):
         print(
-            "[FETCH] websocket-client is not installed. "
-            "Run: pip install websocket-client"
+            f"[ANALYSIS] Waiting for {MIN_CYCLES} cycles "
+            f"per arm: BEFORE={len(before)}, AFTER={len(after)}"
         )
         return
 
-    viewport = OptoelectronicViewport(
-        lambd=LAMBDA,
-        sigma_c=sigma_c,
+    sb = lead_stats(
+        before,
+        LEADS,
+        N_SLOTS,
+        N_PERMS
     )
 
-    fifo_queue = FifoTargetQueue(max_capacity=50)
-    delta_buf = deque(maxlen=DELTA_BUF_LEN)
-
-    fetcher = AsyncPriceFetcher(
-        exchange=exchange,
-        delay_seconds=delay_seconds,
+    sa = lead_stats(
+        after,
+        LEADS,
+        N_SLOTS,
+        N_PERMS
     )
 
-    fetcher.start()
+    pc_rho, pc_z = sb[0]
+
+    analysis["pipeline_ok"] = pc_z >= N_SIGMA
+
+    best_L = max(
+        LEADS,
+        key=lambda L: sa[L][1]
+    )
+
+    analysis["channel_decode_ok"] = (
+        sa[best_L][1] >= N_SIGMA
+    )
+
+    print()
+    print("[ANALYSIS] " + "-" * 65)
+
     print(
-        "[FETCH] Waiting for first delayed tick..."
+        f"BEFORE positive control: "
+        f"rho={pc_rho:+.4f} z={pc_z:+.2f}"
+    )
+
+    for L in LEADS:
+        print(
+            f"AFTER lead +{L}: "
+            f"rho={sa[L][0]:+.4f} "
+            f"z={sa[L][1]:+.2f}"
+        )
+
+    print(
+        f"Positive control: "
+        f"{'RECOVERED' if analysis['pipeline_ok'] else 'NOT RECOVERED'}"
+    )
+
+    print(
+        f"AFTER channel: "
+        f"{'RECOVERED' if analysis['channel_decode_ok'] else 'NOT RECOVERED'}"
+    )
+
+    print(
+        f"Exact timestamp matches: "
+        f"{counters['timestamp_hits']}/"
+        f"{counters['timestamp_total']}"
+    )
+
+    print(
+        f"Within 1 ms: "
+        f"{counters['within_1ms']}/"
+        f"{counters['timestamp_total']}"
+    )
+
+    print(
+        f"Within 10 ms: "
+        f"{counters['within_10ms']}/"
+        f"{counters['timestamp_total']}"
+    )
+
+    if counters["delta_total"]:
+
+        print(
+            f"Exact price-delta matches: "
+            f"{counters['delta_exact']}/"
+            f"{counters['delta_total']}"
+        )
+
+        print(
+            f"Mean absolute delta error: "
+            f"${counters['delta_abs_error'] / counters['delta_total']:.4f}"
+        )
+
+    print("[ANALYSIS] " + "-" * 65)
+    print()
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+def run_full_predictor_pipeline(
+    exchange=EXCHANGE,
+    delay_seconds=REVEAL_DELAY,
+    max_cycles=None
+):
+
+    np.random.seed(2026)
+
+    var_z, sigma_z, slot_corr = noise_stats(
+        LAMBDA,
+        SIGMA_C
+    )
+
+    prereg = {
+        "exchange": exchange,
+        "delay_seconds": delay_seconds,
+        "lambda": LAMBDA,
+        "sigma_c": SIGMA_C,
+        "slots": N_SLOTS,
+        "windows": N_WINDOWS,
+        "leads": list(LEADS),
+        "arms": ["BEFORE", "AFTER"],
+        "reveal": "asynchronous forced reveal"
+    }
+
+    prereg_hash = hashlib.sha256(
+        json.dumps(
+            prereg,
+            sort_keys=True
+        ).encode()
+    ).hexdigest()
+
+    print("=" * 78)
+    print(" RP-GHOST ASYNCHRONOUS COMMIT-REVEAL DECODER")
+    print("=" * 78)
+
+    print(f"[PREREG] {prereg_hash}")
+    print(f"[EXCHANGE] {exchange}")
+    print(f"[DELAY] {delay_seconds:.3f} seconds")
+    print(f"[OPTICAL] lambda={LAMBDA}")
+    print(f"[OPTICAL] Var(z)={var_z:.3f}")
+    print(f"[OPTICAL] sigma(z)={sigma_z:.3f}")
+    print(f"[OPTICAL] slot correlation={slot_corr:.4f}")
+
+    print()
+    print("[ARMS]")
+    print("  BEFORE: Payload commitment -> delay -> forced reveal")
+    print("  AFTER:  Noise commitment -> delay -> payload creation/reveal")
+    print()
+    print("[DISPLAY] Both arms independently display their reveal events.")
+    print("[FETCH] WebSocket receiver remains asynchronous.")
+    print("[DECODER] Payload is decoded only after reveal.")
+    print()
+
+    if not HAS_WS:
+        print("[ERROR] Install websocket-client:")
+        print("        pip install websocket-client")
+        return
+
+    viewport = OptoelectronicViewport()
+
+    fetcher = AsyncPriceFetcher(exchange)
+
+    reveal_queue = queue.Queue()
+
+    scheduler = AsyncRevealScheduler(
+        reveal_queue
     )
 
     before = ArmRecord()
     after = ArmRecord()
 
+    delta_buf = deque(maxlen=DELTA_BUF_LEN)
+
     analysis = {
         "pipeline_ok": False,
-        "channel_decode_ok": False,
+        "channel_decode_ok": False
     }
 
-    timestamp_hits = 0
-    timestamp_total = 0
-    timestamp_within_1ms = 0
-    timestamp_within_10ms = 0
-    delta_abs_error_total = 0.0
-    delta_exact_hits = 0
-    delta_total = 0
+    counters = {
+        "scheduled": 0,
+        "revealed": 0,
+        "timestamp_hits": 0,
+        "within_1ms": 0,
+        "within_10ms": 0,
+        "timestamp_total": 0,
+        "delta_exact": 0,
+        "delta_total": 0,
+        "delta_abs_error": 0.0
+    }
+
     previous_price = None
+    last_sample_perf_ns = 0
 
-    col_idx = np.arange(N_SLOTS)
+    fetcher.start()
+    scheduler.start()
 
-    startup_time = time.perf_counter()
+    print("[START] Waiting for live BTCUSDT ticks...")
 
     try:
-        cycle = 0
 
         while (
             max_cycles is None
-            or cycle < max_cycles
+            or counters["scheduled"] < max_cycles
+            or counters["revealed"] < counters["scheduled"]
         ):
-            got_tick = (
-                fetcher.update_event.wait(
-                    timeout=1.0
-                )
-            )
 
-            fetcher.update_event.clear()
+            # --------------------------------------------------------------
+            # 1. RECEIVE LIVE TICK WITHOUT BLOCKING REVEAL SCHEDULER
+            # --------------------------------------------------------------
 
-            if not got_tick:
-                if (
-                    cycle == 0
-                    and time.perf_counter()
-                    - startup_time
-                    > 5.0
-                ):
-                    print(
-                        "[FETCH] No tick received yet. "
-                        "Check network, exchange endpoint, "
-                        "and websocket-client."
-                    )
+            try:
+                tick = fetcher.ticks.get(timeout=0.02)
+            except queue.Empty:
+                tick = None
 
-                continue
+            if tick is not None:
 
-            price0 = fetcher.get_price()
-            timestamp0_ns = (
-                fetcher.get_timestamp_ns()
-            )
-            timestamp0 = fetcher.get_timestamp()
-
-            if (
-                price0 <= 0.0
-                or not timestamp0_ns
-                or not timestamp0
-            ):
-                continue
-
-            cycle += 1
-
-            arm = (
-                "before"
-                if np.random.random() < 0.5
-                else "after"
-            )
-
-            if arm == "before":
-                price_delta = (
-                    0.0 if previous_price is None
-                    else price0 - previous_price
-                )
-                previous_price = price0
-                Y = encode_payload_bits(timestamp0_ns, price_delta)
-                tilt = make_payload_tilt(Y, eps_abs) if eps_abs > 0.0 else None
-
-                Z = (
-                    viewport.generate_window_block(
-                        n_windows,
-                        N_SLOTS,
-                        tilt,
-                    )
-                )
-
-                m = Z.mean(axis=0)
-
-                before.add(m, Y)
-
-                bit_z = (
-                    m
-                    / (
-                        Z.std(axis=0, ddof=1)
-                        / math.sqrt(n_windows)
-                    )
-                )[col_idx]
-
-                decoded_bits = (
-                    bit_z > 0
-                ).astype(int)
-
-                decoded_code, decoded_delta = decode_payload_bits(decoded_bits)
-                actual_code = timestamp_to_code(timestamp0_ns)
-
-                decoded_ns, decoded_time = (
-                    decode_timestamp_from_code(
-                        decoded_code,
-                        timestamp0_ns,
-                    )
-                )
-
-                actual_time = format_clock_time(
-                    timestamp0_ns
-                )
-
-                exact_bits = int((decoded_bits == Y).sum())
-
-                time_error_ms = (
-                    decoded_code - actual_code
-                )
-
-                print(
-                    f"[{cycle}] BEFORE arm | fetched at {actual_time} | "
-                    f"decoded time {decoded_time} | time error {time_error_ms:+d} ms | "
-                    f"price delta actual {price_delta:+.2f} USD | "
-                    f"decoded {decoded_delta:+.2f} USD | "
-                    f"bits recovered {exact_bits}/{N_SLOTS - DECODE_LEAD}"
-                )
-
-                fifo_queue.push(
-                    timestamp0,
-                    price0,
-                    Y,
-                )
-
-                if len(fifo_queue) >= 3:
-                    fifo_queue.pop_at(index=2)
-
-            else:
-                # Commit to pre-reveal noise. This commitment does not
-                # contain the later price/timestamp payload.
-                Z_commit = viewport.generate_window_block(
-                    n_windows, N_SLOTS, None
-                )
-                commit = hashlib.sha256(Z_commit.tobytes()).hexdigest()
-                commit_perf_ns = time.perf_counter_ns()
-
-                # Reveal delayed fetch time and price.
-
-                price1 = fetcher.get_price()
-                reveal_time = (
-                    fetcher.get_timestamp()
-                )
-                reveal_ns = (
-                    fetcher.get_timestamp_ns()
-                )
+                now_perf = time.perf_counter_ns()
 
                 if (
-                    price1 is None
-                    or price1 <= 0.0
-                    or not reveal_time
-                    or not reveal_ns
-                    or time.perf_counter_ns() <= commit_perf_ns
-                ):
-                    print(
-                        f"[{cycle}] AFTER arm: no delayed "
-                        "tick available after commitment; "
-                        "discarded"
-                    )
-                    continue
-
-                price_delta = (
-                    0.0 if previous_price is None
-                    else price1 - previous_price
-                )
-                previous_price = price1
-                Y = encode_payload_bits(reveal_ns, price_delta)
-
-                # Post-reveal optical encoding: this is a decoder test,
-                # not evidence of predicting information before reveal.
-                tilt = make_payload_tilt(Y, eps_abs)
-                Z = viewport.generate_window_block(n_windows, N_SLOTS, tilt)
-                m = Z.mean(axis=0)
-                col_z = m / (Z.std(axis=0, ddof=1) / math.sqrt(n_windows))
-                bit_z = col_z[col_idx]
-                decoded_bits = (bit_z > 0).astype(int)
-                decoded_code, decoded_delta = decode_payload_bits(decoded_bits)
-
-                actual_code = timestamp_to_code(reveal_ns)
-                decoded_ns, decoded_time = decode_timestamp_from_code(
-                    decoded_code, reveal_ns
-                )
-
-                after.add(m, Y)
-
-                time_error_ms = (
-                    decoded_code - actual_code
-                )
-
-                if time_error_ms == 0:
-                    timestamp_hits += 1
-
-                if abs(time_error_ms) <= 1:
-                    timestamp_within_1ms += 1
-
-                if abs(time_error_ms) <= 10:
-                    timestamp_within_10ms += 1
-
-                timestamp_total += 1
-                delta_error = decoded_delta - price_delta
-                delta_abs_error_total += abs(delta_error)
-                delta_total += 1
-                if abs(delta_error) < 0.0051:
-                    delta_exact_hits += 1
-
-                # Per-cycle certainty.
-                price_z = np.abs(bit_z)
-                min_z = float(price_z.min())
-
-                joint_conf = float(
-                    np.prod(
-                        [
-                            _phi(z)
-                            for z in price_z
-                        ]
-                    )
-                )
-
-                certain = (
-                    min_z >= Z_MIN
-                    and joint_conf
-                    >= JOINT_CONF_MIN
-                )
-
-                # Delta-buffer gates.
-                delta_buf.append(time_error_ms)
-
-                h, (
-                    n_pos,
-                    n_neg,
-                    n_zero,
-                ) = sign_entropy(delta_buf)
-
-                low_entropy = (
-                    len(delta_buf) >= MIN_BUF
-                    and h <= ENTROPY_MAX_BITS
-                )
-
-                dominant = (
-                    1
-                    if n_pos > n_neg
-                    else (
-                        -1
-                        if n_neg > n_pos
-                        else 0
-                    )
-                )
-
-                agrees = (
-                    time_error_ms != 0
-                    and dominant != 0
-                    and (time_error_ms > 0)
-                    == (dominant > 0)
-                )
-
-                recent = list(delta_buf)[
-                    -STREAK:
-                ]
-
-                streak_ok = (
-                    len(recent) == STREAK
+                    now_perf - last_sample_perf_ns
+                    >= int(SAMPLE_INTERVAL * 1e9)
                     and (
-                        all(d > 0 for d in recent)
-                        or all(d < 0 for d in recent)
+                        max_cycles is None
+                        or counters["scheduled"] < max_cycles
                     )
-                )
-
-                big_enough = (
-                    abs(time_error_ms)
-                    >= MIN_ABS_DELTA
-                )
-
-                gates = {
-                    "positive control recovered": analysis[
-                        "pipeline_ok"
-                    ],
-                    "after-arm channel signal": analysis[
-                        "channel_decode_ok"
-                    ],
-                    "certain": certain,
-                    "low entropy": low_entropy,
-                    "agrees": agrees,
-                    "streak": streak_ok,
-                    "big enough": big_enough,
-                }
-
-                failed = [
-                    name
-                    for name, passed in gates.items()
-                    if not passed
-                ]
-
-                reveal_delay_ms = (
-                    time.perf_counter_ns() - commit_perf_ns
-                ) / 1e6
-
-                print(
-                    f"[{cycle}] AFTER arm | commit "
-                    f"{commit[:10]} | fetched at "
-                    f"{reveal_time} | reveal "
-                    f"+{reveal_delay_ms:.1f} ms | "
-                    f"decoded time {decoded_time} | "
-                    f"time error {time_error_ms:+d} ms | "
-                    f"price delta {price_delta:+.2f} USD -> "
-                    f"decoded {decoded_delta:+.2f} USD | "
-                    f"min|z| {min_z:.2f} | "
-                    f"entropy {h:.2f}"
-                )
-
-                if failed:
-                    print(
-                        f"    [GATE] Withheld: "
-                        f"{', '.join(failed)}"
-                    )
-                else:
-                    print(
-                        "    [GATE] All gates passed; "
-                        "clock time decoded; "
-                        "no action taken."
-                    )
-
-            if cycle % report_every == 0:
-                if (
-                    len(before) >= MIN_CYCLES
-                    and len(after) >= MIN_CYCLES
                 ):
-                    sb = lead_stats(
-                        before,
-                        LEADS,
-                        N_SLOTS,
-                        n_perms,
+
+                    last_sample_perf_ns = now_perf
+
+                    price = tick["price"]
+                    fetch_ns = tick["received_ns"]
+
+                    price_delta = (
+                        0.0
+                        if previous_price is None
+                        else price - previous_price
                     )
 
-                    sa = lead_stats(
-                        after,
-                        LEADS,
-                        N_SLOTS,
-                        n_perms,
+                    previous_price = price
+
+                    # Alternate randomized arms.
+                    arm = (
+                        "BEFORE"
+                        if np.random.random() < 0.5
+                        else "AFTER"
                     )
 
-                    pc_rho, pc_z = sb[LEAK_LEAD]
+                    commit_ns = time.time_ns()
+                    commit_perf_ns = time.perf_counter_ns()
 
-                    analysis["pipeline_ok"] = (
-                        pc_z >= N_SIGMA
+                    # BEFORE payload timestamp is the scheduled reveal.
+                    # AFTER payload timestamp is generated at actual reveal.
+                    scheduled_payload_ns = (
+                        fetch_ns + int(delay_seconds * 1e9)
                     )
 
-                    best_L = max(
-                        LEADS,
-                        key=lambda L: sa[L][1],
+                    commitment, committed_bits = make_commitment(
+                        arm,
+                        scheduled_payload_ns,
+                        price,
+                        price_delta
                     )
 
-                    analysis[
-                        "channel_decode_ok"
-                    ] = sa[best_L][1] >= N_SIGMA
-
+                    print()
+                    """
                     print(
-                        "\n[ANALYSIS] " + "-" * 62
+                        f"[COMMIT] {arm} | "
+                        f"BTC=${price:,.2f} | "
+                        f"delta={price_delta:+.2f} | "
+                        f"hash={commitment[:16]}..."
                     )
-
-                    print(
-                        f"  cycles: before {len(before)}, "
-                        f"after {len(after)} | null = "
-                        f"{n_perms:,} shuffles of Y"
-                    )
-
-                    print(
-                        f"  positive control, lead "
-                        f"+{LEAK_LEAD}: "
-                        f"rho={pc_rho:+.4f} "
-                        f"z={pc_z:+.1f} -> "
-                        f"{'RECOVERED' if analysis['pipeline_ok'] else 'MISSED'}"
-                    )
-
-                    for L in LEADS:
+                    
+                    if arm == "BEFORE":
                         print(
-                            f"  after-arm encoded-channel lead +{L}: "
-                            f"rho={sa[L][0]:+.4f} "
-                            f"z={sa[L][1]:+.1f}"
+                            "[COMMIT] Payload hash committed "
+                            "before forced reveal."
+                        )
+                    else:
+                        print(
+                            "[COMMIT] Independent noise hash committed; "
+                            "payload not yet encoded."
+                        )
+                    """
+                    # Capture immutable values for the reveal callback.
+                    captured = {
+                        "arm": arm,
+                        "price": price,
+                        "price_delta": price_delta,
+                        "fetch_ns": fetch_ns,
+                        "commit_ns": commit_ns,
+                        "commit_perf_ns": commit_perf_ns,
+                        "commitment": commitment,
+                        "committed_bits": (
+                            committed_bits.copy()
+                            if committed_bits is not None
+                            else None
+                        )
+                    }
+
+                    def reveal_callback(
+                        scheduled_ns,
+                        actual_ns,
+                        data=captured
+                    ):
+
+                        return {
+                            **data,
+                            "arm": data["arm"],
+                            "scheduled_reveal_ns": scheduled_ns,
+                            "actual_reveal_ns": actual_ns
+                        }
+
+                    scheduled_ns = scheduler.schedule(
+                        delay_seconds,
+                        reveal_callback
+                    )
+
+                    counters["scheduled"] += 1
+                    """
+                    print(
+                        f"[SCHEDULE] {arm} | "
+                        f"forced reveal at "
+                        f"{format_clock_time(scheduled_ns)}"
+                    )
+                    """
+            # --------------------------------------------------------------
+            # 2. PROCESS FORCED REVEAL EVENTS
+            # --------------------------------------------------------------
+
+            while True:
+
+                try:
+                    event = reveal_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                process_reveal(
+                    event,
+                    viewport,
+                    before,
+                    after,
+                    delta_buf,
+                    analysis,
+                    counters
+                )
+
+                # ----------------------------------------------------------
+                # 3. PERIODIC STATISTICAL ANALYSIS
+                # ----------------------------------------------------------
+
+                if (
+                    counters["revealed"] > 0
+                    and counters["revealed"] % REPORT_EVERY == 0
+                ):
+
+                    if (
+                        not hasattr(
+                            run_full_predictor_pipeline,
+                            "_last_report"
+                        )
+                        or run_full_predictor_pipeline._last_report
+                        != counters["revealed"]
+                    ):
+
+                        run_full_predictor_pipeline._last_report = (
+                            counters["revealed"]
                         )
 
-                    print(
-                        f"  rho_leak = "
-                        f"{sb[LEAK_LEAD][0] - sa[LEAK_LEAD][0]:+.4f} | "
-                        f"rho_after_channel = "
-                        f"{sa[LEAK_LEAD][0]:+.4f}"
-                    )
-
-                    verdict = (
-                        "post-reveal payload channel recovered"
-                        if analysis["channel_decode_ok"]
-                        else "post-reveal payload channel not recovered"
-                    )
-
-                    print(f"  verdict: {verdict}")
-
-                    if timestamp_total:
-                        print(
-                            f"  exact time matches: "
-                            f"{timestamp_hits}/"
-                            f"{timestamp_total} "
-                            f"({timestamp_hits / timestamp_total:.6f})"
+                        run_analysis(
+                            before,
+                            after,
+                            analysis,
+                            counters
                         )
-
-                        print(
-                            f"  within 1 ms: "
-                            f"{timestamp_within_1ms}/"
-                            f"{timestamp_total} "
-                            f"({timestamp_within_1ms / timestamp_total:.6f})"
-                        )
-
-                        print(
-                            f"  within 10 ms: "
-                            f"{timestamp_within_10ms}/"
-                            f"{timestamp_total} "
-                            f"({timestamp_within_10ms / timestamp_total:.6f})"
-                        )
-
-                    if delta_total:
-                        print(
-                            f"  price-delta exact (cent) matches: "
-                            f"{delta_exact_hits}/{delta_total} | "
-                            f"mean absolute delta error: "
-                            f"${delta_abs_error_total / delta_total:.4f}"
-                        )
-
-                    print(
-                        "[ANALYSIS] "
-                        + "-" * 62
-                        + "\n"
-                    )
-
-                else:
-                    print(
-                        f"[ANALYSIS] waiting for "
-                        f"{MIN_CYCLES} cycles per arm "
-                        f"(before {len(before)}, "
-                        f"after {len(after)})"
-                    )
 
     except KeyboardInterrupt:
-        pass
+
+        print("\n[STOP] Keyboard interrupt received.")
 
     finally:
+
+        print("[SHUTDOWN] Stopping scheduler and exchange...")
+
+        scheduler.stop()
         fetcher.stop()
-        viewport.release()
+
+        scheduler.join(timeout=2.0)
+        fetcher.join(timeout=2.0)
+
+        print()
+        print("=" * 78)
+        print(" FINAL RP-GHOST REPORT")
+        print("=" * 78)
 
         print(
-            "\n[DONE] Clock-time decoder pipeline "
-            "terminated safely."
+            f"Scheduled: {counters['scheduled']}"
         )
 
+        print(
+            f"Revealed:  {counters['revealed']}"
+        )
+
+        print(
+            f"BEFORE samples: {len(before)}"
+        )
+
+        print(
+            f"AFTER samples:  {len(after)}"
+        )
+
+        print(
+            f"Exchange messages received: {fetcher.received}"
+        )
+
+        if counters["timestamp_total"]:
+
+            print(
+                f"Timestamp exact: "
+                f"{counters['timestamp_hits']}/"
+                f"{counters['timestamp_total']}"
+            )
+
+            print(
+                f"Timestamp within 1 ms: "
+                f"{counters['within_1ms']}/"
+                f"{counters['timestamp_total']}"
+            )
+
+        if counters["delta_total"]:
+
+            print(
+                f"Price delta exact: "
+                f"{counters['delta_exact']}/"
+                f"{counters['delta_total']}"
+            )
+
+            print(
+                f"Mean delta error: "
+                f"${counters['delta_abs_error'] / counters['delta_total']:.4f}"
+            )
+
+        print("=" * 78)
+        print("[DONE] No keyboard injection or trading performed.")
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    # Live Binance Spot BTCUSDT bookTicker feed; no synthetic exchange.
+
     run_full_predictor_pipeline(
         exchange="binance",
-        delay_seconds=0.1,
-        n_windows=2000,
-        leak_eps_sigma=0.02,
-        balanced_detection=False,
-        n_perms=100,
-        report_every=10000,
+        delay_seconds=10.1,
+        max_cycles=None
     )
