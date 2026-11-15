@@ -59,7 +59,6 @@ class OptoelectronicViewport:
             roi = gray[max(0, cy - half):min(h, cy + half), max(0, cx - half):min(w, cx + half)]
             base_intensity = float(np.mean(roi)) if roi.size > 0 else 128.0
             
-            # Generate slots based on live frame optical mean baseline
             arr = np.random.normal(base_intensity, base_intensity * 0.01, size=n_slots)
             mu = np.mean(arr) if np.mean(arr) > 0 else 1.0
             rel_fluct = (arr - mu) / mu
@@ -102,7 +101,7 @@ class FifoTargetQueue:
             "encoded_bits": encoded_bits
         })
 
-    def pop_at(self, index=1):
+    def pop_at(self, index=2):
         temp_list = list(self.buffer)
         if 0 <= index < len(temp_list):
             popped_item = temp_list.pop(index)
@@ -207,7 +206,7 @@ class AsyncBinanceFetcher(threading.Thread):
 def run_full_predictor_pipeline():
     np.random.seed(2026)
     print("==========================================================================")
-    print("  RP-GHOST OPTOELECTRONIC L-ANTICIPATION PREDICTOR (NON-BLOCKING OPTIMIZED) ")
+    print("  RP-GHOST OPTOELECTRONIC L-ANTICIPATION: PRICE + TIMESTAMP PREDICTOR     ")
     print("==========================================================================")
 
     viewport = OptoelectronicViewport(use_webcam=True)
@@ -217,26 +216,26 @@ def run_full_predictor_pipeline():
 
     n_slots = 32
     epsilon = 0.05
-    n_ensemble = 2000  # Optimized ensemble count to guarantee instant loop execution
+    n_ensemble = 2000
 
     try:
         live_btc_price = binance_fetcher.get_price()
         
-        for iteration in range(1, 100000000000):
+        for iteration in range(1, 1000000000):
             current_timestamp = time.time()
             print(f"\n--- PREDICTOR CYCLE {iteration} ---")
 
-            # 1. Encode Target Payload (Price + Timestamp)
+            # 1. Encode Target Payload (Price + Timestamp) into 32-bit vector
             Y_hidden = TimeCodeLatch.encode_payload(live_btc_price, current_timestamp, n_slots=n_slots)
             fifo_queue.push(current_timestamp, live_btc_price, Y_hidden)
 
-            # 2. Manage Queue (Pop at index 2 safely once queue has sufficient depth)
+            # 2. Manage Queue (Pop at index 2 once queue depth allows)
             if len(fifo_queue) >= 3:
                 popped_item = fifo_queue.pop_at(index=2)
                 if popped_item:
-                    print(f"[FIFO] Index 2 Popped Successfully | Timestamp: {popped_item['timestamp']:.2f}")
+                    print(f"[FIFO] Index 2 Popped Successfully | Stored Timestamp: {popped_item['timestamp']:.2f}")
 
-            # 3. Simulate Ensemble Noise Matrices for Lead-Lag Evaluation (Non-blocking)
+            # 3. Simulate Ensemble Noise Matrices for Lead-Lag Evaluation
             Z_ens = np.zeros((n_ensemble, n_slots))
             Y_ens = np.tile(Y_hidden, (n_ensemble, 1))
 
@@ -247,27 +246,28 @@ def run_full_predictor_pipeline():
             best_L, peak_rho, spectrum = LAnticipationPredictor.evaluate_anticipation(Z_ens, Y_ens, max_lead=4)
             print(f"[PREDICTOR] Optimal Lead Parameter L: {best_L} (Peak Correlation ρ: {peak_rho:.4f})")
 
-            # 5. Extract and Decode Forecasted State using Adaptive Thresholding
+            # 5. Extract and Decode Forecasted State
             recovered_bits = np.zeros(n_slots, dtype=int)
             mean_signal = np.mean(Z_ens)
             for k in range(n_slots):
                 anticipatory_idx = (k - abs(best_L)) % n_slots
                 recovered_bits[k] = 1 if np.mean(Z_ens[:, anticipatory_idx]) > mean_signal else 0
 
+            # Decode both Price and Timestamp fields
             rec_price_code, rec_timestamp = TimeCodeLatch.decode_payload(recovered_bits)
             
-            # Reconstruct predicted price from the recovered 16-bit code
             predicted_btc_price = float(rec_price_code * 10)
             target_price_code = int(live_btc_price / 10) & 0xFFFF
+            target_time_code = int(current_timestamp) & 0xFFFF
             
             price_matched = (rec_price_code == target_price_code)
+            time_delta = int(rec_timestamp) - int(target_time_code)
             price_delta = predicted_btc_price - live_btc_price
-            match_status = "VERIFIED MATCH" if price_matched else "MISMATCH"
             
-            print(f"Actual Binance Price : ${live_btc_price:,.2f} (Code: 0x{target_price_code:04X})")
-            print(f"Predicted Price      : ${predicted_btc_price:,.2f} (Code: 0x{rec_price_code:04X})")
-            print(f"Price Delta          : ${price_delta:+,.2f}")
-            print(f"Status               : {match_status}")
+            print(f"Target Price         : ${live_btc_price:,.2f} (Code: 0x{target_price_code:04X})")
+            print(f"Predicted Price      : ${predicted_btc_price:,.2f} (Code: 0x{rec_price_code:04X}) | Δ: ${price_delta:+,.2f}")
+            print(f"Target Timestamp Code: 0x{target_time_code:04X}")
+            print(f"Predicted Timestamp  : 0x{rec_timestamp:04X} | Jitter: {time_delta:+d}s")
             print(f"Active Queue Depth   : {len(fifo_queue)}")
 
             live_btc_price = binance_fetcher.get_price()
