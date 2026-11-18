@@ -4,14 +4,15 @@ import sys
 import time
 import numpy as np
 import requests
-from pynput.keyboard import Controller
+from pynput.keyboard import Controller, Key
 
 keyboard = Controller()
 
 
 def press_key(key):
-    keyboard.press(key)
-    keyboard.release(key)
+    with keyboard.pressed(Key.shift):
+        keyboard.press(key)
+        keyboard.release(key)
 
 
 def get_btc_price_cents():
@@ -219,23 +220,22 @@ def main():
                     latencies.append(latency_ms)
 
                     if last_slack_ms is None:
-                        action = "W"
+                        action = "w"
                     elif slack_ms > last_slack_ms:
-                        action = "S"
+                        action = "s"
                     else:
-                        action = "W"
+                        action = "w"
 
                     press_key(action)
+                    last_slack_ms = slack_ms
 
                     print(
                         f"[DECODE {cycle:03d}] CRC=PASS | "
                         f"Latency={latency_ms:.3f} ms | "
                         f"Slack={slack_ms-beta_ns/60000:.3f} ms | "
-                        f"Key={action} | "
+                        f"Key=Shift+{action.upper()} | "
                         f"Hash=0x{webcam_h:04X}"
                     )
-
-                    last_slack_ms = slack_ms
                 else:
                     missed += 1
                     print(f"[MISSED {cycle:03d}] Deadline exceeded.")
