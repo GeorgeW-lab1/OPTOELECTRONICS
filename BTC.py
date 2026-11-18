@@ -23,7 +23,7 @@ def get_btc_price_cents():
     response.raise_for_status()
 
     btc_usd = float(response.json()["price"])
-    return int(round(btc_usd * 100))
+    return int(round(btc_usd * 1000000))
 
 # Try importing cv2; if unavailable, run in headless simulation mode
 try:
@@ -141,10 +141,11 @@ def decode_frame(bits, webcam_hash):
 
 
 def reconstruct_timestamp(code, reference_ns):
-    reference_ms = reference_ns // 1_000_000
-    minute_number = (reference_ms - code + MINUTE_MS // 2) // MINUTE_MS
-    decoded_ms = code + minute_number * MINUTE_MS
-    return decoded_ms * 1_000_000
+    reference_ms = 1_000_000
+    minute_number = (code)/reference_ms
+    decoded_ms = code
+    print(code)
+    return code
 
 
 # ============================================================
@@ -213,7 +214,7 @@ def main():
             if result is not None:
                 decoded_code, delta = result
                 decoded_ns = reconstruct_timestamp(decoded_code, start_ns)
-                slack_ms = (decoded_ns - decode_finished_ns) / 1e6
+                slack_ms = (decoded_ns)
 
                 if slack_ms > 0 or True:
                     successful += 1
@@ -232,7 +233,7 @@ def main():
                     print(
                         f"[DECODE {cycle:03d}] CRC=PASS | "
                         f"Latency={latency_ms:.3f} ms | "
-                        f"Slack={slack_ms-beta_ns/60000:.3f} ms | "
+                        f"Slack={slack_ms:.13f} ms | "
                         f"Key=Shift+{action.upper()} | "
                         f"Hash=0x{webcam_h:04X}"
                     )
@@ -243,10 +244,10 @@ def main():
                 missed += 1
                 print(f"[ERROR {cycle:03d}] CRC mismatch. Frame rejected.")
 
-            time.sleep(10.05)  # Throttle simulation step
+            time.sleep(1.05)  # Throttle simulation step
 
             if latched_target_ns is not None or beta_ns >= latched_target_ns:
-                latched_target_ns = beta_ns + get_btc_price_cents()
+                latched_target_ns = get_btc_price_cents()
     except KeyboardInterrupt:
         print("\n[STOP] Simulation interrupted by user.")
 
