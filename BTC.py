@@ -1,5 +1,4 @@
 
-#13cad34
 #cf29196
 
 import hashlib
@@ -172,7 +171,7 @@ def main():
     successful = 0
     missed = 0
     latencies = []
-
+    last_slack_ms = 0
     latched_target_ns = 0
     last_slack_ms = None
 
