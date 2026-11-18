@@ -22,7 +22,7 @@ LAMBDA_BASE = 10000.0
 SIGMA_C = 0.005
 TILT = 0.25
 
-LEAD_NS = 1_000_000_000  # 1 second lead time (scaled for demo)
+LEAD_NS = 1_000_000_000_0  # 1 second lead time (scaled for demo)
 MINUTE_MS = 60000
 
 rng = np.random.default_rng()
@@ -206,9 +206,9 @@ def main():
             else:
                 missed += 1
                 print(f"[ERROR {cycle:03d}] CRC mismatch. Frame rejected.")
-
-            time.sleep(1)  # Throttle simulation step
             beta_ns = time.time_ns()
+
+            time.sleep(2)  # Throttle simulation step
 
             if latched_target_ns is not None or beta_ns >= latched_target_ns:
                 latched_target_ns = beta_ns + LEAD_NS
