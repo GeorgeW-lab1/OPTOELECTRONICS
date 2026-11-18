@@ -1,4 +1,5 @@
 
+#13cad34
 #cf29196
 
 import hashlib
@@ -223,12 +224,10 @@ def main():
                     successful += 1
                     latencies.append(latency_ms)
 
-                    if last_slack_ms is None:
+                    if slack_ms > last_slack_ms:
                         action = "w"
-                    elif slack_ms > last_slack_ms:
+                    if slack_ms < last_slack_ms:
                         action = "s"
-                    else:
-                        action = "w"
 
                     press_key(action)
                     last_slack_ms = slack_ms
