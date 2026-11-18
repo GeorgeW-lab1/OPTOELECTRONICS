@@ -1,5 +1,7 @@
 
-#cf29196
+
+#7ff0069
+
 
 import hashlib
 import math
@@ -171,8 +173,9 @@ def main():
     successful = 0
     missed = 0
     latencies = []
-   latched_target_ns = 0
-    last_slack_ms = 0
+
+    latched_target_ns = 0
+    last_slack_ms = None
 
     try:
         print("\n[RUNNING] Starting 50 transmission cycles...\n")
@@ -222,10 +225,12 @@ def main():
                     successful += 1
                     latencies.append(latency_ms)
 
-                    if slack_ms > last_slack_ms:
+                    if last_slack_ms is None:
                         action = "w"
-                    if slack_ms < last_slack_ms:
+                    elif slack_ms > last_slack_ms:
                         action = "s"
+                    elif slack_ms != last_slack_ms:
+                        action = "w"
 
                     press_key(action)
                     last_slack_ms = slack_ms
