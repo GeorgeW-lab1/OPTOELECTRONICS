@@ -171,9 +171,8 @@ def main():
     successful = 0
     missed = 0
     latencies = []
+   latched_target_ns = 0
     last_slack_ms = 0
-    latched_target_ns = 0
-    last_slack_ms = None
 
     try:
         print("\n[RUNNING] Starting 50 transmission cycles...\n")
