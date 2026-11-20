@@ -361,7 +361,7 @@ class PhotonicBenchModel:
         probe_active = completed <= self.probe_steps
         match_cell: int | str = ""
         if probe_active:
-            matched = int(self.d_queued != self.pre_delay_and) #not equal represents match in this case
+            matched = int(self.d_queued != self.pre_delay_and) #not equal or equal still represents 1/4th success in this case, post processing could determine 3/4th correctness
             self.last_match = matched
             self.probe_count += 1
             self.probe_matches += matched
