@@ -401,8 +401,8 @@ class SubsetSumApp(tk.Tk):
             )
         n = int(self.n_var.get())
         bits = int(self.bits_var.get())
-        if not (2 <= n <= 200_000):
-            raise ValueError("N must be in [2, 200000].")
+        if not (2 <= n <= 2_000_000_000):
+            raise ValueError("N must be in [2, 2000000000].")
         if not (2 <= bits <= 20_000):
             raise ValueError("Bits per number must be in [2, 20000].")
         return MatchSubsetSumSolver(
