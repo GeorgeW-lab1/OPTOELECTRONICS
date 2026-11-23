@@ -154,7 +154,7 @@ class PhotonicBenchModel:
         ignore_startup: bool = False,
         manual_x: bool = False,
         feed_select_to_driver_a: bool = True,
-        d_queue_length: int = 256,
+        d_queue_length: int = 2,
         laser_power_mw: float = 10.0,
         extinction_db: float = 20.0,
         split_ratio_a: float = 0.5,
@@ -601,7 +601,7 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.duration_var = tk.StringVar(value="2.0")
         self.speed_var = tk.StringVar(value="1.0")
         self.seed_var = tk.StringVar(value="7")
-        self.queue_len_var = tk.StringVar(value="256")
+        self.queue_len_var = tk.StringVar(value="2")
         self.mode_var = tk.StringVar(value="Random")
         self.manual_x_var = tk.BooleanVar(value=False)
         self.ignore_startup_var = tk.BooleanVar(value=False)
@@ -1352,7 +1352,7 @@ class PhotonicCircuitSimulator(tk.Tk):
 
         self._section(10, 10, 1160, 130, f"OPTICAL & TDC BENCH — {m.diode_wavelength_nm:g}nm BBO / Slit / PBS / Valve / Switch")
         self._section(10, 148, 1160, 115, "FPGA RNG + P/T/F PREDICTIONS + FEEDBACK / DETECTORS / RC THRESHOLD")
-        self._section(10, 272, 1160, 198, "MAIN LOGIC — pre-delay AND -> 150 ms delay + 256-Bit FIFO Queue -> 74HC74")
+        self._section(10, 272, 1160, 198, "MAIN LOGIC — pre-delay AND -> 150 ms delay + 2-Bit FIFO Queue -> 74HC74")
         self._section(10, 478, 1160, 102, "NO-FLIP PROBE & BET/TIMING TELEMETRY — Queue out (D_q) vs. AND BEFORE 150 ms delay")
 
         self._box(25, 38, 175, 44, f"{m.diode_wavelength_nm:g}nm + BBO\nTx={m.optical_tx_mw:.2f}mW | BBO={m.bbo_entangled_mw:.2f}mW", m.x)
