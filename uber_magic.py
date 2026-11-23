@@ -133,10 +133,7 @@ class WebcamWorker:
 class PhotonicBenchModel:
     """
     End-to-end photonic + TDC/FPGA + modal logic timing simulation engine
-    incorporating BBO/405nm source, gold aperture slit, polarizing cube BS,
-    fiber switch, electronic light valve, APD + LDR detectors, TDC time binning,
-    timing control logic array, feedback loop control, 2-bit FIFO queue,
-    150 ms delay line, RC node, and 74HC74 D-FF.
+    with explicit P (Probabilistic), T (Timing), and F (Feedback) predictions.
     """
 
     DT = 0.005
@@ -157,7 +154,7 @@ class PhotonicBenchModel:
         ignore_startup: bool = False,
         manual_x: bool = False,
         feed_select_to_driver_a: bool = True,
-        d_queue_length: int = 2,
+        d_queue_length: int = 256,
         laser_power_mw: float = 10.0,
         extinction_db: float = 20.0,
         split_ratio_a: float = 0.5,
@@ -259,6 +256,13 @@ class PhotonicBenchModel:
         self.timing_logic_out = 0
         self.retry_counter = 0
         self.virtual_t_offset = 0
+
+        # Explicit P, T, F predictions and bet state
+        self.pred_p = 0
+        self.pred_t = 0
+        self.pred_f = 0
+        self.pred_ptf = 0
+        self.outcome_bit = 0
         self.bet_prediction = 0
         self.bet_won = 0
         self.bet_wins_total = 0
@@ -479,9 +483,15 @@ class PhotonicBenchModel:
                 self.accumulator &= self.delayed_and
                 self.accumulator_samples += 1
 
-        self.bet_prediction = int(self.selected_quantum_state == self.target_state_k)
-        outcome_bit = int((self.pre_delay_and ^ self.d_queued ^ self.timing_logic_out) & 1)
-        self.bet_won = int(self.bet_prediction == outcome_bit)
+        # Explicit P, T, F predictions
+        self.pred_p = int(((self.fpga_rng_word & 1) ^ int(self.apd_counts > 0)) & 1)
+        self.pred_t = int(((self.tdc_bin % 2 == 0) ^ int(self.delayed_and)) & 1)
+        self.pred_f = int((self.q ^ self.d_queued) & 1)
+        self.pred_ptf = int((self.pred_p + self.pred_t + self.pred_f) >= 2)
+
+        self.bet_prediction = self.pred_ptf
+        self.outcome_bit = int((self.pre_delay_and ^ self.d_queued ^ self.timing_logic_out) & 1)
+        self.bet_won = int(self.bet_prediction == self.outcome_bit)
         self.bet_trials_total += 1
         self.bet_wins_total += self.bet_won
 
@@ -518,6 +528,11 @@ class PhotonicBenchModel:
             "selected_state": self.selected_quantum_state,
             "retry_counter": self.retry_counter,
             "virtual_t_offset": self.virtual_t_offset,
+            "P_pred": self.pred_p,
+            "T_pred": self.pred_t,
+            "F_pred": self.pred_f,
+            "PTF_pred": self.pred_ptf,
+            "outcome_bit": self.outcome_bit,
             "bet_prediction": self.bet_prediction,
             "bet_won": self.bet_won,
             "crc8": self.last_crc8,
@@ -564,7 +579,7 @@ class PhotonicCircuitSimulator(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Photonic, TDC & Modal Logic Simulator — Bet Wins Data Dump")
+        self.title("Photonic, TDC & Modal Logic Simulator — Bet Wins Data Dump (P / T / F)")
         self.geometry("1420x980")
         self.minsize(1000, 660)
 
@@ -586,7 +601,7 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.duration_var = tk.StringVar(value="2.0")
         self.speed_var = tk.StringVar(value="1.0")
         self.seed_var = tk.StringVar(value="7")
-        self.queue_len_var = tk.StringVar(value="2")
+        self.queue_len_var = tk.StringVar(value="256")
         self.mode_var = tk.StringVar(value="Random")
         self.manual_x_var = tk.BooleanVar(value=False)
         self.ignore_startup_var = tk.BooleanVar(value=False)
@@ -852,7 +867,7 @@ class PhotonicCircuitSimulator(tk.Tk):
         self.waveform.bind("<Configure>", self._schedule_redraw)
 
     # ---------------------------------------------------------
-    # Bet Wins Data Dump (Console, CSV & JSON)
+    # Bet Wins Data Dump (Console, CSV & JSON) with P, T, F
     # ---------------------------------------------------------
 
     def dump_bet_wins_gui(self):
@@ -867,15 +882,15 @@ class PhotonicCircuitSimulator(tk.Tk):
         print(f"\n=== BET WINS DATA DUMP ({len(wins)}/{total_steps} steps, {win_rate:.2%}) ===")
         for r in wins:
             print(
-                f"step={r['step']:03d} t={r['time_s']:.3f}s state={r['selected_state']} "
-                f"T={r['virtual_t_offset']} retry={r['retry_counter']} tdc={r['tdc_bin']:02d} "
-                f"gate={r['timing_gate']} pre_AND={r['pre_delay_and']} D_q={r['D_queued']} "
-                f"Q={r['Q_SELECT']} rng=0x{r['fpga_rng_word']:04X}"
+                f"step={r['step']:03d} t={r['time_s']:.3f}s "
+                f"P={r['P_pred']} T={r['T_pred']} F={r['F_pred']} PTF={r['PTF_pred']} out={r['outcome_bit']} "
+                f"state={r['selected_state']} T_off={r['virtual_t_offset']} retry={r['retry_counter']} "
+                f"tdc={r['tdc_bin']:02d} pre_AND={r['pre_delay_and']} D_q={r['D_queued']} Q={r['Q_SELECT']}"
             )
 
         win_modal = tk.Toplevel(self)
-        win_modal.title(f"Bet Wins Data Dump ({len(wins)} / {total_steps} steps)")
-        win_modal.geometry("1040x540")
+        win_modal.title(f"Bet Wins Data Dump — P / T / F ({len(wins)} / {total_steps} steps)")
+        win_modal.geometry("1160x560")
 
         toolbar = ttk.Frame(win_modal, padding=6)
         toolbar.pack(fill="x")
@@ -950,9 +965,9 @@ class PhotonicCircuitSimulator(tk.Tk):
         box.pack(side="left", fill="both", expand=True)
 
         header = (
-            f"{'Step':>4} | {'Time(s)':>8} | {'Mode':<10} | {'State':>5} | {'T_off':>5} | "
-            f"{'Retry':>5} | {'TDC':>3} | {'Gate':<9} | {'Tx(mW)':>7} | {'APD':>5} | "
-            f"{'preAND':>6} | {'Dq':>2} | {'Q':>2} | {'RNG':>6} | {'CRC8':>4}\n"
+            f"{'Step':>4} | {'Time(s)':>8} | {'P':>1} | {'T':>1} | {'F':>1} | {'PTF':>3} | {'Out':>3} | "
+            f"{'State':>5} | {'T_off':>5} | {'Retry':>5} | {'TDC':>3} | {'Gate':<9} | "
+            f"{'preAND':>6} | {'Dq':>2} | {'Q':>2} | {'RNG':>6}\n"
         )
         box.insert("end", header)
         box.insert("end", "-" * len(header) + "\n")
@@ -961,19 +976,20 @@ class PhotonicCircuitSimulator(tk.Tk):
             line = (
                 f"{r['step']:4d} | "
                 f"{r['time_s']:8.3f} | "
-                f"{r['mode']:<10} | "
+                f"{r['P_pred']:1d} | "
+                f"{r['T_pred']:1d} | "
+                f"{r['F_pred']:1d} | "
+                f"{r['PTF_pred']:3d} | "
+                f"{r['outcome_bit']:3d} | "
                 f"{r['selected_state']:5d} | "
                 f"{r['virtual_t_offset']:5d} | "
                 f"{r['retry_counter']:5d} | "
                 f"{r['tdc_bin']:3d} | "
                 f"{r['timing_gate']:<9} | "
-                f"{r['tx_power_mw']:7.2f} | "
-                f"{r['apd_counts']:5d} | "
                 f"{r['pre_delay_and']:6d} | "
                 f"{r['D_queued']:2d} | "
                 f"{r['Q_SELECT']:2d} | "
-                f"0x{r['fpga_rng_word']:04X} | "
-                f"0x{r['crc8']:02X}\n"
+                f"0x{r['fpga_rng_word']:04X}\n"
             )
             box.insert("end", line)
 
@@ -1335,8 +1351,8 @@ class PhotonicCircuitSimulator(tk.Tk):
         c.delete("all")
 
         self._section(10, 10, 1160, 130, f"OPTICAL & TDC BENCH — {m.diode_wavelength_nm:g}nm BBO / Slit / PBS / Valve / Switch")
-        self._section(10, 148, 1160, 115, "FPGA RNG + STATE SELECTION + FEEDBACK / DETECTORS / RC THRESHOLD")
-        self._section(10, 272, 1160, 198, "MAIN LOGIC — pre-delay AND -> 150 ms delay + 2-Bit FIFO Queue -> 74HC74")
+        self._section(10, 148, 1160, 115, "FPGA RNG + P/T/F PREDICTIONS + FEEDBACK / DETECTORS / RC THRESHOLD")
+        self._section(10, 272, 1160, 198, "MAIN LOGIC — pre-delay AND -> 150 ms delay + 256-Bit FIFO Queue -> 74HC74")
         self._section(10, 478, 1160, 102, "NO-FLIP PROBE & BET/TIMING TELEMETRY — Queue out (D_q) vs. AND BEFORE 150 ms delay")
 
         self._box(25, 38, 175, 44, f"{m.diode_wavelength_nm:g}nm + BBO\nTx={m.optical_tx_mw:.2f}mW | BBO={m.bbo_entangled_mw:.2f}mW", m.x)
@@ -1364,7 +1380,7 @@ class PhotonicCircuitSimulator(tk.Tk):
         )
         self._box(
             550, 88, 290, 42,
-            f"FPGA RNG=0x{m.fpga_rng_word:04X} | State={m.selected_quantum_state} (T={m.virtual_t_offset})\n"
+            f"P={m.pred_p} T={m.pred_t} F={m.pred_f} -> PTF={m.pred_ptf} (Out={m.outcome_bit})\n"
             f"Retry={m.retry_counter} | Bet={'WIN' if m.bet_won else 'TRY'} ({m.bet_wins_total}/{m.bet_trials_total})",
             m.bet_won,
         )
@@ -1538,10 +1554,10 @@ class PhotonicCircuitSimulator(tk.Tk):
             if m.probe_count else 0.0
         )
         self.stats_var.set(
+            f"P={m.pred_p}, T={m.pred_t}, F={m.pred_f} (PTF={m.pred_ptf}, Out={m.outcome_bit})  |  "
             f"pre_delay_AND={m.pre_delay_and}, D_queued={m.d_queued}, del_AND={m.delayed_and}, Q={m.q}  |  "
             f"Queue: {len(m.d_bit_queue)}/{m.d_queue_length} (avg lag {avg_lag_ms:.1f} ms)  |  "
-            f"Queue==PreDelayAND: {m.probe_matches}/{m.probe_count} ({match_pct:.1%}), "
-            f"Diffs: {m.probe_mismatches}  |  Bet Wins: {m.bet_wins_total}/{m.bet_trials_total}"
+            f"Bet Wins: {m.bet_wins_total}/{m.bet_trials_total} ({match_pct:.1%} probe match)"
         )
 
     def export_csv(self):
